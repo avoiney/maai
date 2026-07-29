@@ -9,6 +9,7 @@ test {
     _ = @import("term/cell.zig");
     _ = @import("term/grid.zig");
     _ = @import("term/screen.zig");
+    _ = @import("term/selection.zig");
     _ = @import("term/width.zig");
     _ = @import("vt/parser.zig");
 }

@@ -22,18 +22,63 @@ pub const Sink = struct {
     write: *const fn (*anyopaque, []const u8) void,
 };
 
+/// First refusal on a key press. Returning true consumes it, so `Ctrl+Shift+C`
+/// copies instead of sending a control byte to the child.
+pub const Bindings = struct {
+    ctx: *anyopaque,
+    handle: *const fn (*anyopaque, sym: u32, ctrl: bool, shift: bool, alt: bool) bool,
+};
+
 pub const Keyboard = struct {
     xkb: ?*c.struct_xkb_context = null,
     keymap: ?*c.struct_xkb_keymap = null,
     state: ?*c.struct_xkb_state = null,
     wl_kbd: ?*c.struct_wl_keyboard = null,
     sink: ?Sink = null,
+    bindings: ?Bindings = null,
     /// Terminal modes that change how keys encode. Borrowed from the Screen.
     modes: ?*const Modes = null,
 
-    /// Captured from repeat_info; acted on in phase 3.
+    /// Serial of the most recent input event. The compositor requires a recent one
+    /// to accept a clipboard claim, which is what stops a background client from
+    /// silently taking the selection.
+    last_serial: u32 = 0,
+
+    /// From repeat_info: keys per second, and the delay before repeating starts.
     repeat_rate: i32 = 25,
     repeat_delay: i32 = 600,
+
+    /// Held-key repeat state. Driven from the main loop's poll timeout rather than a
+    /// timerfd, since the loop already computes a deadline for synchronized output.
+    repeat_buf: [64]u8 = undefined,
+    repeat_len: usize = 0,
+    repeat_key: u32 = 0,
+    /// Monotonic milliseconds at which the next repeat is due; 0 means idle.
+    repeat_at: i64 = 0,
+
+    /// Milliseconds between repeats once started.
+    pub fn repeatInterval(self: *const Keyboard) i64 {
+        if (self.repeat_rate <= 0) return 0;
+        return @max(1, @divTrunc(@as(i64, 1000), self.repeat_rate));
+    }
+
+    /// Emit one repeat and schedule the next. Call when `repeat_at` has come due.
+    pub fn fireRepeat(self: *Keyboard, now_ms: i64) void {
+        if (self.repeat_len == 0) return;
+        if (self.sink) |s| s.write(s.ctx, self.repeat_buf[0..self.repeat_len]);
+        const interval = self.repeatInterval();
+        if (interval == 0) {
+            self.stopRepeat();
+        } else {
+            self.repeat_at = now_ms + interval;
+        }
+    }
+
+    pub fn stopRepeat(self: *Keyboard) void {
+        self.repeat_at = 0;
+        self.repeat_len = 0;
+        self.repeat_key = 0;
+    }
 
     pub fn init(self: *Keyboard) void {
         self.xkb = c.xkb_context_new(c.XKB_CONTEXT_NO_FLAGS);
@@ -226,20 +271,68 @@ fn handleKeymap(
 fn handleKey(
     data: ?*anyopaque,
     _: ?*c.struct_wl_keyboard,
-    _: u32,
+    serial: u32,
     _: u32,
     key: u32,
     key_state: u32,
 ) callconv(.c) void {
     const self: *Keyboard = @ptrCast(@alignCast(data.?));
-    if (key_state != c.WL_KEYBOARD_KEY_STATE_PRESSED) return;
-    const sink = self.sink orelse return;
+    self.last_serial = serial;
 
-    var buf: [64]u8 = undefined;
     // Wayland reports evdev keycodes; xkb expects them offset by 8.
-    if (self.encode(key + 8, &buf)) |bytes| {
-        sink.write(sink.ctx, bytes);
+    const keycode = key + 8;
+
+    if (key_state != c.WL_KEYBOARD_KEY_STATE_PRESSED) {
+        // Only the key actually repeating should cancel it; releasing a modifier
+        // while a key is held must not stop the repeat.
+        if (self.repeat_key == keycode) self.stopRepeat();
+        return;
     }
+
+    // Application shortcuts get first refusal, so Ctrl+Shift+C copies rather than
+    // sending a control byte to the child.
+    if (self.bindings) |b| {
+        const state = self.state;
+        const sym = if (state) |s| c.xkb_state_key_get_one_sym(s, keycode) else 0;
+        if (b.handle(
+            b.ctx,
+            sym,
+            self.modActive("Control"),
+            self.modActive("Shift"),
+            self.modActive("Mod1"),
+        )) {
+            self.stopRepeat();
+            return;
+        }
+    }
+
+    const sink = self.sink orelse return;
+    var buf: [64]u8 = undefined;
+    const bytes = self.encode(keycode, &buf) orelse return;
+    sink.write(sink.ctx, bytes);
+
+    // Arm repeat, but only for keys the keymap marks as repeating — otherwise
+    // holding a modifier would stream bytes.
+    const repeats = if (self.keymap) |km|
+        c.xkb_keymap_key_repeats(km, keycode) != 0
+    else
+        false;
+    if (repeats and self.repeat_rate > 0 and bytes.len <= self.repeat_buf.len) {
+        @memcpy(self.repeat_buf[0..bytes.len], bytes);
+        self.repeat_len = bytes.len;
+        self.repeat_key = keycode;
+        self.repeat_at = nowMs() + self.repeat_delay;
+    } else {
+        self.stopRepeat();
+    }
+}
+
+/// Monotonic milliseconds, so an NTP step backwards cannot leave a repeat deadline
+/// permanently in the future. `std.time.milliTimestamp` was removed in Zig 0.16.
+fn nowMs() i64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
 }
 
 fn handleModifiers(

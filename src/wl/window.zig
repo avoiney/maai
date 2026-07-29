@@ -7,6 +7,8 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const Keyboard = @import("keyboard.zig").Keyboard;
+const Pointer = @import("pointer.zig").Pointer;
+const Clipboard = @import("clipboard.zig").Clipboard;
 
 pub const Error = error{
     ConnectFailed,
@@ -26,8 +28,10 @@ pub const Window = struct {
     deco_manager: ?*c.struct_zxdg_decoration_manager_v1 = null,
     seat: ?*c.struct_wl_seat = null,
 
-    /// Owned here so its address is stable for the wl_keyboard listener.
+    /// Owned here so their addresses stay stable for the Wayland listeners.
     keyboard: Keyboard = .{},
+    pointer: Pointer = .{},
+    clipboard: Clipboard = undefined,
 
     surface: ?*c.struct_wl_surface = null,
     xdg_surface: ?*c.struct_xdg_surface = null,
@@ -47,13 +51,14 @@ pub const Window = struct {
     /// Compositor or user asked us to go away.
     closed: bool = false,
 
-    pub fn init(w: *Window) Error!void {
+    pub fn init(w: *Window, gpa: std.mem.Allocator) Error!void {
         const display = c.wl_display_connect(null) orelse return Error.ConnectFailed;
         const registry = c.wl_display_get_registry(display) orelse
             return Error.ConnectFailed;
 
         w.* = .{ .display = display, .registry = registry };
         w.keyboard.init();
+        w.clipboard.init(gpa);
 
         _ = c.wl_registry_add_listener(registry, &registry_listener, w);
 
@@ -64,6 +69,10 @@ pub const Window = struct {
 
         if (w.compositor == null) return Error.MissingCompositor;
         if (w.wm_base == null) return Error.MissingXdgWmBase;
+
+        // Selections are per-seat, so this can only be wired once the seat and both
+        // selection managers have been advertised.
+        if (w.seat) |seat| w.clipboard.attach(seat);
 
         try w.createToplevel();
     }
@@ -116,6 +125,8 @@ pub const Window = struct {
 
     pub fn deinit(w: *Window) void {
         w.keyboard.deinit();
+        w.pointer.deinit();
+        w.clipboard.deinit();
         if (w.seat) |s| c.wl_seat_destroy(s);
         if (w.decoration) |d| c.zxdg_toplevel_decoration_v1_destroy(d);
         if (w.toplevel) |t| c.xdg_toplevel_destroy(t);
@@ -178,6 +189,27 @@ fn handleGlobal(
             @min(version, 7),
         ));
         _ = c.wl_seat_add_listener(w.seat, &seat_listener, w);
+    } else if (std.mem.eql(u8, iface, "wl_data_device_manager")) {
+        w.clipboard.manager = @ptrCast(c.wl_registry_bind(
+            registry,
+            name,
+            &c.wl_data_device_manager_interface,
+            @min(version, 3),
+        ));
+    } else if (std.mem.eql(u8, iface, "zwp_primary_selection_device_manager_v1")) {
+        w.clipboard.primary_manager = @ptrCast(c.wl_registry_bind(
+            registry,
+            name,
+            &c.zwp_primary_selection_device_manager_v1_interface,
+            1,
+        ));
+    } else if (std.mem.eql(u8, iface, "wp_cursor_shape_manager_v1")) {
+        w.pointer.shape_manager = @ptrCast(c.wl_registry_bind(
+            registry,
+            name,
+            &c.wp_cursor_shape_manager_v1_interface,
+            1,
+        ));
     }
 }
 
@@ -204,7 +236,16 @@ fn handleSeatCapabilities(
             w.keyboard.wl_kbd = null;
         }
     }
-    // TODO(phase 3): WL_SEAT_CAPABILITY_POINTER for selection and link clicking.
+
+    const has_pointer = caps & c.WL_SEAT_CAPABILITY_POINTER != 0;
+    if (has_pointer and w.pointer.wl_pointer == null) {
+        if (c.wl_seat_get_pointer(seat)) |ptr| w.pointer.attach(ptr);
+    } else if (!has_pointer) {
+        if (w.pointer.wl_pointer) |ptr| {
+            c.wl_pointer_release(ptr);
+            w.pointer.wl_pointer = null;
+        }
+    }
 }
 
 fn handleSeatName(_: ?*anyopaque, _: ?*c.struct_wl_seat, _: [*c]const u8) callconv(.c) void {}

@@ -61,6 +61,8 @@ pub const Grid = struct {
     start: usize = 0,
     /// Logical lines held, scrollback + screen. Invariant: `count >= rows`.
     count: usize = 0,
+    /// Rows the displayed viewport sits above the live screen. 0 follows output.
+    view: usize = 0,
 
     pub fn init(
         gpa: std.mem.Allocator,
@@ -105,9 +107,39 @@ pub const Grid = struct {
         return &self.buf[(self.start + i) % self.buf.len];
     }
 
-    /// Logical index of the first visible row.
+    /// Logical index of the first row of the *live* screen. Terminal writes always
+    /// go here, regardless of where the user has scrolled the view.
     pub fn screenTop(self: *const Grid) usize {
         return self.count - self.rows;
+    }
+
+    /// Logical index of the first row currently *displayed*.
+    pub fn viewTop(self: *const Grid) usize {
+        return self.screenTop() - self.view;
+    }
+
+    pub fn maxView(self: *const Grid) usize {
+        return self.count - self.rows;
+    }
+
+    /// Row `y` of the displayed viewport, which is the live screen only when the
+    /// view is at the bottom.
+    pub fn viewRowMeta(self: *const Grid, y: u32) *Row {
+        return self.line(self.viewTop() + y);
+    }
+
+    pub fn viewRow(self: *const Grid, y: u32) []Cell {
+        return self.viewRowMeta(y).cells;
+    }
+
+    /// Scroll the view. Positive `delta` moves towards history.
+    pub fn scrollView(self: *Grid, delta: i64) void {
+        const target = @as(i64, @intCast(self.view)) + delta;
+        self.view = @intCast(std.math.clamp(target, 0, @as(i64, @intCast(self.maxView()))));
+    }
+
+    pub fn resetView(self: *Grid) void {
+        self.view = 0;
     }
 
     /// Number of scrollback lines above the screen.
@@ -131,8 +163,14 @@ pub const Grid = struct {
     fn pushBlank(self: *Grid, style: u16) *Row {
         if (self.count == self.buf.len) {
             self.start = (self.start + 1) % self.buf.len;
+            // The ring dropped its oldest line, so a scrolled-back view would
+            // otherwise drift one line towards the present.
+            if (self.view > 0) self.view -= 1;
         } else {
             self.count += 1;
+            // Keep a scrolled-back view anchored on the content the user is
+            // reading instead of dragging it along with new output.
+            if (self.view > 0) self.view += 1;
         }
         const r = self.line(self.count - 1);
         @memset(r.cells, blankCell(style));
@@ -461,6 +499,9 @@ pub const Grid = struct {
         self.rows = rows;
         self.start = 0;
         self.count = total_new - drop;
+        // Rewrapping renumbers every line, so a scrolled-back view no longer means
+        // anything. Snap to the live screen rather than land somewhere arbitrary.
+        self.view = 0;
 
         // Pad so the screen is always fully populated.
         while (self.count < rows) _ = self.pushBlank(0);

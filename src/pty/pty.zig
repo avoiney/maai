@@ -50,6 +50,26 @@ pub const Pty = struct {
             _ = c.unsetenv("COLUMNS");
             _ = c.unsetenv("LINES");
 
+            // Signal dispositions and the blocked mask survive exec, so whatever
+            // the parent chose leaks into the shell and everything it runs. We
+            // ignore SIGPIPE deliberately (see `ignoreSigpipe` in main.zig), and a
+            // shell that inherited that would behave subtly wrong in pipelines —
+            // `head` closing a pipe early would no longer stop the writer. Reset to
+            // defaults so the child starts from a clean slate.
+            //
+            // Only async-signal-safe calls are legal here, which signal() and
+            // sigprocmask() both are.
+            for ([_]c_int{
+                c.SIGPIPE, c.SIGINT,  c.SIGQUIT,  c.SIGTERM, c.SIGHUP,
+                c.SIGTSTP, c.SIGTTIN, c.SIGTTOU,  c.SIGCHLD, c.SIGALRM,
+                c.SIGUSR1, c.SIGUSR2, c.SIGWINCH,
+            }) |sig| {
+                _ = c.signal(sig, c.SIG_DFL);
+            }
+            var mask: c.sigset_t = undefined;
+            _ = c.sigemptyset(&mask);
+            _ = c.sigprocmask(c.SIG_SETMASK, &mask, null);
+
             _ = c.execvp(program, @ptrCast(argv));
             // execvp only returns on failure, and we cannot report it upward.
             c._exit(127);

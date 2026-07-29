@@ -29,6 +29,8 @@ pub const c = @cImport({
     // chosen there, not upstream's conventional filenames.
     @cInclude("xdg-shell-client-protocol.h");
     @cInclude("xdg-decoration-client-protocol.h");
+    @cInclude("primary-selection-client-protocol.h");
+    @cInclude("cursor-shape-client-protocol.h");
 
     // ── Rendering ──────────────────────────────────────────────────────────
     @cInclude("EGL/egl.h");

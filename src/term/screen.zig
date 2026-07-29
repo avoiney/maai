@@ -12,6 +12,7 @@ const cellmod = @import("cell.zig");
 const gridmod = @import("grid.zig");
 const Grid = gridmod.Grid;
 const width = @import("width.zig");
+const sel = @import("selection.zig");
 const parser = @import("../vt/parser.zig");
 
 const Cell = cellmod.Cell;
@@ -62,6 +63,9 @@ pub const Screen = struct {
     styles: StyleTable = .{},
     /// Multi-codepoint clusters (base plus combining marks or variation selectors).
     graphemes: cellmod.GraphemeTable = .{},
+    /// Mouse/keyboard text selection. Lives here so the renderer can highlight it
+    /// from the same place it reads cells.
+    selection: sel.Selection = .{},
 
     cursor_x: u32 = 0,
     cursor_y: u32 = 0,
@@ -176,6 +180,10 @@ pub const Screen = struct {
             self.tab_stops = try self.gpa.realloc(self.tab_stops, cols);
             self.resetTabs();
         }
+
+        // Reflow renumbers lines, so selection coordinates no longer refer to the
+        // text the user picked. Dropping it beats highlighting the wrong region.
+        self.selection.clear();
 
         // A region that spanned the whole screen should keep spanning it.
         if (was_full_height) {

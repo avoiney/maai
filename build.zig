@@ -12,15 +12,19 @@ const std = @import("std");
 /// XML fails the build with an obvious message instead of a link error 20 files
 /// later. Remaining ones, from PLAN.md §9:
 ///
-///   phase 3  unstable/primary-selection/primary-selection-unstable-v1.xml
-///   phase 3  staging/cursor-shape/cursor-shape-v1.xml  (also needs tablet-v2,
-///            whose types cursor-shape's XML references)
 ///   phase 4  staging/xdg-activation/xdg-activation-v1.xml
 ///   phase 7  staging/fractional-scale/fractional-scale-v1.xml
 ///   phase 7  stable/viewporter/viewporter.xml
 const protocols = [_]Protocol{
     .{ .name = "xdg-shell", .path = "stable/xdg-shell/xdg-shell.xml" },
     .{ .name = "xdg-decoration", .path = "unstable/xdg-decoration/xdg-decoration-unstable-v1.xml" },
+    // The PRIMARY selection — select-to-copy and middle-click-paste.
+    .{ .name = "primary-selection", .path = "unstable/primary-selection/primary-selection-unstable-v1.xml" },
+    // Pointer cursors without loading an XCursor theme ourselves.
+    .{ .name = "cursor-shape", .path = "staging/cursor-shape/cursor-shape-v1.xml" },
+    // Not used directly, but cursor-shape-v1's XML references zwp_tablet_tool_v2,
+    // so its interface symbol has to exist or the link fails.
+    .{ .name = "tablet", .path = "stable/tablet/tablet-v2.xml" },
 };
 
 const Protocol = struct {

@@ -333,10 +333,14 @@ pub const Renderer = struct {
         pad: Padding,
     ) void {
         const default_bg = cellmod.default_bg;
+        // The viewport is the live screen only when the user has not scrolled back.
+        const view_top = screen.grid.viewTop();
+        const scrolled = screen.grid.view != 0;
 
         var y: u32 = 0;
         while (y < screen.grid.rows) : (y += 1) {
-            const row = screen.grid.row(y);
+            const row = screen.grid.viewRow(y);
+            const line = view_top + y;
             var x: u32 = 0;
             while (x < screen.grid.cols) : (x += 1) {
                 const cell = row[x];
@@ -347,7 +351,14 @@ pub const Renderer = struct {
                 if (style.attrs.inverse) std.mem.swap(Rgb, &fg, &bg);
                 if (style.attrs.dim) fg = dim(fg);
 
-                const on_cursor = screen.cursor_visible and
+                if (screen.selection.contains(line, x)) {
+                    bg = cellmod.selection_bg;
+                    fg = cellmod.selection_fg;
+                }
+
+                // No cursor while scrolled back: it belongs to the live screen,
+                // which is not what is on display.
+                const on_cursor = !scrolled and screen.cursor_visible and
                     x == screen.cursor_x and y == screen.cursor_y;
                 if (on_cursor) {
                     bg = cellmod.default_cursor;

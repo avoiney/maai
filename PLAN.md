@@ -415,7 +415,82 @@ The bulk of correctness work.
 **Acceptance:** `vttest` menus 1–3 and 11 pass. `nvim`, `htop`, `lazygit`, `k9s`, `fzf`
 are fully usable. Repeated random resizes never corrupt the grid or crash (§8 fuzz).
 
-### Phase 3 — keyboard, selection, clipboard (≈2 weeks) — *your stated requirements*
+### Phase 3 — keyboard, selection, clipboard (≈2 weeks) — *in progress*
+
+**Done (2026-07-29): selection, both clipboards, scrollback viewing, key repeat.**
+
+The terminfo entry was skipped deliberately — the user rarely uses SSH, so its value
+does not justify going before the stated requirements.
+
+- **Selection** (`term/selection.zig`): drag for characters, double-click for a word,
+  triple-click for a whole *logical* line (following soft wraps), `Ctrl`+drag for a
+  rectangular block. Coordinates are absolute line indices into the grid ring, so a
+  selection stays anchored while the view scrolls; reflow renumbers those lines, so a
+  resize clears it rather than highlighting the wrong text.
+  - The subtle part is copying: a soft-wrapped line comes back as **one** line with no
+    newline at the wrap. Get that wrong and a pasted long command executes in pieces.
+    Wide characters copy once, without their spacer.
+- **PRIMARY** (`primary-selection-v1`): publishing on mouse release, middle-click to
+  paste — the "classic clipboard buffer" from the original brief.
+- **CLIPBOARD** (`wl_data_device`): `Ctrl+Shift+C` / `Ctrl+Shift+V`, offering
+  `text/plain;charset=utf-8` plus the legacy `UTF8_STRING`/`STRING`/`TEXT` names that
+  XWayland clients still ask for.
+- **Copy on select feeds both**, at the user's request: a finished selection goes to PRIMARY
+  *and* CLIPBOARD, so `Ctrl+Shift+V` pastes what was just selected. This is not the platform
+  default (foot, kitty and alacritty all keep the two apart) and it has a real cost here —
+  the machine's `cliphist` records every mouse selection. Becomes a `copy_on_select` config
+  option in phase 6.
+- **Paste safety**: bracketed paste when the application enabled it. When it did not, C0
+  controls are stripped except tab and newlines become carriage returns, so pasted text
+  behaves like typing instead of smuggling escape sequences. Reads from the peer's pipe are
+  bounded by a timeout and a size cap — the source is another process, and blocking the
+  event loop on it would hang the window with no way out.
+- **Scrollback viewing**: mouse wheel, `Shift+PageUp/Down`, `Shift+Home/End`. The view
+  stays anchored on what you are reading as new output arrives, and typing snaps back to
+  the live screen. No cursor is drawn while scrolled back, since it belongs to the live
+  screen rather than what is displayed.
+- **Key repeat**, honouring the compositor's `repeat_info` and the keymap's own
+  `xkb_keymap_key_repeats`, so holding a modifier does not stream bytes. Driven from the
+  event loop's existing deadline rather than a second timerfd.
+- **Cursor shape** via `cursor-shape-v1`, so the compositor picks the theme and size and we
+  never load an XCursor theme or manage a cursor surface.
+
+`cursor-shape-v1` needs `tablet-v2` generated alongside it: its XML references
+`zwp_tablet_tool_v2`, so that interface symbol has to exist even though we never use it.
+
+**SIGPIPE is ignored at startup**, and this is not optional. The first selection published
+made the window vanish with no panic, no message and no protocol error — because this
+machine's sway config runs `wl-paste --watch cliphist store`, which reads every selection
+change and closes its end of the pipe as soon as it has the data. Our write then got EPIPE,
+and SIGPIPE's default action terminates the process *silently*. A terminal writes to
+descriptors owned by other processes constantly — a clipboard requester's pipe, the child's
+PTY — and can never assume they stay open.
+
+Two diagnostic gaps were closed at the same time, because "the window just disappeared" is
+not a debuggable report: Wayland protocol errors now name the offending interface and code
+(libwayland records them but never prints them), and a failed `poll` says so. Both paths
+previously exited mutely.
+
+Ignoring SIGPIPE in the parent forced a second fix: signal dispositions and the blocked mask
+survive `exec`, so the shell inherited our ignored SIGPIPE and would have behaved subtly
+wrong in pipelines — `head` closing a pipe early would no longer stop the writer.
+`Pty.spawn` now resets dispositions and unblocks the mask in the child before `execvp`.
+
+Method note: `swaymsg seat - cursor …` can synthesise clicks, which is how the copy path was
+verified without a human at the mouse. It is *not* reliable for drags — sway coalesced three
+`cursor move` commands into one motion event and delivered it after the button release, so
+every synthetic drag selected a single character. Double-click word selection is the usable
+substitute, since it needs no motion at all. `MYTERM_DEBUG=1` traces input and selection
+handling, which is otherwise invisible.
+
+**Still outstanding in this phase:** the Kitty keyboard protocol and legacy
+modifyOtherKeys (the sequences are currently recognised and ignored); xkbcommon-compose for
+dead keys; **mouse reporting to applications** (the modes are tracked but no events are
+emitted, so clicking inside nvim or Claude Code does nothing); a keyboard-driven visual
+select mode; configurable bindings; and a confirmation prompt for multi-line pastes, which
+needs UI that does not exist yet.
+
+Original phase 3 scope, for reference:
 
 - **Keyboard**: xkbcommon keymap from the compositor fd, layout/group changes, dead keys,
   `xkbcommon-compose`, repeat from `repeat_info`.
