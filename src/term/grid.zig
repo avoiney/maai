@@ -39,6 +39,11 @@ pub fn blankCell(style: u16) Cell {
 /// logical line during reflow. Cells with a non-default style are kept even when
 /// blank, because a trailing run of coloured background is visible.
 fn trimmable(c: Cell) bool {
+    // `grapheme` must be checked first. A cluster cell stores a *table index* in
+    // `content`, so the session's first cluster (index 0) looks exactly like
+    // `Cell.empty`, and index 32 looks like a space — reflow would silently delete
+    // them from the end of a line.
+    if (c.grapheme) return false;
     return (c.content == Cell.empty or c.content == ' ') and c.style == 0;
 }
 

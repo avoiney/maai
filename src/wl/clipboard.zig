@@ -160,6 +160,29 @@ pub const Clipboard = struct {
         kind: Kind,
         display: *c.struct_wl_display,
     ) ?[]u8 {
+        // When we own the selection, answer from our own buffer instead of going
+        // through the compositor.
+        //
+        // Not an optimisation — a correctness fix. The round trip would have the
+        // compositor ask *us* for the data via a `send` event, but we are about to
+        // block in poll() on the pipe and would never dispatch it. Nor can we
+        // dispatch while waiting: `paste` runs inside a pointer/keyboard listener,
+        // itself inside wl_display_dispatch_pending, and libwayland does not allow
+        // re-entrant dispatch. So the paste would deadlock until the timeout fired
+        // and then yield nothing — copying inside myterm and pasting back into
+        // myterm silently did nothing.
+        //
+        // `*_source != null` is a reliable ownership test: the compositor sends
+        // `cancelled` when another client takes the selection, and that clears it.
+        switch (kind) {
+            .clipboard => if (self.clipboard_source != null) {
+                return self.gpa.dupe(u8, self.clipboard_text) catch null;
+            },
+            .primary => if (self.primary_source != null) {
+                return self.gpa.dupe(u8, self.primary_text) catch null;
+            },
+        }
+
         var fds: [2]c_int = undefined;
         if (c.pipe(&fds) != 0) return null;
         const read_fd = fds[0];

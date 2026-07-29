@@ -1,11 +1,9 @@
 //! Terminal semantics: cursor, pen, modes, and the parser's handler interface.
 //!
 //! Covers what full-screen applications need: the alternate screen, scroll
-//! regions, line and character insert/delete, tab stops, saved cursor, and bounded
-//! replies to device queries.
-//!
-//! Still absent (phase 2 remainder): double-width characters — every codepoint is
-//! assumed one column wide, so CJK overlaps. See `print`.
+//! regions, line and character insert/delete, tab stops, saved cursor, bounded
+//! replies to device queries, and character widths including double-width cells
+//! and grapheme clusters (see `print` and `width.zig`).
 
 const std = @import("std");
 const cellmod = @import("cell.zig");
@@ -1593,6 +1591,29 @@ test "box frames stay aligned across mixed-width content" {
             s.grid.at(11, @intCast(y)).content,
         );
     }
+}
+
+test "the session's first grapheme cluster survives a reflow" {
+    // Cluster indices live in Cell.content, so index 0 — the first cluster of the
+    // session — is bit-identical to Cell.empty, and index 32 to a space. Any
+    // blank-detection that ignores the `grapheme` flag trims them off the end of a
+    // logical line, silently deleting the character.
+    var s = try Screen.init(std.testing.allocator, 10, 3);
+    defer s.deinit();
+
+    feed(&s, "abcde\u{0301}"); // trailing e-with-acute is cluster index 0
+    try std.testing.expect(s.grid.at(4, 0).grapheme);
+    try std.testing.expectEqual(@as(u32, 0), s.grid.at(4, 0).content);
+
+    try s.resize(10, 3);
+    try s.resize(6, 3);
+    try s.resize(10, 3);
+
+    // Still five columns of content, the last one still the cluster.
+    try std.testing.expect(s.grid.at(4, 0).grapheme);
+    const cluster = s.graphemes.get(s.grid.at(4, 0).content);
+    try std.testing.expectEqual(@as(u21, 'e'), cluster[0]);
+    try std.testing.expectEqual(@as(u21, 0x0301), cluster[1]);
 }
 
 test "reflow keeps double-width pairs intact across a row break" {

@@ -188,6 +188,9 @@ fn trimmedLen(cells: []const Cell) usize {
     var n = cells.len;
     while (n > 0) : (n -= 1) {
         const cell = cells[n - 1];
+        // A cluster cell holds a table index, so index 0 or 32 would read as blank
+        // and get trimmed off the end of a copied line.
+        if (cell.grapheme) break;
         if (cell.content != Cell.empty and cell.content != ' ') break;
     }
     return n;

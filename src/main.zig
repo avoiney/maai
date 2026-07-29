@@ -451,6 +451,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
             }
         } else {
             c.wl_display_cancel_read(win.display);
+            // A hangup or error without POLLIN means the compositor is gone. Without
+            // this the loop spins at 100% of a core: poll returns immediately with
+            // the same revents, forever.
+            const dead = std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL;
+            if (fds[0].revents & dead != 0) {
+                std.debug.print("myterm: compositor connection closed\n", .{});
+                break;
+            }
         }
         if (c.wl_display_dispatch_pending(win.display) < 0) {
             reportWaylandError(&win);

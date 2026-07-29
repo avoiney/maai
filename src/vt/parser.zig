@@ -76,6 +76,9 @@ pub fn Parser(comptime H: type) type {
         // UTF-8 decode state for the ground state.
         utf8_cp: u32 = 0,
         utf8_remaining: u8 = 0,
+        /// Smallest codepoint the in-progress sequence length may legally encode,
+        /// used to reject overlong forms.
+        utf8_min: u32 = 0,
 
         pub fn init(handler: *H) Self {
             return .{ .handler = handler };
@@ -145,7 +148,15 @@ pub fn Parser(comptime H: type) type {
                 self.utf8_cp = (self.utf8_cp << 6) | (b & 0x3f);
                 self.utf8_remaining -= 1;
                 if (self.utf8_remaining == 0) {
-                    self.handler.print(std.math.cast(u21, self.utf8_cp) orelse 0xfffd);
+                    // Reject what the lead-byte ranges alone cannot: non-minimal
+                    // encodings (E0 80 80 for U+0000), UTF-16 surrogates, and
+                    // anything past U+10FFFF. All are invalid UTF-8, and this is
+                    // untrusted remote output.
+                    const cp = self.utf8_cp;
+                    const valid = cp >= self.utf8_min and
+                        cp <= 0x10ffff and
+                        !(cp >= 0xd800 and cp <= 0xdfff);
+                    self.handler.print(if (valid) @intCast(cp) else 0xfffd);
                 }
                 return;
             }
@@ -158,14 +169,17 @@ pub fn Parser(comptime H: type) type {
                 0xc2...0xdf => {
                     self.utf8_cp = b & 0x1f;
                     self.utf8_remaining = 1;
+                    self.utf8_min = 0x80;
                 },
                 0xe0...0xef => {
                     self.utf8_cp = b & 0x0f;
                     self.utf8_remaining = 2;
+                    self.utf8_min = 0x800;
                 },
                 0xf0...0xf4 => {
                     self.utf8_cp = b & 0x07;
                     self.utf8_remaining = 3;
+                    self.utf8_min = 0x10000;
                 },
                 // 0x80-0xc1 and 0xf5-0xff can never start a valid sequence.
                 else => self.handler.print(0xfffd),
@@ -505,6 +519,42 @@ test "truncated UTF-8 yields a replacement char and resyncs" {
     try std.testing.expectEqual(@as(usize, 2), rec.events.items.len);
     try std.testing.expectEqual(@as(u21, 0xfffd), rec.events.items[0].print);
     try std.testing.expectEqual(@as(u21, 'A'), rec.events.items[1].print);
+}
+
+test "invalid UTF-8 encodings are rejected rather than passed through" {
+    // Non-minimal ("overlong") forms and UTF-16 surrogates are invalid UTF-8, and
+    // this is untrusted remote output — the lead-byte ranges alone do not catch them.
+    const cases = [_][]const u8{
+        "\xe0\x80\x80", // overlong encoding of U+0000
+        "\xe0\x9f\xbf", // overlong encoding of U+07FF
+        "\xed\xa0\x80", // U+D800, a high surrogate
+        "\xed\xbf\xbf", // U+DFFF, a low surrogate
+        "\xf0\x80\x80\x80", // overlong 4-byte form
+    };
+    for (cases) |input| {
+        var rec: Recorder = undefined;
+        recorderFor(std.testing.allocator, input, &rec);
+        defer rec.deinit();
+        try std.testing.expectEqual(@as(usize, 1), rec.events.items.len);
+        try std.testing.expectEqual(@as(u21, 0xfffd), rec.events.items[0].print);
+    }
+}
+
+test "valid sequences at the edges of each length still decode" {
+    const cases = [_]struct { bytes: []const u8, cp: u21 }{
+        .{ .bytes = "\xc2\x80", .cp = 0x80 }, // shortest 2-byte
+        .{ .bytes = "\xe0\xa0\x80", .cp = 0x800 }, // shortest 3-byte
+        .{ .bytes = "\xef\xbf\xbf", .cp = 0xffff }, // longest 3-byte
+        .{ .bytes = "\xf0\x90\x80\x80", .cp = 0x10000 }, // shortest 4-byte
+        .{ .bytes = "\xf4\x8f\xbf\xbf", .cp = 0x10ffff }, // highest codepoint
+    };
+    for (cases) |case| {
+        var rec: Recorder = undefined;
+        recorderFor(std.testing.allocator, case.bytes, &rec);
+        defer rec.deinit();
+        try std.testing.expectEqual(@as(usize, 1), rec.events.items.len);
+        try std.testing.expectEqual(case.cp, rec.events.items[0].print);
+    }
 }
 
 test "OSC terminated by BEL and by ST both dispatch" {

@@ -68,6 +68,10 @@ pub const Cell = packed struct(u64) {
     pub const empty: u32 = 0;
 
     pub fn isBlank(self: Cell) bool {
+        // When `grapheme` is set, `content` is an index into the cluster table, not
+        // a codepoint — index 0 would otherwise be mistaken for `empty` and index
+        // 32 for a space.
+        if (self.grapheme) return false;
         return self.content == empty or self.content == ' ';
     }
 };
