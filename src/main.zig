@@ -23,6 +23,9 @@ const read_chunk = 64 * 1024;
 /// Cap on bytes parsed per loop iteration, so a flood cannot starve input or
 /// resize handling. The loop simply comes back around for more (PLAN.md §2).
 const drain_budget = 1024 * 1024;
+/// How long synchronized output (DECSET 2026) may suppress presentation before we
+/// draw anyway. Guards against an application that sets the mode and then dies.
+const sync_timeout_ms = 150;
 
 const App = struct {
     win: *Window,
@@ -91,6 +94,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     var app = App{ .win = &win, .gl = &gl, .screen = &screen, .pty = &pty };
     win.keyboard.sink = .{ .ctx = &app, .write = App.writeToPty };
+    // DECCKM and friends change how keys encode, so the encoder needs to see them.
+    win.keyboard.modes = &screen.modes;
+    // Device queries (DA, DSR) answer back down the PTY.
+    screen.reply = .{ .ctx = &app, .write = App.writeToPty };
 
     var parser = vt.Parser(Screen).init(&screen);
 
@@ -127,9 +134,25 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // competitive. Revisit with measurements rather than on principle.
     var read_buf: [read_chunk]u8 = undefined;
     var fds: [2]std.posix.pollfd = undefined;
+    var sync_started_ms: i64 = 0;
 
     while (!win.closed) {
-        if (app.needs_render and !app.frame_pending) render(&app, &renderer, &cache, &font, pad);
+        // Synchronized output (DECSET 2026): while an application is mid-update we
+        // hold off presenting, so its screen appears atomically instead of torn.
+        // The deadline is a safety valve — an app that sets the mode and then dies
+        // must not freeze the terminal forever.
+        const now_ms = monotonicMs();
+        if (screen.sync_output) {
+            if (sync_started_ms == 0) sync_started_ms = now_ms;
+        } else {
+            sync_started_ms = 0;
+        }
+        const sync_elapsed = now_ms - sync_started_ms;
+        const sync_holding = screen.sync_output and sync_elapsed < sync_timeout_ms;
+
+        if (app.needs_render and !app.frame_pending and !sync_holding) {
+            render(&app, &renderer, &cache, &font, pad);
+        }
 
         // The prepare_read / read_events dance is required: checking the fd for
         // readability without it races against events already queued in memory,
@@ -142,7 +165,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
         fds[0] = .{ .fd = win.fd(), .events = std.posix.POLL.IN, .revents = 0 };
         fds[1] = .{ .fd = pty.master, .events = std.posix.POLL.IN, .revents = 0 };
 
-        _ = std.posix.poll(&fds, -1) catch {
+        // Block indefinitely unless a sync deadline needs us back sooner.
+        const timeout: i32 = if (sync_holding)
+            @intCast(@max(1, sync_timeout_ms - sync_elapsed))
+        else
+            -1;
+
+        _ = std.posix.poll(&fds, timeout) catch {
             c.wl_display_cancel_read(win.display);
             break;
         };
@@ -218,6 +247,17 @@ fn handleFrame(
     c.wl_callback_destroy(callback);
     const app: *App = @ptrCast(@alignCast(data.?));
     app.frame_pending = false;
+}
+
+/// Milliseconds on a monotonic clock.
+///
+/// Monotonic rather than wall time on purpose: an NTP step backwards would make a
+/// deadline computed from wall time never expire. `std.time.milliTimestamp` was
+/// removed in Zig 0.16, so this goes straight to the syscall (vDSO-accelerated).
+fn monotonicMs() i64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
 }
 
 const Dims = struct { cols: u32, rows: u32 };

@@ -305,10 +305,43 @@ Verified by screenshot at 33 columns (long line spanning 5 rows, nothing lost) a
 90 columns (original 2-row layout and colours restored), plus 33 unit tests including a
 randomised width round-trip property test.
 
+**Done (2026-07-29): full-screen application support.** The threshold for dogfooding, so
+taken next.
+
+- **Alternate screen** (1049, plus 47/1047/1048). The two grids are swapped *by value*, so
+  `Screen` stays movable — an internal self-pointer would dangle as soon as the struct
+  returned from `init` were copied. The alt grid is created with zero scrollback: a
+  full-screen app's redraws are not history anyone wants to scroll through.
+- **Scroll regions** (DECSTBM), with IND/RI/NEL, SU/SD, IL/DL. Region scrolls never reach
+  scrollback — only a full-screen scroll on the primary grid does, or history would fill
+  with fragments of every TUI repaint.
+- **Line editing**: ICH, DCH, ECH, IRM insert mode, REP.
+- **Tab stops**: a real stop table with HTS, TBC, CHT, CBT rather than fixed multiples of 8.
+- **Saved cursor**: DECSC/DECRC and CSI s/u, carrying pen, origin mode and autowrap.
+- **DECOM** origin mode, **DECCKM** application cursor keys (wired through to the input
+  encoder — nvim and less need SS3 arrows), **DECALN** for vttest.
+- **Device reports**: DA1, DA2, DSR 5, DSR 6/CPR. Every reply is a fixed shape with no
+  attacker-influenced content — a report that echoes bytes chosen by remote output injects
+  them into our own input stream. DECDSR (`CSI ? … n`) is deliberately unanswered, and
+  `CSI t` window manipulation stays unimplemented for the same reason (§7).
+- **Synchronized output** (2026): presentation is held off mid-update so an app's screen
+  appears atomically. A 150 ms deadline is the safety valve, on a *monotonic* clock — wall
+  time can step backwards under NTP and a deadline that never expires would freeze the
+  terminal.
+
+Verified by screenshot: **nvim** (syntax highlighting, git signs, tab line, powerline
+statusline with Nerd Font glyphs), **htop** (24 CPU meters, tab headers, selection
+highlight, function-key bar), **lazygit** (box-drawing panels, diff colours, full-width
+layout). 52 unit tests.
+
+A bug the tests caught that screenshots would not have: `Screen.resize` judged "did the
+scroll region span the whole screen" against the *new* row count, so a full-screen region
+stayed pinned to the old height and full-screen apps scrolled wrongly after any resize.
+
 **Still outstanding in this phase:** double-width characters (wcwidth + spacer cell +
-grapheme side table), alt screen (1049), scroll regions (DECSTBM), IL/DL/ICH/DCH,
-synchronized output (2026), the myterm terminfo entry, scrollback *viewing* (the data is
-there; the keybinding and view offset are not), and style-id reclamation.
+grapheme side table) — CJK still overlaps; the myterm terminfo entry plus
+`--print-terminfo`; scrollback *viewing* (the data is there, the view offset and keybinding
+are not); style-id reclamation; and the `38:2::r:g:b` colon form with a colour-space id.
 
 The bulk of correctness work.
 

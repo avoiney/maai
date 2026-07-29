@@ -1,9 +1,11 @@
-//! Terminal semantics: cursor, pen, and the parser's handler interface.
+//! Terminal semantics: cursor, pen, modes, and the parser's handler interface.
 //!
-//! Phase 1 covers what a shell prompt and `ls --color` need. Deliberately absent
-//! until phase 2: scroll regions (DECSTBM), insert/delete line and char, alt
-//! screen, tab stop manipulation, and double-width characters (every cell is
-//! assumed one column wide — see `print`).
+//! Covers what full-screen applications need: the alternate screen, scroll
+//! regions, line and character insert/delete, tab stops, saved cursor, and bounded
+//! replies to device queries.
+//!
+//! Still absent (phase 2 remainder): double-width characters — every codepoint is
+//! assumed one column wide, so CJK overlaps. See `print`.
 
 const std = @import("std");
 const cellmod = @import("cell.zig");
@@ -16,27 +18,86 @@ const Style = cellmod.Style;
 const Rgb = cellmod.Rgb;
 const StyleTable = cellmod.StyleTable;
 
+/// Where replies to device queries go — normally the PTY.
+pub const Reply = struct {
+    ctx: *anyopaque,
+    write: *const fn (*anyopaque, []const u8) void,
+};
+
+pub const MouseMode = enum { off, x10, button, any };
+
+const SavedCursor = struct {
+    x: u32 = 0,
+    y: u32 = 0,
+    pen: Style = Style.default,
+    pen_id: u16 = 0,
+    origin_mode: bool = false,
+    autowrap: bool = true,
+};
+
+/// Modes the input encoder needs to see. Kept in one struct so `Keyboard` can hold
+/// a single pointer rather than reaching into `Screen`.
+pub const Modes = struct {
+    /// DECCKM: cursor keys emit SS3 (`ESC O A`) instead of CSI (`ESC [ A`).
+    /// nvim and less both rely on this.
+    app_cursor: bool = false,
+    /// DECSET 2004. Consumed by paste handling in phase 3.
+    bracketed_paste: bool = false,
+    /// DECSET 1004.
+    focus_events: bool = false,
+};
+
 pub const Screen = struct {
     gpa: std.mem.Allocator,
+
+    /// The active grid. On the alternate screen this is the alt grid and `other`
+    /// holds the primary (with its scrollback).
     grid: Grid,
+    /// The inactive grid. Swapped with `grid` on 1049. Held by value, never by
+    /// pointer, so that `Screen` stays movable.
+    other: Grid,
+    in_alt: bool = false,
+
     styles: StyleTable = .{},
 
     cursor_x: u32 = 0,
     cursor_y: u32 = 0,
     cursor_visible: bool = true,
 
-    /// Current SGR state, and its interned id. The id is recomputed only when SGR
-    /// changes, so `print` stays a plain store with no hash lookup.
     pen: Style = Style.default,
     pen_id: u16 = 0,
 
-    /// DECAWM. When the cursor writes the last column, the wrap is *deferred*
-    /// until the next printable character — otherwise a line that exactly fills
-    /// the width would scroll one row too early.
-    autowrap: bool = true,
-    wrap_pending: bool = false,
+    /// Scroll region, inclusive and 0-based. Full screen unless DECSTBM narrows it.
+    margin_top: u32 = 0,
+    margin_bottom: u32 = 0,
 
-    /// Set on any mutation; the render loop consumes and clears it.
+    autowrap: bool = true,
+    /// DECAWM's deferred wrap: writing the last column parks the cursor there and
+    /// only wraps on the *next* printable character, so a line that exactly fills
+    /// the width does not scroll early.
+    wrap_pending: bool = false,
+    /// DECOM: cursor addressing is relative to the scroll region.
+    origin_mode: bool = false,
+    /// IRM: printing shifts the rest of the line right instead of overwriting.
+    insert_mode: bool = false,
+
+    modes: Modes = .{},
+    mouse_mode: MouseMode = .off,
+    mouse_sgr: bool = false,
+    /// DECSET 2026. While set, the renderer holds off presenting so an app's
+    /// multi-write screen update appears atomically instead of tearing.
+    sync_output: bool = false,
+
+    saved: SavedCursor = .{},
+    other_saved: SavedCursor = .{},
+
+    /// One entry per column; true where a tab stop sits.
+    tab_stops: []bool,
+
+    /// Last printed codepoint, for REP.
+    last_printed: u21 = ' ',
+
+    reply: ?Reply = null,
     dirty: bool = true,
 
     title_buf: [256]u8 = undefined,
@@ -52,22 +113,74 @@ pub const Screen = struct {
         rows: u32,
         scrollback: u32,
     ) !Screen {
-        var s = Screen{ .gpa = gpa, .grid = try Grid.init(gpa, cols, rows, scrollback) };
+        var primary = try Grid.init(gpa, cols, rows, scrollback);
+        errdefer primary.deinit();
+        // The alternate screen has no scrollback: a full-screen application's
+        // redraws are not history anyone wants to scroll back through.
+        var alt = try Grid.init(gpa, cols, rows, 0);
+        errdefer alt.deinit();
+
+        const tabs = try gpa.alloc(bool, cols);
+        errdefer gpa.free(tabs);
+
+        var s = Screen{
+            .gpa = gpa,
+            .grid = primary,
+            .other = alt,
+            .margin_bottom = rows - 1,
+            .tab_stops = tabs,
+        };
         try s.styles.init(gpa);
+        s.resetTabs();
         return s;
     }
 
     pub fn deinit(self: *Screen) void {
         self.grid.deinit();
+        self.other.deinit();
+        self.gpa.free(self.tab_stops);
         self.styles.deinit(self.gpa);
     }
 
     pub fn resize(self: *Screen, cols: u32, rows: u32) !void {
-        var cur = gridmod.Cursor{ .x = self.cursor_x, .y = self.cursor_y };
-        try self.grid.resizeReflow(cols, rows, &cur);
-        self.cursor_x = cur.x;
-        self.cursor_y = cur.y;
-        // A pending wrap is meaningless at the new width.
+        // Captured before the grids change: whether the region spanned the whole
+        // screen has to be judged against the *old* height, or a full-screen region
+        // stays pinned to the old row count and full-screen apps scroll wrongly.
+        const was_full_height = self.margin_top == 0 and
+            self.margin_bottom + 1 >= self.grid.rows;
+
+        // The primary grid reflows so scrollback survives; the alternate screen
+        // does not, because its rows are independent screen lines rather than
+        // wrapped text, and its owner redraws on SIGWINCH.
+        if (self.in_alt) {
+            var saved = gridmod.Cursor{ .x = self.other_saved.x, .y = self.other_saved.y };
+            try self.other.resizeReflow(cols, rows, &saved);
+            self.other_saved.x = saved.x;
+            self.other_saved.y = saved.y;
+            try self.grid.resizePreserve(cols, rows, self.pen_id);
+            self.cursor_x = @min(self.cursor_x, cols - 1);
+            self.cursor_y = @min(self.cursor_y, rows - 1);
+        } else {
+            var cur = gridmod.Cursor{ .x = self.cursor_x, .y = self.cursor_y };
+            try self.grid.resizeReflow(cols, rows, &cur);
+            self.cursor_x = cur.x;
+            self.cursor_y = cur.y;
+            try self.other.resizePreserve(cols, rows, self.pen_id);
+        }
+
+        if (self.tab_stops.len != cols) {
+            self.tab_stops = try self.gpa.realloc(self.tab_stops, cols);
+            self.resetTabs();
+        }
+
+        // A region that spanned the whole screen should keep spanning it.
+        if (was_full_height) {
+            self.margin_bottom = rows - 1;
+        } else {
+            self.margin_bottom = @min(self.margin_bottom, rows - 1);
+            self.margin_top = @min(self.margin_top, self.margin_bottom);
+        }
+
         self.wrap_pending = false;
         self.dirty = true;
     }
@@ -76,24 +189,38 @@ pub const Screen = struct {
         return self.title_buf[0..self.title_len];
     }
 
+    fn respond(self: *Screen, bytes: []const u8) void {
+        if (self.reply) |r| r.write(r.ctx, bytes);
+    }
+
+    fn resetTabs(self: *Screen) void {
+        for (self.tab_stops, 0..) |*t, i| t.* = (i % 8 == 0 and i != 0);
+    }
+
     // ── parser handler interface ────────────────────────────────────────────
 
     pub fn print(self: *Screen, cp: u21) void {
         if (self.wrap_pending) {
             self.wrap_pending = false;
-            // Record that this row continues onto the next one. This is the single
-            // bit of state that lets resize tell a soft wrap from a real newline,
-            // and therefore the thing reflow depends on entirely.
+            // Record that this row continues onto the next. This single bit is what
+            // lets resize tell a soft wrap from a real newline, and so is the thing
+            // reflow depends on entirely.
             self.grid.rowMeta(self.cursor_y).wrapped = true;
             self.cursor_x = 0;
             self.lineFeed();
         }
 
-        // TODO(phase 2): double-width via wcwidth, plus the trailing spacer cell
-        // and grapheme cluster side table. Phase 1 treats every codepoint as one
-        // column, which is correct for ASCII and most Nerd Font icons.
-        const cell = self.grid.at(self.cursor_x, self.cursor_y);
-        cell.* = .{ .content = cp, .style = self.pen_id, .dirty = true };
+        if (self.insert_mode) self.insertChars(1);
+
+        // TODO(phase 2): double-width via wcwidth, plus the trailing spacer cell and
+        // the grapheme cluster side table. Every codepoint is one column for now,
+        // which is right for ASCII and most Nerd Font icons but wrong for CJK.
+        self.grid.at(self.cursor_x, self.cursor_y).* = .{
+            .content = cp,
+            .style = self.pen_id,
+            .dirty = true,
+        };
+        self.last_printed = cp;
 
         if (self.cursor_x + 1 >= self.grid.cols) {
             if (self.autowrap) self.wrap_pending = true;
@@ -111,9 +238,8 @@ pub const Screen = struct {
                 if (self.cursor_x > 0) self.cursor_x -= 1;
                 self.dirty = true;
             },
-            0x09 => self.tab(),
-            // LF, VT and FF all move down one line.
-            0x0a, 0x0b, 0x0c => {
+            0x09 => self.tab(1),
+            0x0a, 0x0b, 0x0c => { // LF, VT, FF
                 self.wrap_pending = false;
                 self.lineFeed();
             },
@@ -126,53 +252,89 @@ pub const Screen = struct {
         }
     }
 
-    pub fn escDispatch(self: *Screen, final: u8, _: []const u8) void {
+    pub fn escDispatch(self: *Screen, final: u8, intermediates: []const u8) void {
+        if (intermediates.len > 0) {
+            // DECALN: fill the screen with 'E'. vttest leads with this.
+            if (intermediates[0] == '#' and final == '8') self.alignmentTest();
+            return;
+        }
         switch (final) {
-            // NEL, IND: down one line. RI (reverse index) is phase 2 (needs
-            // scroll regions to be meaningful).
-            'D', 'E' => {
-                if (final == 'E') self.cursor_x = 0;
+            'D' => self.lineFeed(), // IND
+            'E' => { // NEL
+                self.cursor_x = 0;
                 self.lineFeed();
             },
-            'c' => self.reset(),
-            else => {},
+            'M' => self.reverseIndex(), // RI
+            '7' => self.saveCursor(),
+            '8' => self.restoreCursor(),
+            'H' => { // HTS
+                if (self.cursor_x < self.tab_stops.len) self.tab_stops[self.cursor_x] = true;
+            },
+            'c' => self.reset(), // RIS
+            else => {}, // keypad modes and charset selection are no-ops for now
         }
+        self.dirty = true;
     }
 
     pub fn csiDispatch(
         self: *Screen,
         final: u8,
         private: u8,
-        _: []const u8,
+        intermediates: []const u8,
         params: *const parser.Params,
     ) void {
+        // DECSCUSR (`CSI Ps SP q`) and friends carry intermediates; we render a
+        // block cursor regardless, so drop them rather than misreading the final.
+        if (intermediates.len > 0) return;
+
         switch (final) {
             'm' => self.sgr(params),
-            'H', 'f' => { // CUP — 1-based, defaults to home
-                const row = params.get(0, 1);
-                const col = params.get(1, 1);
-                self.cursor_y = @min(@max(row, 1) - 1, self.grid.rows - 1);
-                self.cursor_x = @min(@max(col, 1) - 1, self.grid.cols - 1);
-                self.wrap_pending = false;
-            },
+            '@' => self.insertChars(params.get(0, 1)),
             'A' => self.moveCursor(0, -@as(i64, params.get(0, 1))),
             'B' => self.moveCursor(0, params.get(0, 1)),
             'C' => self.moveCursor(params.get(0, 1), 0),
             'D' => self.moveCursor(-@as(i64, params.get(0, 1)), 0),
-            'G' => { // CHA: absolute column
-                self.cursor_x = @min(@max(params.get(0, 1), 1) - 1, self.grid.cols - 1);
-                self.wrap_pending = false;
+            'E' => { // CNL
+                self.cursor_x = 0;
+                self.moveCursor(0, params.get(0, 1));
             },
-            'd' => { // VPA: absolute row
-                self.cursor_y = @min(@max(params.get(0, 1), 1) - 1, self.grid.rows - 1);
-                self.wrap_pending = false;
+            'F' => { // CPL
+                self.cursor_x = 0;
+                self.moveCursor(0, -@as(i64, params.get(0, 1)));
             },
+            'G', '`' => self.setColumn(params.get(0, 1)), // CHA, HPA
+            'a' => self.moveCursor(params.get(0, 1), 0), // HPR
+            'H', 'f' => self.setPosition(params.get(0, 1), params.get(1, 1)),
+            'I' => self.tab(params.get(0, 1)), // CHT
             'J' => self.eraseInDisplay(params.get(0, 0)),
             'K' => self.eraseInLine(params.get(0, 0)),
+            'L' => self.insertLines(params.get(0, 1)),
+            'M' => self.deleteLines(params.get(0, 1)),
+            'P' => self.deleteChars(params.get(0, 1)),
+            'S' => self.scrollUpRegion(params.get(0, 1)),
+            'T' => self.scrollDownRegion(params.get(0, 1)),
             'X' => self.eraseChars(params.get(0, 1)),
+            'Z' => self.backTab(params.get(0, 1)), // CBT
+            'b' => self.repeatLast(params.get(0, 1)), // REP
+            'd' => self.setRow(params.get(0, 1)), // VPA
+            'e' => self.moveCursor(0, params.get(0, 1)), // VPR
+            'c' => self.deviceAttributes(private),
+            'g' => self.clearTabs(params.get(0, 0)), // TBC
             'h', 'l' => {
-                if (private == '?') self.decPrivateMode(params, final == 'h');
+                if (private == '?') {
+                    self.decPrivateMode(params, final == 'h');
+                } else if (private == 0) {
+                    self.ansiMode(params, final == 'h');
+                }
             },
+            'n' => self.deviceStatus(params, private),
+            'r' => self.setScrollRegion(params),
+            's' => self.saveCursor(),
+            'u' => self.restoreCursor(),
+            // 't' is xterm window manipulation. Deliberately unimplemented: several
+            // of its subcommands *report* window state, and a terminal that echoes
+            // state back into the input stream is an exfiltration primitive
+            // (PLAN.md §7).
             else => {},
         }
         self.dirty = true;
@@ -181,10 +343,9 @@ pub const Screen = struct {
     pub fn oscDispatch(self: *Screen, data: []const u8) void {
         // OSC 0 (icon + title) and OSC 2 (title).
         //
-        // Note there is deliberately no title *query* support, and there never
-        // will be: output can set the title, and a terminal that reports it back
-        // lets a compromised remote host echo arbitrary bytes onto our input
-        // stream. See PLAN.md §7.
+        // There is deliberately no title *query* support, and never will be: output
+        // can set the title, and a terminal that reports it back lets a compromised
+        // remote host echo arbitrary bytes onto our input stream (PLAN.md §7).
         const semi = std.mem.indexOfScalar(u8, data, ';') orelse return;
         const code = data[0..semi];
         const text = data[semi + 1 ..];
@@ -194,53 +355,200 @@ pub const Screen = struct {
             @memcpy(self.title_buf[0..n], text[0..n]);
             self.title_len = n;
         }
+        // OSC 7 (cwd), 8 (hyperlinks), 4/10/11 (palette), 52 (clipboard) land in
+        // phases 4-6. OSC 52 *reads* stay denied by default regardless.
     }
 
-    // DCS is parsed but dropped until Sixel lands in phase 8.
+    // DCS is parsed but dropped until Sixel arrives in phase 8.
     pub fn dcsHook(_: *Screen, _: u8, _: u8, _: *const parser.Params) void {}
     pub fn dcsPut(_: *Screen, _: u8) void {}
     pub fn dcsUnhook(_: *Screen) void {}
 
-    // ── operations ─────────────────────────────────────────────────────────
+    // ── cursor movement ────────────────────────────────────────────────────
 
-    fn lineFeed(self: *Screen) void {
-        if (self.cursor_y + 1 >= self.grid.rows) {
-            // Appending a blank line is what scrolls the screen; the displaced row
-            // becomes scrollback, so cursor_y keeps pointing at the bottom row.
-            self.grid.scrollUp(1, self.pen_id);
-        } else {
-            self.cursor_y += 1;
-        }
-        self.dirty = true;
+    fn setPosition(self: *Screen, row: u16, col: u16) void {
+        const base: u32 = if (self.origin_mode) self.margin_top else 0;
+        const limit: u32 = if (self.origin_mode) self.margin_bottom else self.grid.rows - 1;
+        self.cursor_y = @min(base + @max(row, 1) - 1, limit);
+        self.cursor_x = @min(@max(col, 1) - 1, self.grid.cols - 1);
+        self.wrap_pending = false;
     }
 
-    fn tab(self: *Screen) void {
-        // Fixed 8-column tab stops; DECST8C / HTS come in phase 2.
-        const next = (self.cursor_x / 8 + 1) * 8;
-        self.cursor_x = @min(next, self.grid.cols - 1);
-        self.dirty = true;
+    fn setColumn(self: *Screen, col: u16) void {
+        self.cursor_x = @min(@max(col, 1) - 1, self.grid.cols - 1);
+        self.wrap_pending = false;
+    }
+
+    fn setRow(self: *Screen, row: u16) void {
+        const base: u32 = if (self.origin_mode) self.margin_top else 0;
+        const limit: u32 = if (self.origin_mode) self.margin_bottom else self.grid.rows - 1;
+        self.cursor_y = @min(base + @max(row, 1) - 1, limit);
+        self.wrap_pending = false;
     }
 
     fn moveCursor(self: *Screen, dx: i64, dy: i64) void {
         const x = @as(i64, self.cursor_x) + dx;
         const y = @as(i64, self.cursor_y) + dy;
         self.cursor_x = @intCast(std.math.clamp(x, 0, @as(i64, self.grid.cols) - 1));
-        self.cursor_y = @intCast(std.math.clamp(y, 0, @as(i64, self.grid.rows) - 1));
+        // Cursor motion does not scroll, and inside a region it cannot leave it.
+        const lo: i64 = if (self.cursorInRegion()) self.margin_top else 0;
+        const hi: i64 = if (self.cursorInRegion())
+            self.margin_bottom
+        else
+            @as(i64, self.grid.rows) - 1;
+        self.cursor_y = @intCast(std.math.clamp(y, lo, hi));
         self.wrap_pending = false;
+    }
+
+    fn cursorInRegion(self: *const Screen) bool {
+        return self.cursor_y >= self.margin_top and self.cursor_y <= self.margin_bottom;
+    }
+
+    fn saveCursor(self: *Screen) void {
+        self.saved = .{
+            .x = self.cursor_x,
+            .y = self.cursor_y,
+            .pen = self.pen,
+            .pen_id = self.pen_id,
+            .origin_mode = self.origin_mode,
+            .autowrap = self.autowrap,
+        };
+    }
+
+    fn restoreCursor(self: *Screen) void {
+        self.cursor_x = @min(self.saved.x, self.grid.cols - 1);
+        self.cursor_y = @min(self.saved.y, self.grid.rows - 1);
+        self.pen = self.saved.pen;
+        self.pen_id = self.saved.pen_id;
+        self.origin_mode = self.saved.origin_mode;
+        self.autowrap = self.saved.autowrap;
+        self.wrap_pending = false;
+    }
+
+    // ── scrolling ──────────────────────────────────────────────────────────
+
+    fn fullScreenRegion(self: *const Screen) bool {
+        return self.margin_top == 0 and self.margin_bottom == self.grid.rows - 1;
+    }
+
+    fn lineFeed(self: *Screen) void {
+        if (self.cursor_y == self.margin_bottom) {
+            // Only a full-screen scroll on the primary grid produces scrollback.
+            // Region scrolls and alt-screen scrolls are an application repainting
+            // itself, not history worth keeping.
+            if (self.fullScreenRegion() and !self.in_alt) {
+                self.grid.scrollUp(1, self.pen_id);
+            } else {
+                self.grid.scrollRegionUp(self.margin_top, self.margin_bottom, 1, self.pen_id);
+            }
+        } else if (self.cursor_y + 1 < self.grid.rows) {
+            self.cursor_y += 1;
+        }
+        self.dirty = true;
+    }
+
+    fn reverseIndex(self: *Screen) void {
+        if (self.cursor_y == self.margin_top) {
+            self.grid.scrollRegionDown(self.margin_top, self.margin_bottom, 1, self.pen_id);
+        } else if (self.cursor_y > 0) {
+            self.cursor_y -= 1;
+        }
+    }
+
+    fn scrollUpRegion(self: *Screen, n: u16) void {
+        const count = @max(n, 1);
+        if (self.fullScreenRegion() and !self.in_alt) {
+            self.grid.scrollUp(count, self.pen_id);
+        } else {
+            self.grid.scrollRegionUp(self.margin_top, self.margin_bottom, count, self.pen_id);
+        }
+    }
+
+    fn scrollDownRegion(self: *Screen, n: u16) void {
+        self.grid.scrollRegionDown(self.margin_top, self.margin_bottom, @max(n, 1), self.pen_id);
+    }
+
+    fn setScrollRegion(self: *Screen, params: *const parser.Params) void {
+        const top = @max(params.get(0, 1), 1) - 1;
+        const bottom_raw = params.get(1, @intCast(self.grid.rows));
+        const bottom = @min(@max(bottom_raw, 1) - 1, self.grid.rows - 1);
+
+        // A degenerate region is ignored outright, per DEC.
+        if (top >= bottom) {
+            self.margin_top = 0;
+            self.margin_bottom = self.grid.rows - 1;
+        } else {
+            self.margin_top = top;
+            self.margin_bottom = bottom;
+        }
+        // DECSTBM homes the cursor.
+        self.cursor_y = if (self.origin_mode) self.margin_top else 0;
+        self.cursor_x = 0;
+        self.wrap_pending = false;
+    }
+
+    fn insertLines(self: *Screen, n: u16) void {
+        if (!self.cursorInRegion()) return;
+        self.grid.scrollRegionDown(self.cursor_y, self.margin_bottom, @max(n, 1), self.pen_id);
+        self.cursor_x = 0;
+    }
+
+    fn deleteLines(self: *Screen, n: u16) void {
+        if (!self.cursorInRegion()) return;
+        self.grid.scrollRegionUp(self.cursor_y, self.margin_bottom, @max(n, 1), self.pen_id);
+        self.cursor_x = 0;
+    }
+
+    // ── line editing ───────────────────────────────────────────────────────
+
+    fn insertChars(self: *Screen, n: u16) void {
+        const row = self.grid.row(self.cursor_y);
+        const cols = self.grid.cols;
+        const x = self.cursor_x;
+        const count = @min(@as(u32, @max(n, 1)), cols - x);
+
+        var i = cols;
+        while (i > x + count) {
+            i -= 1;
+            row[i] = row[i - count];
+        }
+        @memset(row[x .. x + count], gridmod.blankCell(self.pen_id));
+    }
+
+    fn deleteChars(self: *Screen, n: u16) void {
+        const row = self.grid.row(self.cursor_y);
+        const cols = self.grid.cols;
+        const x = self.cursor_x;
+        const count = @min(@as(u32, @max(n, 1)), cols - x);
+
+        var i = x;
+        while (i + count < cols) : (i += 1) row[i] = row[i + count];
+        @memset(row[cols - count ..], gridmod.blankCell(self.pen_id));
+    }
+
+    fn eraseChars(self: *Screen, n: u16) void {
+        const row = self.grid.row(self.cursor_y);
+        const end = @min(self.cursor_x + @max(n, 1), self.grid.cols);
+        @memset(row[self.cursor_x..end], gridmod.blankCell(self.pen_id));
+    }
+
+    fn repeatLast(self: *Screen, n: u16) void {
+        const cp = self.last_printed;
+        var i: u16 = 0;
+        while (i < @max(n, 1)) : (i += 1) self.print(cp);
     }
 
     fn eraseInDisplay(self: *Screen, mode: u16) void {
         switch (mode) {
-            0 => { // cursor to end of screen
+            0 => {
                 self.eraseInLine(0);
                 self.grid.clearRows(self.cursor_y + 1, self.grid.rows, self.pen_id);
             },
-            1 => { // start of screen to cursor
+            1 => {
                 self.grid.clearRows(0, self.cursor_y, self.pen_id);
                 self.eraseInLine(1);
             },
             2 => self.grid.clearVisible(self.pen_id),
-            // ED(3) additionally discards scrollback.
             3 => {
                 self.grid.clearVisible(self.pen_id);
                 self.grid.dropScrollback();
@@ -255,7 +563,7 @@ pub const Screen = struct {
         switch (mode) {
             0 => {
                 @memset(meta.cells[self.cursor_x..], b);
-                // The line no longer runs on, so it must not be joined by reflow.
+                // The line no longer runs on, so reflow must not join it.
                 meta.wrapped = false;
             },
             1 => @memset(meta.cells[0 .. self.cursor_x + 1], b),
@@ -267,31 +575,189 @@ pub const Screen = struct {
         }
     }
 
-    fn eraseChars(self: *Screen, n: u16) void {
-        const row = self.grid.row(self.cursor_y);
-        const end = @min(self.cursor_x + @max(n, 1), self.grid.cols);
-        @memset(row[self.cursor_x..end], gridmod.blankCell(self.pen_id));
+    fn alignmentTest(self: *Screen) void {
+        var y: u32 = 0;
+        while (y < self.grid.rows) : (y += 1) {
+            const meta = self.grid.rowMeta(y);
+            for (meta.cells) |*cl| cl.* = .{ .content = 'E', .style = 0 };
+            meta.wrapped = false;
+        }
+        self.cursor_x = 0;
+        self.cursor_y = 0;
+    }
+
+    // ── tabs ───────────────────────────────────────────────────────────────
+
+    fn tab(self: *Screen, n: u16) void {
+        var remaining = @max(n, 1);
+        while (remaining > 0) : (remaining -= 1) {
+            var x = self.cursor_x + 1;
+            while (x < self.grid.cols and !self.tab_stops[x]) x += 1;
+            self.cursor_x = @min(x, self.grid.cols - 1);
+            if (self.cursor_x == self.grid.cols - 1) break;
+        }
+        self.wrap_pending = false;
+        self.dirty = true;
+    }
+
+    fn backTab(self: *Screen, n: u16) void {
+        var remaining = @max(n, 1);
+        while (remaining > 0) : (remaining -= 1) {
+            if (self.cursor_x == 0) break;
+            var x = self.cursor_x - 1;
+            while (x > 0 and !self.tab_stops[x]) x -= 1;
+            self.cursor_x = x;
+        }
+        self.wrap_pending = false;
+    }
+
+    fn clearTabs(self: *Screen, mode: u16) void {
+        switch (mode) {
+            0 => if (self.cursor_x < self.tab_stops.len) {
+                self.tab_stops[self.cursor_x] = false;
+            },
+            3 => @memset(self.tab_stops, false),
+            else => {},
+        }
+    }
+
+    // ── modes ──────────────────────────────────────────────────────────────
+
+    fn ansiMode(self: *Screen, params: *const parser.Params, set: bool) void {
+        for (0..params.len) |i| {
+            switch (params.values[i]) {
+                4 => self.insert_mode = set, // IRM
+                else => {}, // LNM (20) intentionally ignored
+            }
+        }
     }
 
     fn decPrivateMode(self: *Screen, params: *const parser.Params, set: bool) void {
         for (0..params.len) |i| {
             switch (params.values[i]) {
+                1 => self.modes.app_cursor = set, // DECCKM
+                6 => { // DECOM
+                    self.origin_mode = set;
+                    self.cursor_x = 0;
+                    self.cursor_y = if (set) self.margin_top else 0;
+                },
                 7 => self.autowrap = set, // DECAWM
                 25 => self.cursor_visible = set, // DECTCEM
-                else => {}, // 1049 alt screen, 2004 bracketed paste: phase 2/3
+                1000 => self.mouse_mode = if (set) .button else .off,
+                1002, 1003 => self.mouse_mode = if (set) .any else .off,
+                1006 => self.mouse_sgr = set,
+                1004 => self.modes.focus_events = set,
+                // 47 and 1047 switch buffers without touching the cursor; 1048 is
+                // cursor save/restore alone; 1049 is the combination everything
+                // actually uses.
+                47, 1047 => self.setAltScreen(set, false, set),
+                1048 => if (set) self.saveCursor() else self.restoreCursor(),
+                1049 => self.setAltScreen(set, true, set),
+                2004 => self.modes.bracketed_paste = set,
+                2026 => self.sync_output = set,
+                else => {},
             }
         }
     }
 
+    /// Switch between the primary and alternate screen.
+    ///
+    /// The two grids are swapped by value rather than behind a pointer, so `Screen`
+    /// remains movable — an internal self-pointer would dangle the moment the
+    /// struct returned from `init` were copied.
+    fn setAltScreen(self: *Screen, enable: bool, with_cursor: bool, clear: bool) void {
+        if (enable == self.in_alt) return;
+
+        if (with_cursor) {
+            const mine = SavedCursor{
+                .x = self.cursor_x,
+                .y = self.cursor_y,
+                .pen = self.pen,
+                .pen_id = self.pen_id,
+                .origin_mode = self.origin_mode,
+                .autowrap = self.autowrap,
+            };
+            const theirs = self.other_saved;
+            self.other_saved = mine;
+            self.saved = theirs;
+        }
+
+        std.mem.swap(Grid, &self.grid, &self.other);
+        self.in_alt = enable;
+
+        // Margins belong to the buffer being left behind.
+        self.margin_top = 0;
+        self.margin_bottom = self.grid.rows - 1;
+        self.origin_mode = false;
+        self.wrap_pending = false;
+
+        if (clear) self.grid.clearVisible(self.pen_id);
+
+        if (with_cursor and !enable) {
+            self.cursor_x = @min(self.saved.x, self.grid.cols - 1);
+            self.cursor_y = @min(self.saved.y, self.grid.rows - 1);
+            self.pen = self.saved.pen;
+            self.pen_id = self.saved.pen_id;
+            self.autowrap = self.saved.autowrap;
+        } else if (enable) {
+            self.cursor_x = 0;
+            self.cursor_y = 0;
+        }
+        self.dirty = true;
+    }
+
     fn reset(self: *Screen) void {
+        if (self.in_alt) self.setAltScreen(false, false, false);
         self.pen = Style.default;
         self.pen_id = 0;
         self.cursor_x = 0;
         self.cursor_y = 0;
+        self.cursor_visible = true;
         self.autowrap = true;
+        self.origin_mode = false;
+        self.insert_mode = false;
         self.wrap_pending = false;
+        self.margin_top = 0;
+        self.margin_bottom = self.grid.rows - 1;
+        self.modes = .{};
+        self.mouse_mode = .off;
+        self.sync_output = false;
+        self.resetTabs();
         self.grid.clearVisible(0);
         self.dirty = true;
+    }
+
+    // ── device reports ─────────────────────────────────────────────────────
+    // Every reply here is a fixed shape with no attacker-influenced content.
+    // That is a security property, not a simplification: a report that echoes
+    // bytes chosen by remote output injects them into our own input stream.
+
+    fn deviceAttributes(self: *Screen, private: u8) void {
+        if (private == '>') {
+            // DA2: terminal id 0, "firmware" 10, cartridge 1.
+            self.respond("\x1b[>0;10;1c");
+        } else if (private == 0) {
+            // DA1: VT220 with ANSI colour.
+            self.respond("\x1b[?62;22c");
+        }
+    }
+
+    fn deviceStatus(self: *Screen, params: *const parser.Params, private: u8) void {
+        // DECDSR (private '?') variants are deliberately unanswered.
+        if (private != 0) return;
+        switch (params.get(0, 0)) {
+            5 => self.respond("\x1b[0n"), // ready, no malfunction
+            6 => { // CPR
+                const base: u32 = if (self.origin_mode) self.margin_top else 0;
+                var buf: [32]u8 = undefined;
+                const out = std.fmt.bufPrint(&buf, "\x1b[{d};{d}R", .{
+                    self.cursor_y - base + 1,
+                    self.cursor_x + 1,
+                }) catch return;
+                self.respond(out);
+            },
+            else => {},
+        }
     }
 
     // ── SGR ────────────────────────────────────────────────────────────────
@@ -313,11 +779,9 @@ pub const Screen = struct {
                 3 => self.pen.attrs.italic = true,
                 4 => {
                     // `4:n` selects a style; plain `4` is a single underline.
-                    const style_arg = if (i + 1 < params.len and params.is_sub[i + 1])
-                        params.values[i + 1]
-                    else
-                        1;
-                    if (i + 1 < params.len and params.is_sub[i + 1]) i += 1;
+                    const sub = i + 1 < params.len and params.is_sub[i + 1];
+                    const style_arg = if (sub) params.values[i + 1] else 1;
+                    if (sub) i += 1;
                     self.pen.attrs.underline = switch (style_arg) {
                         0 => .none,
                         1 => .single,
@@ -344,16 +808,16 @@ pub const Screen = struct {
                 28 => self.pen.attrs.invisible = false,
                 29 => self.pen.attrs.strike = false,
                 30...37 => self.pen.fg = cellmod.ansi16[p - 30],
-                38 => if (self.extendedColor(params, &i)) |col| {
+                38 => if (extendedColor(params, &i)) |col| {
                     self.pen.fg = col;
                 },
                 39 => self.pen.fg = cellmod.default_fg,
                 40...47 => self.pen.bg = cellmod.ansi16[p - 40],
-                48 => if (self.extendedColor(params, &i)) |col| {
+                48 => if (extendedColor(params, &i)) |col| {
                     self.pen.bg = col;
                 },
                 49 => self.pen.bg = cellmod.default_bg,
-                58 => if (self.extendedColor(params, &i)) |col| {
+                58 => if (extendedColor(params, &i)) |col| {
                     self.pen.ul = col;
                 },
                 59 => self.pen.ul = cellmod.default_fg,
@@ -365,40 +829,39 @@ pub const Screen = struct {
         self.commitPen();
     }
 
-    /// Parse the argument of SGR 38/48/58, advancing `i` past what it consumed.
-    ///
-    /// Accepts both the semicolon form (`38;5;n`, `38;2;r;g;b`) and the colon form
-    /// (`38:5:n`, `38:2:r:g:b`). TODO(phase 2): the colon form may also carry a
-    /// colour-space id — `38:2::r:g:b` — which we currently misread.
-    fn extendedColor(_: *Screen, params: *const parser.Params, i: *usize) ?Rgb {
-        const kind = params.get(i.* + 1, 0);
-        switch (kind) {
-            5 => {
-                const idx = params.get(i.* + 2, 0);
-                i.* += 2;
-                return cellmod.palette256[@min(idx, 255)];
-            },
-            2 => {
-                const r = params.get(i.* + 2, 0);
-                const g = params.get(i.* + 3, 0);
-                const b = params.get(i.* + 4, 0);
-                i.* += 4;
-                return Rgb.rgb(
-                    @intCast(@min(r, 255)),
-                    @intCast(@min(g, 255)),
-                    @intCast(@min(b, 255)),
-                );
-            },
-            else => return null,
-        }
-    }
-
     fn commitPen(self: *Screen) void {
         // Falling back to the default style on OOM is a cosmetic loss; refusing to
         // render would not be.
         self.pen_id = self.styles.intern(self.gpa, self.pen) catch 0;
     }
 };
+
+/// Parse the argument of SGR 38/48/58, advancing `i` past what it consumed.
+///
+/// Accepts the semicolon form (`38;5;n`, `38;2;r;g;b`) and the colon form
+/// (`38:5:n`, `38:2:r:g:b`). TODO(phase 2): the colon form may also carry a
+/// colour-space id — `38:2::r:g:b` — which we currently misread.
+fn extendedColor(params: *const parser.Params, i: *usize) ?Rgb {
+    switch (params.get(i.* + 1, 0)) {
+        5 => {
+            const idx = params.get(i.* + 2, 0);
+            i.* += 2;
+            return cellmod.palette256[@min(idx, 255)];
+        },
+        2 => {
+            const r = params.get(i.* + 2, 0);
+            const g = params.get(i.* + 3, 0);
+            const b = params.get(i.* + 4, 0);
+            i.* += 4;
+            return Rgb.rgb(
+                @intCast(@min(r, 255)),
+                @intCast(@min(g, 255)),
+                @intCast(@min(b, 255)),
+            );
+        },
+        else => return null,
+    }
+}
 
 // ── tests ───────────────────────────────────────────────────────────────────
 
@@ -423,6 +886,23 @@ fn rowText(s: *const Screen, y: u32, buf: []u8) []const u8 {
     return std.mem.trimEnd(u8, buf[0..n], " ");
 }
 
+/// Collects replies so device-report tests can assert on them.
+const Sink = struct {
+    buf: [128]u8 = undefined,
+    len: usize = 0,
+
+    fn write(ctx: *anyopaque, bytes: []const u8) void {
+        const self: *Sink = @ptrCast(@alignCast(ctx));
+        const n = @min(bytes.len, self.buf.len - self.len);
+        @memcpy(self.buf[self.len..][0..n], bytes[0..n]);
+        self.len += n;
+    }
+
+    fn got(self: *const Sink) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
 test "plain text lands on the grid" {
     var s = try Screen.init(std.testing.allocator, 10, 3);
     defer s.deinit();
@@ -438,7 +918,6 @@ test "deferred wrap: a line that exactly fills the width does not scroll early" 
     defer s.deinit();
 
     feed(&s, "abcd");
-    // Cursor parked on the last column with a wrap pending, still on row 0.
     try std.testing.expectEqual(@as(u32, 0), s.cursor_y);
     try std.testing.expect(s.wrap_pending);
 
@@ -475,16 +954,13 @@ test "SGR truecolor and 256-colour set the pen" {
     defer s.deinit();
 
     feed(&s, "\x1b[38;2;10;20;30mA");
-    const a = s.styles.get(s.grid.at(0, 0).style);
-    try std.testing.expect(a.fg.eq(Rgb.rgb(10, 20, 30)));
+    try std.testing.expect(s.styles.get(s.grid.at(0, 0).style).fg.eq(Rgb.rgb(10, 20, 30)));
 
     feed(&s, "\x1b[38;5;196mB");
-    const b = s.styles.get(s.grid.at(1, 0).style);
-    try std.testing.expect(b.fg.eq(cellmod.palette256[196]));
+    try std.testing.expect(s.styles.get(s.grid.at(1, 0).style).fg.eq(cellmod.palette256[196]));
 
     feed(&s, "\x1b[0mC");
-    const c = s.styles.get(s.grid.at(2, 0).style);
-    try std.testing.expect(c.fg.eq(cellmod.default_fg));
+    try std.testing.expect(s.styles.get(s.grid.at(2, 0).style).fg.eq(cellmod.default_fg));
 }
 
 test "SGR 4:3 selects curly underline without also setting italic" {
@@ -507,7 +983,6 @@ test "CUP is 1-based and clamps to the grid" {
 
     feed(&s, "\x1b[H");
     try std.testing.expectEqual(@as(u32, 0), s.cursor_y);
-    try std.testing.expectEqual(@as(u32, 0), s.cursor_x);
 
     feed(&s, "\x1b[99;99H");
     try std.testing.expectEqual(@as(u32, 3), s.cursor_y);
@@ -539,21 +1014,18 @@ test "soft-wrapped output rewraps on narrow and survives widening again" {
     var s = try Screen.init(std.testing.allocator, 20, 5);
     defer s.deinit();
 
-    const long = "the quick brown fox jumps over the lazy dog";
-    feed(&s, long);
+    feed(&s, "the quick brown fox jumps over the lazy dog");
 
     // rowText trims the trailing blanks of each row, so expectations carry none.
     var buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings("the quick brown fox", rowText(&s, 0, &buf));
     try std.testing.expect(s.grid.rowMeta(0).wrapped);
 
-    // Narrow well below the line width.
     try s.resize(10, 5);
     try std.testing.expectEqualStrings("the quick", rowText(&s, 0, &buf));
     try std.testing.expectEqualStrings("brown fox", rowText(&s, 1, &buf));
     try std.testing.expectEqualStrings("jumps over", rowText(&s, 2, &buf));
 
-    // Widen again: the original layout comes back rather than staying truncated.
     try s.resize(20, 5);
     try std.testing.expectEqualStrings("the quick brown fox", rowText(&s, 0, &buf));
     try std.testing.expectEqualStrings("jumps over the lazy", rowText(&s, 1, &buf));
@@ -568,7 +1040,6 @@ test "hard-newline lines are not merged when narrowing" {
     try s.resize(4, 6);
 
     var buf: [32]u8 = undefined;
-    // "alpha" rewraps to two rows; "beta" and "gamma" stay separate lines.
     try std.testing.expectEqualStrings("alph", rowText(&s, 0, &buf));
     try std.testing.expectEqualStrings("a", rowText(&s, 1, &buf));
     try std.testing.expectEqualStrings("beta", rowText(&s, 2, &buf));
@@ -581,7 +1052,6 @@ test "scrolled-off output goes to scrollback rather than being lost" {
     defer s.deinit();
     feed(&s, "one\r\ntwo\r\nthree\r\nfour");
 
-    // Screen shows the last two lines; the earlier ones are history.
     var buf: [32]u8 = undefined;
     try std.testing.expectEqualStrings("three", rowText(&s, 0, &buf));
     try std.testing.expectEqualStrings("four", rowText(&s, 1, &buf));
@@ -596,4 +1066,253 @@ test "tab advances to the next 8-column stop" {
 
     var buf: [32]u8 = undefined;
     try std.testing.expectEqualStrings("a       b", rowText(&s, 0, &buf));
+}
+
+test "HTS and TBC move and clear tab stops" {
+    var s = try Screen.init(std.testing.allocator, 24, 2);
+    defer s.deinit();
+
+    feed(&s, "\x1b[3g"); // clear all stops
+    feed(&s, "\x1b[1;5H\x1bH"); // set one at column 5 (index 4)
+    feed(&s, "\x1b[1;1H\ta");
+    try std.testing.expectEqual(@as(u32, 5), s.cursor_x);
+
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("    a", rowText(&s, 0, &buf));
+}
+
+test "CBT walks back through tab stops" {
+    var s = try Screen.init(std.testing.allocator, 32, 2);
+    defer s.deinit();
+    feed(&s, "\x1b[1;20H\x1b[2Z");
+    // From column 20 (index 19), two stops back is index 8.
+    try std.testing.expectEqual(@as(u32, 8), s.cursor_x);
+}
+
+test "alternate screen keeps the primary intact and has no scrollback" {
+    var s = try Screen.initScrollback(std.testing.allocator, 10, 3, 16);
+    defer s.deinit();
+
+    feed(&s, "primary text\r\n");
+    feed(&s, "\x1b[?1049h"); // enter alt
+    try std.testing.expect(s.in_alt);
+
+    var buf: [32]u8 = undefined;
+    // Alt starts cleared.
+    try std.testing.expectEqualStrings("", rowText(&s, 0, &buf));
+
+    feed(&s, "alt");
+    try std.testing.expectEqualStrings("alt", rowText(&s, 0, &buf));
+    // Scrolling the alt screen must not accumulate history.
+    feed(&s, "\r\n\r\n\r\n\r\n\r\n");
+    try std.testing.expectEqual(@as(usize, 0), s.grid.historyLen());
+
+    feed(&s, "\x1b[?1049l"); // back to primary
+    try std.testing.expect(!s.in_alt);
+    try std.testing.expectEqualStrings("primary te", rowText(&s, 0, &buf));
+}
+
+test "alt screen restores the cursor position on exit" {
+    var s = try Screen.init(std.testing.allocator, 10, 4);
+    defer s.deinit();
+
+    feed(&s, "\x1b[3;5H"); // row 3, col 5
+    feed(&s, "\x1b[?1049h");
+    feed(&s, "\x1b[1;1Hxyz");
+    feed(&s, "\x1b[?1049l");
+
+    try std.testing.expectEqual(@as(u32, 2), s.cursor_y);
+    try std.testing.expectEqual(@as(u32, 4), s.cursor_x);
+}
+
+test "scroll region confines scrolling to its rows" {
+    var s = try Screen.init(std.testing.allocator, 6, 5);
+    defer s.deinit();
+
+    feed(&s, "\x1b[1;1Hr0\x1b[2;1Hr1\x1b[3;1Hr2\x1b[4;1Hr3\x1b[5;1Hr4");
+    // Region covers rows 2..4 (1-based), i.e. indices 1..3.
+    feed(&s, "\x1b[2;4r");
+    feed(&s, "\x1b[4;1H\n"); // LF on the region's last row scrolls the region
+
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("r0", rowText(&s, 0, &buf)); // untouched
+    try std.testing.expectEqualStrings("r2", rowText(&s, 1, &buf));
+    try std.testing.expectEqualStrings("r3", rowText(&s, 2, &buf));
+    try std.testing.expectEqualStrings("", rowText(&s, 3, &buf)); // blanked
+    try std.testing.expectEqualStrings("r4", rowText(&s, 4, &buf)); // untouched
+}
+
+test "region scrolling does not pollute scrollback" {
+    var s = try Screen.initScrollback(std.testing.allocator, 6, 4, 16);
+    defer s.deinit();
+
+    feed(&s, "\x1b[1;3r"); // region is rows 1..3
+    feed(&s, "\x1b[3;1H\n\n\n\n");
+    try std.testing.expectEqual(@as(usize, 0), s.grid.historyLen());
+}
+
+test "reverse index scrolls the region down at its top" {
+    var s = try Screen.init(std.testing.allocator, 6, 4);
+    defer s.deinit();
+
+    feed(&s, "\x1b[1;1Ha\x1b[2;1Hb\x1b[3;1Hc");
+    feed(&s, "\x1b[1;1H\x1bM"); // RI at the top margin
+
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("", rowText(&s, 0, &buf));
+    try std.testing.expectEqualStrings("a", rowText(&s, 1, &buf));
+    try std.testing.expectEqualStrings("b", rowText(&s, 2, &buf));
+}
+
+test "insert and delete lines within the region" {
+    var s = try Screen.init(std.testing.allocator, 6, 4);
+    defer s.deinit();
+
+    feed(&s, "\x1b[1;1Ha\x1b[2;1Hb\x1b[3;1Hc\x1b[4;1Hd");
+    feed(&s, "\x1b[2;1H\x1b[L"); // insert a line at row 2
+
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("a", rowText(&s, 0, &buf));
+    try std.testing.expectEqualStrings("", rowText(&s, 1, &buf));
+    try std.testing.expectEqualStrings("b", rowText(&s, 2, &buf));
+
+    feed(&s, "\x1b[2;1H\x1b[M"); // delete it again
+    try std.testing.expectEqualStrings("b", rowText(&s, 1, &buf));
+    try std.testing.expectEqualStrings("c", rowText(&s, 2, &buf));
+}
+
+test "insert and delete characters shift the line" {
+    var s = try Screen.init(std.testing.allocator, 8, 2);
+    defer s.deinit();
+
+    feed(&s, "abcdef\x1b[1;3H\x1b[2@"); // insert 2 blanks before 'c'
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("ab  cdef", rowText(&s, 0, &buf));
+
+    feed(&s, "\x1b[1;3H\x1b[2P"); // delete them again
+    try std.testing.expectEqualStrings("abcdef", rowText(&s, 0, &buf));
+}
+
+test "insert mode shifts instead of overwriting" {
+    var s = try Screen.init(std.testing.allocator, 8, 2);
+    defer s.deinit();
+    feed(&s, "abcd\x1b[1;2H\x1b[4hXY");
+
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("aXYbcd", rowText(&s, 0, &buf));
+}
+
+test "origin mode makes addressing relative to the region" {
+    var s = try Screen.init(std.testing.allocator, 6, 6);
+    defer s.deinit();
+
+    feed(&s, "\x1b[3;5r"); // region rows 3..5 -> indices 2..4
+    feed(&s, "\x1b[?6h"); // DECOM
+    feed(&s, "\x1b[1;1HX");
+
+    var buf: [16]u8 = undefined;
+    // Row 1 in origin mode is the region's top, index 2.
+    try std.testing.expectEqualStrings("X", rowText(&s, 2, &buf));
+}
+
+test "REP repeats the last printed character" {
+    var s = try Screen.init(std.testing.allocator, 10, 2);
+    defer s.deinit();
+    feed(&s, "-\x1b[4b");
+
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("-----", rowText(&s, 0, &buf));
+}
+
+test "DECALN fills the screen with E" {
+    var s = try Screen.init(std.testing.allocator, 4, 2);
+    defer s.deinit();
+    feed(&s, "\x1b#8");
+
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("EEEE", rowText(&s, 0, &buf));
+    try std.testing.expectEqualStrings("EEEE", rowText(&s, 1, &buf));
+}
+
+test "save and restore cursor round-trips position and pen" {
+    var s = try Screen.init(std.testing.allocator, 10, 4);
+    defer s.deinit();
+
+    feed(&s, "\x1b[2;4H\x1b[31m\x1b7"); // DECSC
+    feed(&s, "\x1b[1;1H\x1b[0m");
+    feed(&s, "\x1b8"); // DECRC
+
+    try std.testing.expectEqual(@as(u32, 1), s.cursor_y);
+    try std.testing.expectEqual(@as(u32, 3), s.cursor_x);
+    try std.testing.expect(s.pen.fg.eq(cellmod.ansi16[1]));
+}
+
+test "device attributes and cursor position report" {
+    var s = try Screen.init(std.testing.allocator, 20, 5);
+    defer s.deinit();
+
+    var sink = Sink{};
+    s.reply = .{ .ctx = &sink, .write = Sink.write };
+
+    feed(&s, "\x1b[c");
+    try std.testing.expectEqualStrings("\x1b[?62;22c", sink.got());
+
+    sink.len = 0;
+    feed(&s, "\x1b[>c");
+    try std.testing.expectEqualStrings("\x1b[>0;10;1c", sink.got());
+
+    sink.len = 0;
+    feed(&s, "\x1b[3;7H\x1b[6n");
+    try std.testing.expectEqualStrings("\x1b[3;7R", sink.got());
+
+    sink.len = 0;
+    feed(&s, "\x1b[5n");
+    try std.testing.expectEqualStrings("\x1b[0n", sink.got());
+}
+
+test "DECDSR private status queries go unanswered" {
+    var s = try Screen.init(std.testing.allocator, 10, 3);
+    defer s.deinit();
+
+    var sink = Sink{};
+    s.reply = .{ .ctx = &sink, .write = Sink.write };
+
+    feed(&s, "\x1b[?6n");
+    try std.testing.expectEqual(@as(usize, 0), sink.len);
+}
+
+test "application cursor keys and bracketed paste modes are tracked" {
+    var s = try Screen.init(std.testing.allocator, 10, 3);
+    defer s.deinit();
+
+    feed(&s, "\x1b[?1h\x1b[?2004h");
+    try std.testing.expect(s.modes.app_cursor);
+    try std.testing.expect(s.modes.bracketed_paste);
+
+    feed(&s, "\x1b[?1l\x1b[?2004l");
+    try std.testing.expect(!s.modes.app_cursor);
+    try std.testing.expect(!s.modes.bracketed_paste);
+}
+
+test "synchronized output mode is tracked" {
+    var s = try Screen.init(std.testing.allocator, 10, 3);
+    defer s.deinit();
+    feed(&s, "\x1b[?2026h");
+    try std.testing.expect(s.sync_output);
+    feed(&s, "\x1b[?2026l");
+    try std.testing.expect(!s.sync_output);
+}
+
+test "resize keeps the alternate screen in step with the primary" {
+    var s = try Screen.init(std.testing.allocator, 10, 4);
+    defer s.deinit();
+
+    feed(&s, "\x1b[?1049h");
+    try s.resize(20, 6);
+
+    try std.testing.expectEqual(@as(u32, 20), s.grid.cols);
+    try std.testing.expectEqual(@as(u32, 6), s.grid.rows);
+    try std.testing.expectEqual(@as(u32, 20), s.other.cols);
+    try std.testing.expectEqual(@as(u32, 6), s.other.rows);
+    try std.testing.expectEqual(@as(u32, 5), s.margin_bottom);
 }

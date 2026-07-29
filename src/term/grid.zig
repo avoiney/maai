@@ -166,6 +166,87 @@ pub const Grid = struct {
         self.count = self.rows;
     }
 
+    // ── scroll regions ──────────────────────────────────────────────────────
+    // Region scrolling copies row contents rather than rotating the `cells`
+    // pointers, because ring slot k permanently owns slab[k * cols ..]. Breaking
+    // that would corrupt every later index calculation.
+    //
+    // Note these never touch scrollback: only a full-screen scroll produces
+    // history, which is why `Screen.lineFeed` routes to `scrollUp` when the top
+    // margin is 0 and here otherwise. Pushing region scrolls into history would
+    // fill it with garbage from every full-screen app's redraw.
+
+    fn copyVisibleRow(self: *Grid, dst: u32, src: u32) void {
+        const d = self.rowMeta(dst);
+        const s = self.rowMeta(src);
+        @memcpy(d.cells, s.cells);
+        d.wrapped = s.wrapped;
+    }
+
+    /// Scroll rows [top, bottom] up by `n`, blanking those exposed at the bottom.
+    pub fn scrollRegionUp(self: *Grid, top: u32, bottom: u32, n: u32, style: u16) void {
+        if (n == 0 or top > bottom or bottom >= self.rows) return;
+        const height = bottom - top + 1;
+        if (n >= height) {
+            self.clearRows(top, bottom + 1, style);
+            return;
+        }
+        var y = top;
+        while (y + n <= bottom) : (y += 1) self.copyVisibleRow(y, y + n);
+        self.clearRows(bottom + 1 - n, bottom + 1, style);
+    }
+
+    /// Scroll rows [top, bottom] down by `n`, blanking those exposed at the top.
+    pub fn scrollRegionDown(self: *Grid, top: u32, bottom: u32, n: u32, style: u16) void {
+        if (n == 0 or top > bottom or bottom >= self.rows) return;
+        const height = bottom - top + 1;
+        if (n >= height) {
+            self.clearRows(top, bottom + 1, style);
+            return;
+        }
+        var y: u32 = bottom + 1;
+        while (y > top + n) {
+            y -= 1;
+            self.copyVisibleRow(y, y - n);
+        }
+        self.clearRows(top, top + n, style);
+    }
+
+    /// Resize without reflow, preserving the top-left overlap.
+    ///
+    /// This is for the alternate screen, which has no scrollback and whose owner
+    /// redraws on SIGWINCH anyway. Rewrapping a full-screen TUI would produce
+    /// garbage, since its "lines" are really independent screen rows.
+    pub fn resizePreserve(self: *Grid, cols: u32, rows: u32, style: u16) !void {
+        if (cols == self.cols and rows == self.rows) return;
+        if (cols == 0 or rows == 0) return;
+
+        const capacity = @as(usize, rows) + self.scrollback_max;
+        const slab = try self.gpa.alloc(Cell, capacity * cols);
+        errdefer self.gpa.free(slab);
+        @memset(slab, blankCell(style));
+
+        const buf = try self.gpa.alloc(Row, capacity);
+        errdefer self.gpa.free(buf);
+        for (buf, 0..) |*r, k| r.* = .{ .cells = slab[k * cols ..][0..cols] };
+
+        const copy_rows = @min(rows, self.rows);
+        const copy_cols = @min(cols, self.cols);
+        var y: u32 = 0;
+        while (y < copy_rows) : (y += 1) {
+            @memcpy(buf[y].cells[0..copy_cols], self.row(y)[0..copy_cols]);
+        }
+
+        self.gpa.free(self.slab);
+        self.gpa.free(self.buf);
+        self.slab = slab;
+        self.buf = buf;
+        self.cols = cols;
+        self.rows = rows;
+        self.start = 0;
+        self.count = rows;
+    }
+
     // ── reflow ──────────────────────────────────────────────────────────────
 
     const Logical = struct {

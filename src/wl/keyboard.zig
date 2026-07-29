@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const Modes = @import("../term/screen.zig").Modes;
 
 /// Where encoded key bytes go. Indirected so this module does not need to know
 /// about the PTY or the App.
@@ -27,6 +28,8 @@ pub const Keyboard = struct {
     state: ?*c.struct_xkb_state = null,
     wl_kbd: ?*c.struct_wl_keyboard = null,
     sink: ?Sink = null,
+    /// Terminal modes that change how keys encode. Borrowed from the Screen.
+    modes: ?*const Modes = null,
 
     /// Captured from repeat_info; acted on in phase 3.
     repeat_rate: i32 = 25,
@@ -74,7 +77,6 @@ pub const Keyboard = struct {
             (if (ctrl) @as(u8, 4) else 0);
         const modded = mod != 1;
 
-        // Cursor and editing keys. CSI form only; DECCKM's SS3 form is phase 3.
         const csi_final: ?u8 = switch (sym) {
             c.XKB_KEY_Up => 'A',
             c.XKB_KEY_Down => 'B',
@@ -85,8 +87,16 @@ pub const Keyboard = struct {
             else => null,
         };
         if (csi_final) |final| {
-            return if (modded)
-                std.fmt.bufPrint(buf, "\x1b[1;{d}{c}", .{ mod, final }) catch null
+            if (modded) {
+                // Modified cursor keys always use the CSI form with a parameter,
+                // even under DECCKM — SS3 has nowhere to put the modifier.
+                return std.fmt.bufPrint(buf, "\x1b[1;{d}{c}", .{ mod, final }) catch null;
+            }
+            // DECCKM (application cursor keys): SS3 rather than CSI. nvim and less
+            // both enable this, and arrow keys misbehave in them without it.
+            const app = if (self.modes) |m| m.app_cursor else false;
+            return if (app)
+                std.fmt.bufPrint(buf, "\x1bO{c}", .{final}) catch null
             else
                 std.fmt.bufPrint(buf, "\x1b[{c}", .{final}) catch null;
         }
