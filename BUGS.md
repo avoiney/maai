@@ -13,13 +13,48 @@ phase 3.
 | Point | État |
 |---|---|
 | §1 cluster perdu au resize | **corrigé** — `grapheme` testé avant les prédicats de blanc, dans `grid.zig`, `cell.zig` et `selection.zig` ; test de non-régression ajouté |
-| §2 table de styles non recyclée | **ouvert** — demande un vrai refcount, voir plus bas |
-| §3 `GraphemeTable` sans borne | **ouvert** — même mécanisme que §2 |
+| §2 table de styles non recyclée | **corrigé** — marquage-compactage dans `Screen.collectGarbage`, avec temporisation quand l'ensemble vivant est réellement grand |
+| §3 `GraphemeTable` sans borne | **corrigé** — même passage de ramassage ; le contrôle vit aussi dans `extendCluster`, la croissance étant pilotée par `print` et non par SGR |
 | §4 spin CPU si le compositeur meurt | **corrigé** — sortie sur `POLLERR/HUP/NVAL`, et `dispatch_pending < 0` traité comme fatal |
 | §5 UTF-8 overlongs et surrogates | **corrigé** — validation du codepoint assemblé, U+FFFD sinon ; tests des bornes de chaque longueur |
-| §R1 coût du reflow | **ouvert** — à mesurer avant d'optimiser |
+| §R1 coût du reflow | **mesuré, partiellement corrigé** — voir le tableau de chiffres plus bas |
 | §R2 taille de `screen.zig` | **ouvert** |
 | §D1 commentaires périmés | **corrigé** pour l'en-tête de `screen.zig` (double largeur) ; les deux TODO de `cell.zig` restent exacts tant que §2 et §3 sont ouverts |
+
+## Mesures (`zig build bench -Doptimize=ReleaseFast`)
+
+Harnais dans `src/bench.zig` : aucune dépendance Wayland/EGL/fcft, donc un chiffre
+s'attribue à une couche et non à « le terminal ». Minimum de 5 exécutions après un
+tour de chauffe écarté, écart au-dessus indiqué, horloge monotone, allocations
+comptées par un allocateur enveloppant.
+
+| Cas | Avant | Après |
+|---|---|---|
+| truecolor SGR par cellule (2 MiB) | 239 909 ms | **10,1 ms** — 198 MiB/s |
+| 150k styles distincts | 102 703 ms | **13,9 ms** |
+| reflow, 10k lignes, largeur −1 | 11,4 ms · 19,2 MiB | inchangé |
+| reflow, 10k lignes, hauteur −1 | 11,1 ms · 19,2 MiB | **0,009 ms · 0,1 MiB** |
+| parse ASCII (4 MiB) | — | 26,8 ms — 149 MiB/s |
+| parse CJK + combinantes (2 MiB) | — | 8,7 ms — 231 MiB/s |
+| 50k défilements de ligne | — | 2,7 ms |
+
+Deux enseignements de la mesure :
+
+1. **Mon propre ramassage était quadratique.** Avec du truecolor par cellule chaque
+   style est référencé par une cellule vivante : le balayage ne libère rien, réarme
+   au plafond, et repart à chaque SGR pour rebalayer 2,4 M de cellules. 240 secondes
+   pour 2 MiB. Corrigé par une temporisation : un ramassage improductif désarme le
+   suivant pour 65536 internements et on accepte la saturation — ce qui est honnête,
+   on ne peut pas représenter plus de 65535 styles simultanés.
+2. **Le redimensionnement purement vertical ne nécessite aucun re-wrap.** Chaque
+   ligne garde sa largeur et ses drapeaux ; `rows` n'est que « combien du ring est
+   visible ». Voie rapide en O(rows) : 1200× plus rapide, et 190× moins d'allocation.
+
+Reste ouvert : le changement de **largeur** coûte toujours 11,4 ms et 19,2 MiB. À
+75 Hz pendant un glisser de bord latéral, c'est 0,85 s de travail par seconde — le
+budget de trame de 13 ms est dépassé. Pistes non tentées : ne pas `memset` le slab
+que l'on va réécrire ; ne reflower que l'historique réellement atteignable et
+différer le reste. À mesurer de nouveau avant de choisir.
 
 Bug supplémentaire trouvé hors relevé, signalé à l'usage : **coller dans myterm ce
 qu'on venait d'y copier ne faisait rien.** Interblocage sur soi-même — on demandait

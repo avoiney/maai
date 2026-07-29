@@ -80,12 +80,15 @@ comptime {
     std.debug.assert(@sizeOf(Cell) == 8);
 }
 
+/// Live-set thresholds at which `Screen` compacts its tables. Chosen well below the
+/// 65535 id ceiling so there is room to keep working while the scan runs.
+pub const style_gc_threshold: usize = 32768;
+pub const grapheme_gc_threshold: usize = 16384;
+
 /// Maps Style -> id, with a dense array for id -> Style.
 ///
-/// Phase 1 never reclaims ids: styles are append-only until the table is reset.
-/// A screenful of `ls --color` output produces a few dozen entries, so the leak is
-/// bounded in practice. Refcounting arrives with scrollback in phase 2, where
-/// long-lived history can otherwise accumulate unbounded distinct styles.
+/// Ids are allocated append-only; unreferenced ones are reclaimed by
+/// `Screen.collectGarbage`, which is the only thing with a view of every cell.
 pub const StyleTable = struct {
     list: std.ArrayList(Style) = .empty,
     map: std.AutoHashMapUnmanaged(Style, u16) = .empty,
@@ -116,6 +119,21 @@ pub const StyleTable = struct {
         if (id >= self.list.items.len) return Style.default;
         return self.list.items[id];
     }
+
+    /// Replace the contents with `styles`, whose order defines the new ids.
+    pub fn rebuild(
+        self: *StyleTable,
+        gpa: std.mem.Allocator,
+        styles: []const Style,
+    ) !void {
+        self.list.clearRetainingCapacity();
+        self.map.clearRetainingCapacity();
+        try self.list.ensureTotalCapacity(gpa, styles.len);
+        for (styles, 0..) |s, i| {
+            self.list.appendAssumeCapacity(s);
+            try self.map.put(gpa, s, @intCast(i));
+        }
+    }
 };
 
 /// Multi-codepoint grapheme clusters, held out of line so the common
@@ -129,7 +147,7 @@ pub const GraphemeTable = struct {
     /// driven by untrusted input.
     pub const max_len = 8;
 
-    const Span = struct { start: u32, len: u8 };
+    pub const Span = struct { start: u32, len: u8 };
 
     data: std.ArrayList(u21) = .empty,
     spans: std.ArrayList(Span) = .empty,
@@ -142,8 +160,8 @@ pub const GraphemeTable = struct {
     /// Store a cluster and return its index.
     ///
     /// Append-only: extending a cluster writes a new entry rather than editing the
-    /// old one, so the previous copy is wasted. Bounded in practice because clusters
-    /// are short and rare. TODO(phase 2 remainder): reclaim alongside style ids.
+    /// old one, so the previous copy is dead. `Screen.collectGarbage` reclaims both
+    /// that waste and clusters whose cells are gone.
     pub fn add(self: *GraphemeTable, gpa: std.mem.Allocator, cps: []const u21) !u32 {
         const n = @min(cps.len, max_len);
         const start: u32 = @intCast(self.data.items.len);

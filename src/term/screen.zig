@@ -26,6 +26,56 @@ pub const Reply = struct {
 
 pub const MouseMode = enum { off, x10, button, any };
 
+/// Garbage-collection pacing for one interned table.
+///
+/// `floor` is tracked separately from `trigger` because the trigger is re-armed
+/// above whatever survived a collection; re-arming against a global constant would
+/// make it un-lowerable.
+///
+/// `cooldown` exists because collection cannot always help. Per-cell truecolor —
+/// `lolcat`, a gradient prompt, an image converted to ANSI — genuinely references
+/// tens of thousands of distinct styles from live cells, so a scan frees nothing,
+/// the trigger re-arms at the ceiling, and every subsequent SGR rescans the entire
+/// grid. That is quadratic, and it is not theoretical: before this cooldown existed
+/// the benchmark took **240 seconds** to parse 4 MiB of per-cell truecolor, versus
+/// well under a second after. When a collection turns out unproductive we back off
+/// hard and accept saturation, which is honest — no more than 65535 distinct styles
+/// can be represented at once — rather than paying for a scan that cannot help.
+const Gc = struct {
+    trigger: usize,
+    floor: usize = 0,
+    /// Interns to let past before attempting collection again.
+    cooldown: usize = 0,
+
+    /// How many interns to skip after a collection that freed almost nothing. Large
+    /// enough that the amortised scan cost disappears, small enough that space
+    /// freed by scrollback churn is eventually reclaimed.
+    const unproductive_cooldown: usize = 1 << 16;
+
+    fn init(trigger: usize) Gc {
+        return .{ .trigger = trigger, .floor = trigger };
+    }
+
+    /// True if a collection should run now, consuming one step of any cooldown.
+    fn due(self: *Gc, live: usize) bool {
+        if (self.cooldown > 0) {
+            self.cooldown -= 1;
+            return false;
+        }
+        return live >= self.trigger;
+    }
+
+    fn rearm(self: *Gc, before: usize, after: usize, ceiling: usize) void {
+        const base = if (self.floor == 0) self.trigger else self.floor;
+        self.floor = base;
+        self.trigger = @min(@max(base, after * 2), ceiling);
+
+        // Freed less than a quarter? The live set is simply this large.
+        const freed = before - after;
+        if (freed * 4 < before) self.cooldown = unproductive_cooldown;
+    }
+};
+
 const SavedCursor = struct {
     x: u32 = 0,
     y: u32 = 0,
@@ -98,6 +148,10 @@ pub const Screen = struct {
 
     /// One entry per column; true where a tab stop sits.
     tab_stops: []bool,
+
+    /// When `collectGarbage` runs, per table.
+    gc_styles: Gc = .{ .trigger = cellmod.style_gc_threshold },
+    gc_graphemes: Gc = .{ .trigger = cellmod.grapheme_gc_threshold },
 
     /// Last printed codepoint, for REP.
     last_printed: u21 = ' ',
@@ -334,6 +388,15 @@ pub const Screen = struct {
     }
 
     fn extendCluster(self: *Screen, cell: *Cell, cp: u21) void {
+        // Cluster growth is driven by printing, not by SGR, so the pacing check has
+        // to live here as well — `commitPen` alone would never see it, and a `cat`
+        // of decomposed text would grow the table without bound.
+        //
+        // Safe to collect at this point: collection rewrites cell *fields* but never
+        // moves cells, so `cell` stays valid, and the old cluster it still refers to
+        // is marked live and survives with a remapped index.
+        if (self.gc_graphemes.due(self.graphemes.spans.items.len)) self.collectGarbage();
+
         var buf: [cellmod.GraphemeTable.max_len]u21 = undefined;
         var n: usize = 0;
 
@@ -976,9 +1039,138 @@ pub const Screen = struct {
     }
 
     fn commitPen(self: *Screen) void {
+        if (self.gc_styles.due(self.styles.list.items.len)) self.collectGarbage();
         // Falling back to the default style on OOM is a cosmetic loss; refusing to
         // render would not be.
         self.pen_id = self.styles.intern(self.gpa, self.pen) catch 0;
+    }
+
+    // ── reclamation ────────────────────────────────────────────────────────
+
+    const unused_style: u16 = 0xffff;
+    const marked_style: u16 = 0xfffe;
+    const unused_cluster: u32 = 0xffff_ffff;
+    const marked_cluster: u32 = 0xffff_fffe;
+
+    /// Reclaim style ids and grapheme clusters no cell refers to any more.
+    ///
+    /// Mark and compact, not refcounting. Refcounting would put an increment and a
+    /// decrement on every cell write — including the bulk `@memset` paths used by
+    /// erase, scroll and clear, which have no single place to hook — and `print` is
+    /// the hottest loop in the program. Compaction costs one full scan of both
+    /// grids, but only when a table is nearly full.
+    ///
+    /// Without this, a `lolcat` or a gradient prompt exhausts all 65535 style ids in
+    /// a few screens at 1440p, after which every cell renders in the default style
+    /// for the rest of the session, with no message and no way to recover.
+    pub fn collectGarbage(self: *Screen) void {
+        const gpa = self.gpa;
+        const style_n = self.styles.list.items.len;
+        const cluster_n = self.graphemes.spans.items.len;
+
+        const style_map = gpa.alloc(u16, style_n) catch return;
+        defer gpa.free(style_map);
+        @memset(style_map, unused_style);
+
+        const cluster_map = gpa.alloc(u32, cluster_n) catch return;
+        defer gpa.free(cluster_map);
+        @memset(cluster_map, unused_cluster);
+
+        // ── mark ──
+        // Scrollback counts: a cell that has scrolled off screen is still live, and
+        // will be shown again if the user scrolls back or the window is widened.
+        for ([_]*const Grid{ &self.grid, &self.other }) |g| {
+            var i: usize = 0;
+            while (i < g.count) : (i += 1) {
+                for (g.line(i).cells) |cell| {
+                    if (cell.style < style_n) style_map[cell.style] = marked_style;
+                    if (cell.grapheme and cell.content < cluster_n) {
+                        cluster_map[cell.content] = marked_cluster;
+                    }
+                }
+            }
+        }
+        // Ids held outside the grids: the current pen and both saved cursors.
+        for ([_]u16{ self.pen_id, self.saved.pen_id, self.other_saved.pen_id }) |id| {
+            if (id < style_n) style_map[id] = marked_style;
+        }
+        // Id 0 is the default style and must keep that id, referenced or not: a
+        // zeroed Cell means "default", so renumbering it would change every blank.
+        if (style_n > 0) style_map[0] = marked_style;
+
+        // ── assign new ids ──
+        var new_styles: std.ArrayList(cellmod.Style) = .empty;
+        defer new_styles.deinit(gpa);
+        for (style_map, 0..) |*slot, old| {
+            if (slot.* != marked_style) continue;
+            slot.* = @intCast(new_styles.items.len);
+            new_styles.append(gpa, self.styles.list.items[old]) catch return;
+        }
+
+        var new_data: std.ArrayList(u21) = .empty;
+        defer new_data.deinit(gpa);
+        var new_spans: std.ArrayList(cellmod.GraphemeTable.Span) = .empty;
+        defer new_spans.deinit(gpa);
+        for (cluster_map, 0..) |*slot, old| {
+            if (slot.* != marked_cluster) continue;
+            const cps = self.graphemes.get(@intCast(old));
+            const start: u32 = @intCast(new_data.items.len);
+            new_data.appendSlice(gpa, cps) catch return;
+            slot.* = @intCast(new_spans.items.len);
+            new_spans.append(gpa, .{
+                .start = start,
+                .len = @intCast(cps.len),
+            }) catch return;
+        }
+
+        // Everything below this point must not fail: the maps are final and the
+        // cells are about to be renumbered against them.
+
+        // ── rewrite references ──
+        for ([_]*const Grid{ &self.grid, &self.other }) |g| {
+            var i: usize = 0;
+            while (i < g.count) : (i += 1) {
+                for (g.line(i).cells) |*cell| {
+                    if (cell.style < style_n and style_map[cell.style] < marked_style) {
+                        cell.style = style_map[cell.style];
+                    } else {
+                        cell.style = 0;
+                    }
+                    if (cell.grapheme) {
+                        if (cell.content < cluster_n and
+                            cluster_map[cell.content] < marked_cluster)
+                        {
+                            cell.content = cluster_map[cell.content];
+                        } else {
+                            // Unreachable in practice: the cell was just marked.
+                            // Degrade to a blank rather than point at nothing.
+                            cell.grapheme = false;
+                            cell.content = Cell.empty;
+                        }
+                    }
+                }
+            }
+        }
+        self.pen_id = if (self.pen_id < style_n) style_map[self.pen_id] else 0;
+        self.saved.pen_id = if (self.saved.pen_id < style_n) style_map[self.saved.pen_id] else 0;
+        self.other_saved.pen_id = if (self.other_saved.pen_id < style_n)
+            style_map[self.other_saved.pen_id]
+        else
+            0;
+
+        self.styles.rebuild(gpa, new_styles.items) catch {};
+        self.graphemes.data.clearRetainingCapacity();
+        self.graphemes.spans.clearRetainingCapacity();
+        self.graphemes.data.appendSlice(gpa, new_data.items) catch {};
+        self.graphemes.spans.appendSlice(gpa, new_spans.items) catch {};
+
+        self.gc_styles.rearm(style_n, new_styles.items.len, std.math.maxInt(u16) - 1);
+        self.gc_graphemes.rearm(
+            cluster_n,
+            new_spans.items.len,
+            std.math.maxInt(u32) - 1,
+        );
+        self.dirty = true;
     }
 };
 
@@ -1641,6 +1833,87 @@ test "reflow keeps double-width pairs intact across a row break" {
             }
         }
     }
+}
+
+test "style ids are reclaimed rather than exhausting the table" {
+    var s = try Screen.init(std.testing.allocator, 10, 2);
+    defer s.deinit();
+    s.gc_styles = Gc.init(64); // collect early so the test stays quick
+
+    // Overwrite one cell with a thousand distinct truecolor styles. Only the last
+    // is referenced, so the table must not grow without bound — this is the
+    // `lolcat` case that used to degrade the session permanently.
+    var i: u32 = 0;
+    while (i < 1000) : (i += 1) {
+        var buf: [40]u8 = undefined;
+        const seq = try std.fmt.bufPrint(
+            &buf,
+            "\x1b[1;1H\x1b[38;2;{d};{d};7mX",
+            .{ i % 256, (i / 256) % 256 },
+        );
+        feed(&s, seq);
+    }
+
+    try std.testing.expect(s.styles.list.items.len < 300);
+    // The most recent style is intact, so collection did not corrupt live data.
+    const st = s.styles.get(s.grid.at(0, 0).style);
+    try std.testing.expect(st.fg.eq(Rgb.rgb(999 % 256, (999 / 256) % 256, 7)));
+}
+
+test "styles referenced only from scrollback survive collection" {
+    var s = try Screen.initScrollback(std.testing.allocator, 8, 2, 16);
+    defer s.deinit();
+
+    // Push a red line into history, where nothing on screen refers to its style.
+    feed(&s, "\x1b[31mRED\r\n\x1b[0mx\r\ny\r\nz");
+    try std.testing.expect(s.grid.historyLen() > 0);
+
+    s.gc_styles = Gc.init(4);
+    feed(&s, "\x1b[32mG"); // triggers collection
+
+    // Find the history line holding "RED" and check it is still red.
+    var found = false;
+    var line: usize = 0;
+    while (line < s.grid.count) : (line += 1) {
+        const cells = s.grid.line(line).cells;
+        if (cells[0].content != 'R') continue;
+        found = true;
+        try std.testing.expect(s.styles.get(cells[0].style).fg.eq(cellmod.ansi16[1]));
+    }
+    try std.testing.expect(found);
+}
+
+test "grapheme clusters are reclaimed but live ones survive" {
+    var s = try Screen.init(std.testing.allocator, 10, 2);
+    defer s.deinit();
+    s.gc_graphemes = Gc.init(32);
+    s.gc_styles = Gc.init(32);
+
+    // Each pass writes a fresh cluster into the same cell, orphaning the previous.
+    var i: u32 = 0;
+    while (i < 500) : (i += 1) feed(&s, "\x1b[1;1He\u{0301}");
+
+    try std.testing.expect(s.graphemes.spans.items.len < 200);
+
+    const cell = s.grid.at(0, 0);
+    try std.testing.expect(cell.grapheme);
+    const cluster = s.graphemes.get(cell.content);
+    try std.testing.expectEqual(@as(usize, 2), cluster.len);
+    try std.testing.expectEqual(@as(u21, 'e'), cluster[0]);
+    try std.testing.expectEqual(@as(u21, 0x0301), cluster[1]);
+}
+
+test "collection keeps id 0 as the default style" {
+    var s = try Screen.init(std.testing.allocator, 6, 2);
+    defer s.deinit();
+    s.gc_styles = Gc.init(2);
+
+    feed(&s, "\x1b[38;2;1;2;3mA\x1b[38;2;4;5;6mB");
+    s.collectGarbage();
+
+    // A zeroed Cell must still mean "default", so id 0 cannot be renumbered.
+    try std.testing.expect(s.styles.get(0).fg.eq(cellmod.default_fg));
+    try std.testing.expect(s.styles.get(0).bg.eq(cellmod.default_bg));
 }
 
 test "resize keeps the alternate screen in step with the primary" {

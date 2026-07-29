@@ -111,6 +111,23 @@ pub fn build(b: *std.Build) void {
     const pure = b.addTest(.{ .root_module = pure_mod });
     const pure_step = b.step("test-pure", "Run the fast terminal-logic unit tests");
     pure_step.dependOn(&b.addRunArtifact(pure).step);
+
+    // Benchmarks. Same dependency-light shape as the fast tests, so parsing, grid
+    // mutation and reflow can be measured — and profiled under perf or callgrind —
+    // without a compositor in the picture.
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    bench_mod.linkSystemLibrary("utf8proc", .{});
+    const bench = b.addExecutable(.{ .name = "bench", .root_module = bench_mod });
+    b.installArtifact(bench);
+    const bench_run = b.addRunArtifact(bench);
+    if (b.args) |args| bench_run.addArgs(args);
+    const bench_step = b.step("bench", "Run core benchmarks (use -Doptimize=ReleaseFast)");
+    bench_step.dependOn(&bench_run.step);
 }
 
 /// Ask pkg-config where a package keeps its data files. Runs at configure time,
