@@ -229,7 +229,7 @@ Findings worth keeping, each of which cost a build cycle:
   handle cast at `eglCreateWindowSurface`.
 - `std.posix.getenv` is gone; use `std.c.getenv`.
 
-### Phase 1 — PTY and text on screen (≈1 week)
+### Phase 1 — PTY and text on screen ✅ done (2026-07-29)
 
 `openpty`, fork/exec `zsh` as session leader with correct `TERM`/`winsize`. Minimal VT:
 printable ASCII, `\n \r \b \t`, SGR 0/1/30-37/40-47. Load FiraCode via fcft, rasterize
@@ -237,7 +237,78 @@ into the R8 atlas, render one instanced quad per cell. Background pass, then gly
 
 **Acceptance:** `ls --color`, `echo`, and a shell prompt render correctly at both DPIs.
 
-### Phase 2 — VT conformance, scrollback, reflow (≈3–4 weeks)
+**Result:** cell 10x20 px, baseline 15, on `FiraCode Nerd Font:size=12:dpi=96`. Verified by
+screenshot: `ls --color` directory colours and `tmp`'s background highlight, 16/256/truecolor
+SGR, underline, inverse, dim, strikethrough, UTF-8 (`café → λ ★ ✓`), 8-column tab stops,
+cursor block. Survived four rapid compositor resizes with no crash or corruption. fcft
+reports `text-run=true`, so the ligature shaping phase 7 needs is available.
+
+Delivered beyond the phase 1 line, and why:
+- **Full Williams VT500 DFA**, not just the phase 1 subset — CSI/OSC/DCS/APC states all
+  exist so phase 2 only fills in handlers, and phase 8 can hang Sixel and the Kitty
+  graphics protocol off `dcsHook`/APC without restructuring.
+- **Minimal xkb keyboard** (`src/wl/keyboard.zig`). Phase 3 owns keyboard properly, but
+  phase 1's acceptance criteria cannot be checked interactively without being able to
+  type. Missing on purpose: key repeat, Kitty keyboard protocol, compose/dead keys,
+  DECCKM application cursor keys.
+- **`test-pure` build target** — the C-free suite (27 tests) runs in well under a second,
+  which is what makes the phase 2 reflow property tests practical to iterate on.
+- **`-e cmd`** for scripted checks without a keyboard.
+
+Deviation from §2 worth revisiting with data: the loop is **single-threaded** poll over
+Wayland + PTY, not a per-pane parse thread. Threading only starts paying for itself with
+multiple panes (phase 5), and foot shows a single-threaded loop is fully competitive.
+Decide by measurement then, not on principle.
+
+Known gaps carried into phase 2, all visible in the verification screenshots:
+- Double-width characters render narrow and overlap (`日本語`); needs wcwidth plus the
+  spacer cell and grapheme side table.
+- Resize truncates instead of reflowing — deliberate, since rewrap needs the `wrapped`
+  row flag that arrives with scrollback.
+- No scrollback, no alt screen, no scroll regions, so nvim/htop are not usable yet.
+- Style ids are never reclaimed (append-only until reset).
+- `TERM=xterm-256color`, pending the myterm terminfo entry.
+
+Zig 0.16 API findings, in addition to phase 0's:
+- `std.posix.write`/`close` were removed (the `Io` interface supersedes them); with libc
+  linked, call `std.c.write`/`std.c.close` and read errno via `std.c.errno(rc)`.
+- `std.ArrayList` is now the **unmanaged** variant — `.empty`, and every method takes the
+  allocator.
+- `std.mem.trimRight`/`trimLeft` are now `trimEnd`/`trimStart`.
+- `std.process.argsAlloc` and `std.os.argv` are gone. `main` takes
+  `std.process.Init.Minimal`, whose `args.vector` is `[]const [*:0]const u8` — already C
+  argv, so no duplication is needed before a fork/exec.
+- `std.posix.PROT` is a packed struct of flags: `.{ .READ = true }`.
+
+### Phase 2 — VT conformance, scrollback, reflow (≈3–4 weeks) — *in progress*
+
+**Done (2026-07-29): scrollback and reflow.** Pulled forward ahead of the rest of phase 2
+because truncation-on-resize was the most visible defect in daily use — narrowing the
+window cut text off, and widening could not bring it back since the cells were genuinely
+gone.
+
+- `Row.wrapped` records a soft wrap, which is the one bit of state that lets resize tell
+  "one long line" from "two short lines". Everything else here depends on it.
+- Storage is now a single ring buffer covering scrollback *and* screen, so scrolling is
+  "append a blank line" and history eviction falls out for free. Two allocations total: one
+  cell slab plus one row-metadata array, with ring slot `k` permanently owning
+  `slab[k * cols ..]`, so recycling a line during scroll is a memset.
+- `resizeReflow` recovers logical lines across `wrapped`, re-splits at the new width, and
+  carries the cursor by converting it to an offset within its logical line and back.
+- Trailing empty screen lines are dropped before rewrapping. Without that, the blank
+  remainder of the screen counts as real logical lines and every resize pushes actual
+  output further up into scrollback — which looks like content scrolling away for no
+  reason. The cursor's own line is always kept, since the prompt usually sits on an
+  otherwise-empty line.
+
+Verified by screenshot at 33 columns (long line spanning 5 rows, nothing lost) and back at
+90 columns (original 2-row layout and colours restored), plus 33 unit tests including a
+randomised width round-trip property test.
+
+**Still outstanding in this phase:** double-width characters (wcwidth + spacer cell +
+grapheme side table), alt screen (1049), scroll regions (DECSTBM), IL/DL/ICH/DCH,
+synchronized output (2026), the myterm terminfo entry, scrollback *viewing* (the data is
+there; the keybinding and view offset are not), and style-id reclamation.
 
 The bulk of correctness work.
 

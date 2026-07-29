@@ -61,13 +61,18 @@ pub fn build(b: *std.Build) void {
     }
 
     // ── System libraries ───────────────────────────────────────────────────
-    // Phase 0 set only. Later phases add: xkbcommon, xkbcommon-compose (phase 3),
-    // fcft / harfbuzz / freetype2 (phase 1 / 7), spng (phase 8), utf8proc.
+    // Later phases add: xkbcommon-compose (phase 3), harfbuzz / freetype2 when we
+    // drop below fcft (phase 7), spng and utf8proc (phase 8).
+    //
+    // forkpty/openpty are in libc since glibc 2.34, so there is no -lutil here.
     for ([_][]const u8{
         "wayland-client",
         "wayland-egl",
         "EGL",
         "GLESv2",
+        "fcft",
+        "pixman-1",
+        "xkbcommon",
     }) |lib| mod.linkSystemLibrary(lib, .{});
 
     const exe = b.addExecutable(.{ .name = "myterm", .root_module = mod });
@@ -79,9 +84,23 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Build and run myterm");
     run_step.dependOn(&run_cmd.step);
 
+    // Full suite: links everything, so it can cover font and renderer code.
     const tests = b.addTest(.{ .root_module = mod });
-    const test_step = b.step("test", "Run unit tests");
+    const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
+
+    // Pure-Zig suite: no C libraries, so it builds and runs in well under a
+    // second. This is the one to run on every save while working on the parser,
+    // grid, reflow, or URL scanning.
+    const pure = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tests_pure.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const pure_step = b.step("test-pure", "Run unit tests that need no C libraries");
+    pure_step.dependOn(&b.addRunArtifact(pure).step);
 }
 
 /// Ask pkg-config where a package keeps its data files. Runs at configure time,

@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const Keyboard = @import("keyboard.zig").Keyboard;
 
 pub const Error = error{
     ConnectFailed,
@@ -23,6 +24,10 @@ pub const Window = struct {
     compositor: ?*c.struct_wl_compositor = null,
     wm_base: ?*c.struct_xdg_wm_base = null,
     deco_manager: ?*c.struct_zxdg_decoration_manager_v1 = null,
+    seat: ?*c.struct_wl_seat = null,
+
+    /// Owned here so its address is stable for the wl_keyboard listener.
+    keyboard: Keyboard = .{},
 
     surface: ?*c.struct_wl_surface = null,
     xdg_surface: ?*c.struct_xdg_surface = null,
@@ -48,6 +53,7 @@ pub const Window = struct {
             return Error.ConnectFailed;
 
         w.* = .{ .display = display, .registry = registry };
+        w.keyboard.init();
 
         _ = c.wl_registry_add_listener(registry, &registry_listener, w);
 
@@ -103,7 +109,14 @@ pub const Window = struct {
         if (c.wl_display_dispatch(w.display) < 0) return Error.Disconnected;
     }
 
+    /// The Wayland connection's fd, for the poll loop in main.
+    pub fn fd(w: *Window) std.posix.fd_t {
+        return c.wl_display_get_fd(w.display);
+    }
+
     pub fn deinit(w: *Window) void {
+        w.keyboard.deinit();
+        if (w.seat) |s| c.wl_seat_destroy(s);
         if (w.decoration) |d| c.zxdg_toplevel_decoration_v1_destroy(d);
         if (w.toplevel) |t| c.xdg_toplevel_destroy(t);
         if (w.xdg_surface) |s| c.xdg_surface_destroy(s);
@@ -157,8 +170,44 @@ fn handleGlobal(
             &c.zxdg_decoration_manager_v1_interface,
             1,
         ));
+    } else if (std.mem.eql(u8, iface, "wl_seat")) {
+        w.seat = @ptrCast(c.wl_registry_bind(
+            registry,
+            name,
+            &c.wl_seat_interface,
+            @min(version, 7),
+        ));
+        _ = c.wl_seat_add_listener(w.seat, &seat_listener, w);
     }
 }
+
+const seat_listener: c.struct_wl_seat_listener = .{
+    .capabilities = handleSeatCapabilities,
+    .name = handleSeatName,
+};
+
+/// Capabilities can change at runtime (a keyboard being unplugged), so this both
+/// attaches and detaches rather than assuming a one-time announcement.
+fn handleSeatCapabilities(
+    data: ?*anyopaque,
+    seat: ?*c.struct_wl_seat,
+    caps: u32,
+) callconv(.c) void {
+    const w: *Window = @ptrCast(@alignCast(data.?));
+    const has_keyboard = caps & c.WL_SEAT_CAPABILITY_KEYBOARD != 0;
+
+    if (has_keyboard and w.keyboard.wl_kbd == null) {
+        if (c.wl_seat_get_keyboard(seat)) |kbd| w.keyboard.attach(kbd);
+    } else if (!has_keyboard) {
+        if (w.keyboard.wl_kbd) |kbd| {
+            c.wl_keyboard_release(kbd);
+            w.keyboard.wl_kbd = null;
+        }
+    }
+    // TODO(phase 3): WL_SEAT_CAPABILITY_POINTER for selection and link clicking.
+}
+
+fn handleSeatName(_: ?*anyopaque, _: ?*c.struct_wl_seat, _: [*c]const u8) callconv(.c) void {}
 
 fn handleGlobalRemove(_: ?*anyopaque, _: ?*c.struct_wl_registry, _: u32) callconv(.c) void {}
 
