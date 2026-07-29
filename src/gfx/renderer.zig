@@ -364,23 +364,20 @@ pub const Renderer = struct {
                 const cell_x = pad.x + x * font.cell_w;
                 const cell_y = pad.y + y * font.cell_h;
 
-                if (!style.attrs.invisible and
-                    cell.content != cellmod.Cell.empty and cell.content != ' ')
-                {
-                    if (cache.get(cell.content, 256)) |glyph| {
-                        if (!glyph.blank) {
-                            // fcft reports bearings relative to the pen on the
-                            // baseline: +x right, +y up from the baseline.
-                            const gx = @as(i64, cell_x) + glyph.left;
-                            const gy = @as(i64, cell_y) + font.baseline - glyph.top;
-                            self.fg_list.append(self.gpa, .{
-                                .pos = .{ clampI16(gx), clampI16(gy) },
-                                .size = .{ glyph.region.w, glyph.region.h },
-                                .uv = .{ glyph.region.x, glyph.region.y },
-                                .color = .{ fg.r, fg.g, fg.b, fg.a },
-                                .flags = if (glyph.kind == .color) flag_color_glyph else 0,
-                            }) catch {};
+                // `wide == 2` marks the trailing spacer of a double-width
+                // character; its glyph was already drawn by the lead cell, and
+                // drawing anything here would overprint it.
+                if (!style.attrs.invisible and cell.wide != 2) {
+                    if (cell.grapheme) {
+                        // Overlay every codepoint of the cluster at the same cell
+                        // origin. Combining marks carry bearings that place them
+                        // over the base character, so this composes correctly
+                        // without needing full shaping.
+                        for (screen.graphemes.get(cell.content)) |cp| {
+                            self.emitGlyph(cache, font, cell_x, cell_y, cp, fg);
                         }
+                    } else if (cell.content != cellmod.Cell.empty and cell.content != ' ') {
+                        self.emitGlyph(cache, font, cell_x, cell_y, cell.content, fg);
                     }
                 }
 
@@ -410,6 +407,31 @@ pub const Renderer = struct {
                 }
             }
         }
+    }
+
+    fn emitGlyph(
+        self: *Renderer,
+        cache: *GlyphCache,
+        font: *const Font,
+        cell_x: u32,
+        cell_y: u32,
+        cp: u32,
+        fg: Rgb,
+    ) void {
+        const glyph = cache.get(cp, 256) orelse return;
+        if (glyph.blank) return;
+
+        // fcft reports bearings relative to the pen on the baseline: +x to the
+        // right, +y upwards from the baseline.
+        const gx = @as(i64, cell_x) + glyph.left;
+        const gy = @as(i64, cell_y) + font.baseline - glyph.top;
+        self.fg_list.append(self.gpa, .{
+            .pos = .{ clampI16(gx), clampI16(gy) },
+            .size = .{ glyph.region.w, glyph.region.h },
+            .uv = .{ glyph.region.x, glyph.region.y },
+            .color = .{ fg.r, fg.g, fg.b, fg.a },
+            .flags = if (glyph.kind == .color) flag_color_glyph else 0,
+        }) catch {};
     }
 
     fn solid(self: *Renderer, x: u32, y: i64, w: u32, h: u32, color: Rgb) void {

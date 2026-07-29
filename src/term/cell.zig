@@ -114,6 +114,53 @@ pub const StyleTable = struct {
     }
 };
 
+/// Multi-codepoint grapheme clusters, held out of line so the common
+/// single-codepoint cell stays 8 bytes.
+///
+/// A cell with `grapheme` set stores an index here in `content`.
+pub const GraphemeTable = struct {
+    /// Hard cap on codepoints per cluster. Combining marks are unbounded in
+    /// principle, and a remote process can emit thousands of them against one base
+    /// character ("zalgo" text); without a cap that is an unbounded allocation
+    /// driven by untrusted input.
+    pub const max_len = 8;
+
+    const Span = struct { start: u32, len: u8 };
+
+    data: std.ArrayList(u21) = .empty,
+    spans: std.ArrayList(Span) = .empty,
+
+    pub fn deinit(self: *GraphemeTable, gpa: std.mem.Allocator) void {
+        self.data.deinit(gpa);
+        self.spans.deinit(gpa);
+    }
+
+    /// Store a cluster and return its index.
+    ///
+    /// Append-only: extending a cluster writes a new entry rather than editing the
+    /// old one, so the previous copy is wasted. Bounded in practice because clusters
+    /// are short and rare. TODO(phase 2 remainder): reclaim alongside style ids.
+    pub fn add(self: *GraphemeTable, gpa: std.mem.Allocator, cps: []const u21) !u32 {
+        const n = @min(cps.len, max_len);
+        const start: u32 = @intCast(self.data.items.len);
+        try self.data.appendSlice(gpa, cps[0..n]);
+        const idx: u32 = @intCast(self.spans.items.len);
+        try self.spans.append(gpa, .{ .start = start, .len = @intCast(n) });
+        return idx;
+    }
+
+    pub fn get(self: *const GraphemeTable, idx: u32) []const u21 {
+        if (idx >= self.spans.items.len) return &.{};
+        const span = self.spans.items[idx];
+        return self.data.items[span.start..][0..span.len];
+    }
+
+    pub fn clear(self: *GraphemeTable) void {
+        self.data.clearRetainingCapacity();
+        self.spans.clearRetainingCapacity();
+    }
+};
+
 // ── Default colours ─────────────────────────────────────────────────────────
 // A dark nightfox-ish default. Phase 6 replaces these with parsed themes and
 // hooks up the ~/.config/.app-theme-flavour watch.

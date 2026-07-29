@@ -73,6 +73,7 @@ pub fn build(b: *std.Build) void {
         "fcft",
         "pixman-1",
         "xkbcommon",
+        "utf8proc",
     }) |lib| mod.linkSystemLibrary(lib, .{});
 
     const exe = b.addExecutable(.{ .name = "myterm", .root_module = mod });
@@ -89,17 +90,22 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
 
-    // Pure-Zig suite: no C libraries, so it builds and runs in well under a
+    // Fast suite: terminal logic only, so it builds and runs in well under a
     // second. This is the one to run on every save while working on the parser,
     // grid, reflow, or URL scanning.
-    const pure = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/tests_pure.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+    //
+    // It links utf8proc because character widths come from the Unicode tables and
+    // reimplementing them in Zig just to keep this target dependency-free would be
+    // a lot of code to get subtly wrong. Wayland, EGL and fcft stay out.
+    const pure_mod = b.createModule(.{
+        .root_source_file = b.path("src/tests_pure.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
     });
-    const pure_step = b.step("test-pure", "Run unit tests that need no C libraries");
+    pure_mod.linkSystemLibrary("utf8proc", .{});
+    const pure = b.addTest(.{ .root_module = pure_mod });
+    const pure_step = b.step("test-pure", "Run the fast terminal-logic unit tests");
     pure_step.dependOn(&b.addRunArtifact(pure).step);
 }
 

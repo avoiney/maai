@@ -11,6 +11,12 @@
 //!
 //! (`pub usingnamespace` would let callers import these names flat, but it was
 //! removed in Zig 0.16, hence the explicit `.c` qualifier everywhere.)
+//!
+//! One documented exception: `term/width.zig` imports utf8proc in its own block.
+//! The rule above exists to stop the same *struct type* being translated twice, and
+//! utf8proc's surface here is a single function over integers — no types cross the
+//! boundary. Keeping it separate lets the terminal-logic test target link only
+//! utf8proc instead of dragging in Wayland, EGL and fcft.
 
 pub const c = @cImport({
     // ── Wayland ────────────────────────────────────────────────────────────

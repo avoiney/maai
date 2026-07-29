@@ -256,7 +256,66 @@ pub const Grid = struct {
         old_rows: usize,
         /// Content length in cells, after trimming the tail.
         len: usize,
+        /// Rows it will occupy at the new width. Filled in by pass 2.
+        new_rows: usize = 1,
     };
+
+    /// Walks a logical line at a target width, placing each character so that a
+    /// double-width pair never straddles a row boundary.
+    ///
+    /// Row breaks cannot be computed arithmetically once wide characters exist: a
+    /// pair that would land half on one row and half on the next must move whole to
+    /// the following row, leaving the last column blank. Counting rows and emitting
+    /// them therefore share this one walker, so the two can never disagree.
+    const Wrap = struct {
+        g: *const Grid,
+        line_start: usize,
+        len: usize,
+        cols: u32,
+
+        off: usize = 0,
+        row: usize = 0,
+        x: u32 = 0,
+
+        const Step = struct { row: usize, x: u32, off: usize, w: u8 };
+
+        fn next(self: *Wrap) ?Step {
+            while (self.off < self.len) {
+                const src = self.cellAt(self.off);
+                // Spacers carry no content; the lead reproduces them.
+                if (src.wide == 2) {
+                    self.off += 1;
+                    continue;
+                }
+                const w: u8 = if (src.wide == 1) 2 else 1;
+                // The `x > 0` guard keeps a width-1 grid from looping forever on a
+                // wide character that can never fit.
+                if (self.x > 0 and self.x + w > self.cols) {
+                    self.row += 1;
+                    self.x = 0;
+                }
+                const step = Step{ .row = self.row, .x = self.x, .off = self.off, .w = w };
+                self.x += w;
+                self.off += 1;
+                return step;
+            }
+            return null;
+        }
+
+        fn cellAt(self: *const Wrap, off: usize) Cell {
+            // Wrapped rows are exactly `g.cols` wide, so an offset maps uniformly
+            // onto (old row, old column).
+            const r = self.g.line(self.line_start + off / self.g.cols);
+            return r.cells[off % self.g.cols];
+        }
+    };
+
+    fn countWrappedRows(self: *const Grid, l: Logical, cols: u32) usize {
+        var it = Wrap{ .g = self, .line_start = l.start, .len = l.len, .cols = cols };
+        var rows: usize = 0;
+        while (it.next()) |st| rows = st.row + 1;
+        return @max(rows, 1);
+    }
 
     /// Resize, rewrapping soft-wrapped lines to the new width.
     ///
@@ -317,7 +376,10 @@ pub const Grid = struct {
         // ── pass 2: how many rows will that be at the new width? ──
         const new_cap = @as(usize, rows) + self.scrollback_max;
         var total_new: usize = 0;
-        for (logical.items) |l| total_new += rowsNeeded(l.len, cols);
+        for (logical.items) |*l| {
+            l.new_rows = self.countWrappedRows(l.*, cols);
+            total_new += l.new_rows;
+        }
 
         // Oldest history is dropped when it no longer fits.
         const drop = if (total_new > new_cap) total_new - new_cap else 0;
@@ -331,43 +393,64 @@ pub const Grid = struct {
         errdefer self.gpa.free(buf);
         for (buf, 0..) |*r, k| r.* = .{ .cells = slab[k * cols ..][0..cols] };
 
-        var written: usize = 0;
-        var skipped: usize = 0;
+        var global_row: usize = 0;
         var cur_new_abs: ?usize = null;
+        var cur_new_x: u32 = 0;
 
         for (logical.items, 0..) |l, li| {
-            const nr = rowsNeeded(l.len, cols);
+            const on_cursor_line = li == cur_logical;
+            // Best placement seen so far for the cursor: the last character at or
+            // before its offset. The offset can land on a spacer, or past the end of
+            // the line entirely when the cursor trails the text.
+            var best: ?Wrap.Step = null;
 
-            var k: usize = 0;
-            while (k < nr) : (k += 1) {
-                if (skipped < drop) {
-                    skipped += 1;
-                    if (li == cur_logical and k == cur_offset / cols) {
-                        // The cursor's row is being dropped; it will be clamped.
-                        cur_new_abs = null;
-                    }
-                    continue;
+            var it = Wrap{ .g = self, .line_start = l.start, .len = l.len, .cols = cols };
+            while (it.next()) |st| {
+                if (on_cursor_line and st.off <= cur_offset) best = st;
+
+                const grow = global_row + st.row;
+                if (grow < drop) continue;
+                const di = grow - drop;
+                if (di >= new_cap) break;
+
+                const src = it.cellAt(st.off);
+                buf[di].cells[st.x] = src;
+                if (st.w == 2 and st.x + 1 < cols) {
+                    buf[di].cells[st.x + 1] = .{
+                        .content = Cell.empty,
+                        .style = src.style,
+                        .wide = 2,
+                    };
                 }
-
-                const dst = &buf[written];
-                const from = k * cols;
-                const upto = @min(from + cols, l.len);
-
-                var x: usize = 0;
-                while (from + x < upto) : (x += 1) {
-                    const off = from + x;
-                    // Wrapped rows are exactly `self.cols` wide, so offset maps
-                    // uniformly onto (old row, old column).
-                    const old_row = self.line(l.start + off / self.cols);
-                    dst.cells[x] = old_row.cells[off % self.cols];
-                }
-                dst.wrapped = k + 1 < nr;
-
-                if (li == cur_logical and k == cur_offset / cols) {
-                    cur_new_abs = written;
-                }
-                written += 1;
             }
+
+            // Mark soft-wrap continuations for every row of this logical line.
+            var k: usize = 0;
+            while (k < l.new_rows) : (k += 1) {
+                const grow = global_row + k;
+                if (grow < drop) continue;
+                const di = grow - drop;
+                if (di < new_cap) buf[di].wrapped = k + 1 < l.new_rows;
+            }
+
+            if (on_cursor_line) {
+                if (best) |st| {
+                    // Sitting exactly on a character keeps its column; anything
+                    // past it (spacer, or trailing cursor) moves just after.
+                    const x = if (st.off == cur_offset) st.x else st.x + st.w;
+                    const overflow = x >= cols;
+                    const grow = global_row + st.row + @intFromBool(overflow);
+                    cur_new_x = if (overflow) 0 else x;
+                    if (grow >= drop) cur_new_abs = grow - drop;
+                } else {
+                    // Empty line: the cursor sits at its start.
+                    const grow = global_row;
+                    cur_new_x = 0;
+                    if (grow >= drop) cur_new_abs = grow - drop;
+                }
+            }
+
+            global_row += l.new_rows;
         }
 
         self.gpa.free(self.slab);
@@ -377,27 +460,19 @@ pub const Grid = struct {
         self.cols = cols;
         self.rows = rows;
         self.start = 0;
-        self.count = written;
+        self.count = total_new - drop;
 
         // Pad so the screen is always fully populated.
         while (self.count < rows) _ = self.pushBlank(0);
 
         const top = self.screenTop();
         if (cur_new_abs) |abs| {
-            cur.y = if (abs >= top)
-                @intCast(@min(abs - top, rows - 1))
-            else
-                0;
-            cur.x = @intCast(@min(cur_offset % cols, cols - 1));
+            cur.y = if (abs >= top) @intCast(@min(abs - top, rows - 1)) else 0;
+            cur.x = @min(cur_new_x, cols - 1);
         } else {
             cur.y = @min(cur.y, rows - 1);
             cur.x = @min(cur.x, cols - 1);
         }
-    }
-
-    fn rowsNeeded(len: usize, cols: u32) usize {
-        if (len == 0) return 1;
-        return (len + cols - 1) / cols;
     }
 };
 

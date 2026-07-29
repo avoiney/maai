@@ -338,10 +338,63 @@ A bug the tests caught that screenshots would not have: `Screen.resize` judged "
 scroll region span the whole screen" against the *new* row count, so a full-screen region
 stayed pinned to the old height and full-screen apps scrolled wrongly after any resize.
 
-**Still outstanding in this phase:** double-width characters (wcwidth + spacer cell +
-grapheme side table) — CJK still overlaps; the myterm terminfo entry plus
-`--print-terminfo`; scrollback *viewing* (the data is there, the view offset and keybinding
-are not); style-id reclamation; and the `38:2::r:g:b` colon form with a colour-space id.
+**Done (2026-07-29): character widths and grapheme clusters.** Prompted by Claude Code
+rendering wrong: its UI is box-drawn frames full of emoji, and the right border landed on a
+different column on every row.
+
+Widths come from **utf8proc**, not libc `wcwidth()`, which consults the process locale and
+would make layout depend on how the terminal was launched.
+
+- Double-width characters occupy a lead cell plus a spacer (`wide = 1` / `wide = 2`).
+  Overwriting either half clears the other, or an orphaned half corrupts the row from that
+  point on. A wide character never straddles the right edge: it wraps whole, leaving the
+  final column blank.
+- Zero-width codepoints (combining marks, variation selectors) attach to the preceding cell
+  through a grapheme side table, so `e` + `´` is one column and renders composed.
+- **Emoji presentation is honoured**: `⚠` alone is one column, but `⚠️` (with U+FE0F) is
+  two. That is what `string-width` (Node), `wcwidth` (Python) and `go-runewidth` all report,
+  so it is what every TUI's own layout assumes. Following the narrower reading would keep
+  those UIs misaligned — matching the ecosystem matters more here than matching the spec
+  most literally.
+- Clusters are capped at 8 codepoints. A remote process can emit thousands of combining
+  marks against one base character ("zalgo" text); uncapped, that is an unbounded
+  allocation driven by untrusted input.
+- Reflow keeps pairs intact. Row breaks can no longer be computed arithmetically, so
+  counting rows and emitting them share one walker (`Grid.Wrap`) that cannot disagree with
+  itself.
+
+Verified by generating a frame whose padding is computed with the ecosystem's width model
+and checking it renders as a true rectangle across ASCII, emoji, VS16, CJK, combining marks
+and mixed rows. 61 tests, 47 ms.
+
+Cosmetic gap: `⚠️` renders in its monochrome text form, because we draw the base
+codepoint's glyph and fcft resolves that to a text-presentation font. Correct emoji
+presentation needs `fcft_rasterize_grapheme_utf32` shaping, which belongs with the phase 7
+typography work. Alignment is unaffected.
+
+**Done (2026-07-29): private-marker CSI sequences.** Claude Code still rendered every
+character underlined after the width fix. `csiDispatch` was switching on the final byte
+without consulting the private marker, so sequences from an entirely different namespace
+were executed as their unmarked namesakes:
+
+| Sequence | Actually means | Was executed as |
+|---|---|---|
+| `CSI > 4 ; 2 m` | xterm XTMODKEYS | SGR 4 + SGR 2 — underline and dim everything after |
+| `CSI > 1 u` / `CSI < u` | kitty keyboard push/pop | CSI u — restore cursor, moving it at random |
+
+Private-marked sequences are now dispatched separately, with only `?h`/`?l` and `>c`
+acted on and the rest recognised but inert until phase 3 brings the keyboard protocols.
+
+Worth keeping as a method note: this was found by capturing what the application actually
+emits (`script -q -e -c claude`) and tabulating every CSI sequence in it, rather than by
+reasoning about which SGR code might be at fault. The capture is also replayable, so the
+fix could be verified against the real byte stream instead of a hand-written approximation
+— and the first hand-written repro had in fact been misleading, because its padding was
+hand-counted and so could never have aligned.
+
+**Still outstanding in this phase:** the myterm terminfo entry plus `--print-terminfo`;
+scrollback *viewing* (the data is there, the view offset and keybinding are not); style-id
+and grapheme-id reclamation; and the `38:2::r:g:b` colon form with a colour-space id.
 
 The bulk of correctness work.
 

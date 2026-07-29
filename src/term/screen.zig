@@ -11,6 +11,7 @@ const std = @import("std");
 const cellmod = @import("cell.zig");
 const gridmod = @import("grid.zig");
 const Grid = gridmod.Grid;
+const width = @import("width.zig");
 const parser = @import("../vt/parser.zig");
 
 const Cell = cellmod.Cell;
@@ -59,6 +60,8 @@ pub const Screen = struct {
     in_alt: bool = false,
 
     styles: StyleTable = .{},
+    /// Multi-codepoint clusters (base plus combining marks or variation selectors).
+    graphemes: cellmod.GraphemeTable = .{},
 
     cursor_x: u32 = 0,
     cursor_y: u32 = 0,
@@ -140,6 +143,7 @@ pub const Screen = struct {
         self.other.deinit();
         self.gpa.free(self.tab_stops);
         self.styles.deinit(self.gpa);
+        self.graphemes.deinit(self.gpa);
     }
 
     pub fn resize(self: *Screen, cols: u32, rows: u32) !void {
@@ -200,6 +204,14 @@ pub const Screen = struct {
     // ── parser handler interface ────────────────────────────────────────────
 
     pub fn print(self: *Screen, cp: u21) void {
+        const w = width.charWidth(cp);
+        // Zero-width codepoints — combining marks, variation selectors — belong to
+        // the character before them and must not consume a column of their own.
+        if (w == 0) {
+            self.combine(cp);
+            return;
+        }
+
         if (self.wrap_pending) {
             self.wrap_pending = false;
             // Record that this row continues onto the next. This single bit is what
@@ -210,24 +222,133 @@ pub const Screen = struct {
             self.lineFeed();
         }
 
-        if (self.insert_mode) self.insertChars(1);
+        // A double-width glyph may not straddle the right edge: it wraps whole,
+        // leaving the final column blank.
+        if (w == 2 and self.cursor_x + 2 > self.grid.cols) {
+            if (!self.autowrap) return;
+            self.grid.rowMeta(self.cursor_y).wrapped = true;
+            self.cursor_x = 0;
+            self.lineFeed();
+        }
 
-        // TODO(phase 2): double-width via wcwidth, plus the trailing spacer cell and
-        // the grapheme cluster side table. Every codepoint is one column for now,
-        // which is right for ASCII and most Nerd Font icons but wrong for CJK.
-        self.grid.at(self.cursor_x, self.cursor_y).* = .{
-            .content = cp,
-            .style = self.pen_id,
-            .dirty = true,
-        };
+        if (self.insert_mode) self.insertChars(w);
+
+        self.writeCell(self.cursor_x, cp, w);
         self.last_printed = cp;
 
-        if (self.cursor_x + 1 >= self.grid.cols) {
+        const next = self.cursor_x + w;
+        if (next >= self.grid.cols) {
+            // Park on the lead cell; wrap_pending defers the wrap to the next
+            // printable character.
             if (self.autowrap) self.wrap_pending = true;
         } else {
-            self.cursor_x += 1;
+            self.cursor_x = next;
         }
         self.dirty = true;
+    }
+
+    /// Write one character at `x`, laying down a spacer cell when it is wide.
+    fn writeCell(self: *Screen, x: u32, cp: u21, w: u8) void {
+        self.breakPairAt(x);
+        self.grid.at(x, self.cursor_y).* = .{
+            .content = cp,
+            .style = self.pen_id,
+            .wide = if (w == 2) 1 else 0,
+            .dirty = true,
+        };
+        if (w == 2 and x + 1 < self.grid.cols) {
+            self.breakPairAt(x + 1);
+            self.grid.at(x + 1, self.cursor_y).* = .{
+                .content = Cell.empty,
+                .style = self.pen_id,
+                .wide = 2,
+                .dirty = true,
+            };
+        }
+    }
+
+    /// Overwriting half of a double-width pair must clear the other half, or an
+    /// orphaned lead or spacer is left behind and the row renders wrong from there
+    /// on.
+    fn breakPairAt(self: *Screen, x: u32) void {
+        const cell = self.grid.at(x, self.cursor_y);
+        switch (cell.wide) {
+            1 => if (x + 1 < self.grid.cols) {
+                const spacer = self.grid.at(x + 1, self.cursor_y);
+                if (spacer.wide == 2) spacer.* = gridmod.blankCell(spacer.style);
+            },
+            2 => if (x > 0) {
+                const lead = self.grid.at(x - 1, self.cursor_y);
+                if (lead.wide == 1) lead.* = gridmod.blankCell(lead.style);
+            },
+            else => {},
+        }
+    }
+
+    /// Attach a zero-width codepoint to the character it modifies.
+    fn combine(self: *Screen, cp: u21) void {
+        // With a wrap pending the cursor still sits on the last character written;
+        // otherwise it has already moved past it.
+        var x: u32 = if (self.wrap_pending)
+            self.cursor_x
+        else if (self.cursor_x > 0)
+            self.cursor_x - 1
+        else
+            return;
+
+        // Step from a spacer back onto its lead.
+        if (self.grid.at(x, self.cursor_y).wide == 2 and x > 0) x -= 1;
+        const cell = self.grid.at(x, self.cursor_y);
+        if (cell.content == Cell.empty and !cell.grapheme) return;
+
+        // Emoji presentation widens a one-column base to two (see width.zig).
+        if (width.widensToEmoji(cp, if (cell.wide == 0) 1 else 2) and
+            x + 1 < self.grid.cols)
+        {
+            self.breakPairAt(x + 1);
+            cell.wide = 1;
+            self.grid.at(x + 1, self.cursor_y).* = .{
+                .content = Cell.empty,
+                .style = cell.style,
+                .wide = 2,
+                .dirty = true,
+            };
+            if (!self.wrap_pending) {
+                if (x + 2 >= self.grid.cols) {
+                    if (self.autowrap) self.wrap_pending = true;
+                    self.cursor_x = x;
+                } else {
+                    self.cursor_x = x + 2;
+                }
+            }
+        }
+
+        self.extendCluster(cell, cp);
+        self.dirty = true;
+    }
+
+    fn extendCluster(self: *Screen, cell: *Cell, cp: u21) void {
+        var buf: [cellmod.GraphemeTable.max_len]u21 = undefined;
+        var n: usize = 0;
+
+        if (cell.grapheme) {
+            const existing = self.graphemes.get(cell.content);
+            n = @min(existing.len, buf.len);
+            @memcpy(buf[0..n], existing[0..n]);
+        } else {
+            buf[0] = @intCast(cell.content);
+            n = 1;
+        }
+        // Cluster at capacity: drop the mark rather than grow without bound.
+        if (n >= buf.len) return;
+
+        buf[n] = cp;
+        n += 1;
+
+        const idx = self.graphemes.add(self.gpa, buf[0..n]) catch return;
+        cell.content = idx;
+        cell.grapheme = true;
+        cell.dirty = true;
     }
 
     pub fn execute(self: *Screen, b: u8) void {
@@ -287,6 +408,31 @@ pub const Screen = struct {
         // block cursor regardless, so drop them rather than misreading the final.
         if (intermediates.len > 0) return;
 
+        // A private marker puts the sequence in a different namespace, where the
+        // same final byte means something else entirely. Falling through to the
+        // standard handlers is not a harmless no-op, it actively corrupts state:
+        //
+        //   CSI > 4 ; 2 m   xterm modifyOtherKeys, was read as SGR 4 (underline)
+        //                   plus SGR 2 (dim), so everything after it rendered
+        //                   underlined -- the reported Claude Code symptom
+        //   CSI > 1 u       kitty keyboard protocol push, was read as CSI u
+        //                   (restore cursor), moving the cursor at random
+        if (private != 0) {
+            switch (final) {
+                'h' => if (private == '?') self.decPrivateMode(params, true),
+                'l' => if (private == '?') self.decPrivateMode(params, false),
+                'c' => if (private == '>') self.deviceAttributes('>'),
+                // Recognised and deliberately inert: DECDSR (`CSI ? Ps n`),
+                // XTMODKEYS (`CSI > Ps m`), XTVERSION (`CSI > Ps q`), and the kitty
+                // keyboard protocol's push/pop (`CSI > Ps u`, `CSI < u`). The
+                // keyboard protocols are phase 3; until then, silently ignoring
+                // them leaves applications on their legacy encodings, which works.
+                else => {},
+            }
+            self.dirty = true;
+            return;
+        }
+
         switch (final) {
             'm' => self.sgr(params),
             '@' => self.insertChars(params.get(0, 1)),
@@ -318,16 +464,10 @@ pub const Screen = struct {
             'b' => self.repeatLast(params.get(0, 1)), // REP
             'd' => self.setRow(params.get(0, 1)), // VPA
             'e' => self.moveCursor(0, params.get(0, 1)), // VPR
-            'c' => self.deviceAttributes(private),
+            'c' => self.deviceAttributes(0), // DA1
             'g' => self.clearTabs(params.get(0, 0)), // TBC
-            'h', 'l' => {
-                if (private == '?') {
-                    self.decPrivateMode(params, final == 'h');
-                } else if (private == 0) {
-                    self.ansiMode(params, final == 'h');
-                }
-            },
-            'n' => self.deviceStatus(params, private),
+            'h', 'l' => self.ansiMode(params, final == 'h'),
+            'n' => self.deviceStatus(params),
             'r' => self.setScrollRegion(params),
             's' => self.saveCursor(),
             'u' => self.restoreCursor(),
@@ -742,9 +882,9 @@ pub const Screen = struct {
         }
     }
 
-    fn deviceStatus(self: *Screen, params: *const parser.Params, private: u8) void {
-        // DECDSR (private '?') variants are deliberately unanswered.
-        if (private != 0) return;
+    /// Only reached with no private marker; DECDSR (`CSI ? Ps n`) is filtered out
+    /// earlier and stays unanswered.
+    fn deviceStatus(self: *Screen, params: *const parser.Params) void {
         switch (params.get(0, 0)) {
             5 => self.respond("\x1b[0n"), // ready, no malfunction
             6 => { // CPR
@@ -1270,6 +1410,40 @@ test "device attributes and cursor position report" {
     try std.testing.expectEqualStrings("\x1b[0n", sink.got());
 }
 
+test "private-marker sequences are not mistaken for their unmarked namesakes" {
+    // Taken verbatim from a capture of Claude Code's output. Every one of these
+    // shares a final byte with a standard sequence, and treating them alike
+    // corrupted state rather than merely being ignored.
+    var s = try Screen.init(std.testing.allocator, 20, 5);
+    defer s.deinit();
+
+    var sink = Sink{};
+    s.reply = .{ .ctx = &sink, .write = Sink.write };
+
+    // XTMODKEYS. Was read as SGR 4 + SGR 2, underlining and dimming everything
+    // that followed.
+    feed(&s, "\x1b[>4;2mX");
+    const st = s.styles.get(s.grid.at(0, 0).style);
+    try std.testing.expectEqual(cellmod.Underline.none, st.attrs.underline);
+    try std.testing.expect(!st.attrs.dim);
+
+    // Kitty keyboard protocol push/pop. Was read as CSI u, restoring the cursor.
+    feed(&s, "\x1b[3;8H");
+    feed(&s, "\x1b[>1u\x1b[<u");
+    try std.testing.expectEqual(@as(u32, 2), s.cursor_y);
+    try std.testing.expectEqual(@as(u32, 7), s.cursor_x);
+
+    // XTVERSION must not be answered — a reply here would be a fixed string, but
+    // the query also must not be mistaken for anything else.
+    sink.len = 0;
+    feed(&s, "\x1b[>0q");
+    try std.testing.expectEqual(@as(usize, 0), sink.len);
+
+    // DA2 still works, and is the one private-marker query we do answer.
+    feed(&s, "\x1b[>c");
+    try std.testing.expectEqualStrings("\x1b[>0;10;1c", sink.got());
+}
+
 test "DECDSR private status queries go unanswered" {
     var s = try Screen.init(std.testing.allocator, 10, 3);
     defer s.deinit();
@@ -1301,6 +1475,143 @@ test "synchronized output mode is tracked" {
     try std.testing.expect(s.sync_output);
     feed(&s, "\x1b[?2026l");
     try std.testing.expect(!s.sync_output);
+}
+
+test "double-width characters occupy two cells with a spacer" {
+    var s = try Screen.init(std.testing.allocator, 10, 2);
+    defer s.deinit();
+    feed(&s, "a日b");
+
+    try std.testing.expectEqual(@as(u32, 'a'), s.grid.at(0, 0).content);
+    try std.testing.expectEqual(@as(u21, '日'), @as(u21, @intCast(s.grid.at(1, 0).content)));
+    try std.testing.expectEqual(@as(u2, 1), s.grid.at(1, 0).wide);
+    // The spacer holds no content of its own.
+    try std.testing.expectEqual(@as(u2, 2), s.grid.at(2, 0).wide);
+    try std.testing.expectEqual(@as(u32, 'b'), s.grid.at(3, 0).content);
+    // 'a' + 2 columns + 'b' == 4
+    try std.testing.expectEqual(@as(u32, 4), s.cursor_x);
+}
+
+test "overwriting half of a wide pair clears the other half" {
+    var s = try Screen.init(std.testing.allocator, 8, 2);
+    defer s.deinit();
+
+    feed(&s, "日");
+    // Overwrite the lead: the orphaned spacer must be cleared too.
+    feed(&s, "\x1b[1;1Hx");
+    try std.testing.expectEqual(@as(u32, 'x'), s.grid.at(0, 0).content);
+    try std.testing.expectEqual(@as(u2, 0), s.grid.at(1, 0).wide);
+
+    feed(&s, "\x1b[1;1H日");
+    // Now overwrite the spacer instead; the lead must go.
+    feed(&s, "\x1b[1;2Hy");
+    try std.testing.expectEqual(@as(u32, 'y'), s.grid.at(1, 0).content);
+    try std.testing.expectEqual(@as(u2, 0), s.grid.at(0, 0).wide);
+    try std.testing.expect(s.grid.at(0, 0).isBlank());
+}
+
+test "a wide character wraps whole rather than splitting at the edge" {
+    var s = try Screen.init(std.testing.allocator, 5, 3);
+    defer s.deinit();
+
+    // Four narrow characters leave exactly one free column, too few for 日.
+    feed(&s, "abcd日");
+
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("abcd", rowText(&s, 0, &buf));
+    // It moved to the next row rather than straddling the boundary.
+    try std.testing.expectEqual(@as(u2, 1), s.grid.at(0, 1).wide);
+    try std.testing.expectEqual(@as(u2, 2), s.grid.at(1, 1).wide);
+    try std.testing.expect(s.grid.rowMeta(0).wrapped);
+}
+
+test "combining marks attach to the base cell without taking a column" {
+    var s = try Screen.init(std.testing.allocator, 10, 2);
+    defer s.deinit();
+    feed(&s, "e\u{0301}x"); // e + combining acute, then x
+
+    // 'e' and its accent share one cell, so 'x' is at column 1.
+    try std.testing.expect(s.grid.at(0, 0).grapheme);
+    try std.testing.expectEqual(@as(u32, 'x'), s.grid.at(1, 0).content);
+    try std.testing.expectEqual(@as(u32, 2), s.cursor_x);
+
+    const cluster = s.graphemes.get(s.grid.at(0, 0).content);
+    try std.testing.expectEqual(@as(usize, 2), cluster.len);
+    try std.testing.expectEqual(@as(u21, 'e'), cluster[0]);
+    try std.testing.expectEqual(@as(u21, 0x0301), cluster[1]);
+}
+
+test "a variation selector widens its base to emoji presentation" {
+    var s = try Screen.init(std.testing.allocator, 10, 2);
+    defer s.deinit();
+    // U+26A0 is one column bare; with VS16 the ecosystem treats it as two, and a
+    // terminal that disagrees misaligns every framed TUI.
+    feed(&s, "\u{26A0}\u{FE0F}x");
+
+    try std.testing.expectEqual(@as(u2, 1), s.grid.at(0, 0).wide);
+    try std.testing.expectEqual(@as(u2, 2), s.grid.at(1, 0).wide);
+    try std.testing.expectEqual(@as(u32, 'x'), s.grid.at(2, 0).content);
+    try std.testing.expectEqual(@as(u32, 3), s.cursor_x);
+}
+
+test "a run of combining marks is capped rather than growing without bound" {
+    var s = try Screen.init(std.testing.allocator, 10, 2);
+    defer s.deinit();
+
+    feed(&s, "e");
+    var i: usize = 0;
+    while (i < 500) : (i += 1) feed(&s, "\u{0301}");
+
+    const cluster = s.graphemes.get(s.grid.at(0, 0).content);
+    try std.testing.expectEqual(cellmod.GraphemeTable.max_len, cluster.len);
+    // And layout is unaffected.
+    try std.testing.expectEqual(@as(u32, 1), s.cursor_x);
+}
+
+test "box frames stay aligned across mixed-width content" {
+    // This is the reported Claude Code symptom: a framed UI whose right border
+    // drifted per row depending on the emoji and CJK it contained.
+    var s = try Screen.init(std.testing.allocator, 12, 4);
+    defer s.deinit();
+
+    feed(&s, "|abcdefghij|\r\n"); // 10 narrow
+    feed(&s, "|日本語abcd|\r\n"); // 3 wide + 4 narrow == 10
+    feed(&s, "|e\u{0301}bcdefghij|"); // combining mark takes no column
+
+    // Every closing bar must land in the same column.
+    for (0..3) |y| {
+        try std.testing.expectEqual(
+            @as(u32, '|'),
+            s.grid.at(11, @intCast(y)).content,
+        );
+    }
+}
+
+test "reflow keeps double-width pairs intact across a row break" {
+    var s = try Screen.init(std.testing.allocator, 8, 3);
+    defer s.deinit();
+    feed(&s, "ab日本語");
+
+    // At width 5 the pairs cannot split: 'ab' + 日 fills 4 of 5, so 本 moves down.
+    try s.resize(5, 4);
+
+    var y: u32 = 0;
+    while (y < s.grid.rows) : (y += 1) {
+        var x: u32 = 0;
+        while (x < s.grid.cols) : (x += 1) {
+            const cell = s.grid.at(x, y);
+            if (cell.wide == 1) {
+                // A lead must never sit in the final column, and its spacer must
+                // immediately follow.
+                try std.testing.expect(x + 1 < s.grid.cols);
+                try std.testing.expectEqual(@as(u2, 2), s.grid.at(x + 1, y).wide);
+            }
+            if (cell.wide == 2) {
+                try std.testing.expect(x > 0);
+                try std.testing.expectEqual(@as(u2, 1), s.grid.at(x - 1, y).wide);
+            }
+        }
+    }
 }
 
 test "resize keeps the alternate screen in step with the primary" {
