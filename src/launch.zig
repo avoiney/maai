@@ -49,13 +49,20 @@ pub fn openWith(program: [*:0]const u8, link: []const u8) ?std.c.pid_t {
     @memcpy(buf[0..link.len], link);
     buf[link.len] = 0;
 
+    var argv = [_:null]?[*:0]const u8{ program, @ptrCast(&buf) };
+    return spawn(program, &argv);
+}
+
+/// `posix_spawn` with signals reset.
+///
+/// Dispositions survive `exec` and this process ignores SIGPIPE, so a child inheriting
+/// that would behave subtly wrong in pipelines — exactly the bug that already bit the
+/// shell once. The mask is emptied for the same reason.
+fn spawn(program: [*:0]const u8, argv: [:null]const ?[*:0]const u8) ?std.c.pid_t {
     var attr: c.posix_spawnattr_t = undefined;
     if (c.posix_spawnattr_init(&attr) != 0) return null;
     defer _ = c.posix_spawnattr_destroy(&attr);
 
-    // Reset every signal the terminal may have touched, and unblock the mask.
-    // Inheriting an ignored SIGPIPE is not hypothetical: it is exactly the bug that
-    // made a pipeline in the child shell misbehave once already.
     var defaults: c.sigset_t = undefined;
     _ = c.sigfillset(&defaults);
     _ = c.posix_spawnattr_setsigdefault(&attr, &defaults);
@@ -67,14 +74,13 @@ pub fn openWith(program: [*:0]const u8, link: []const u8) ?std.c.pid_t {
         c.POSIX_SPAWN_SETSIGDEF | c.POSIX_SPAWN_SETSIGMASK,
     );
 
-    var argv = [_:null]?[*:0]const u8{ program, @ptrCast(&buf) };
     var pid: std.c.pid_t = 0;
     const rc = c.posix_spawnp(
         &pid,
         program,
         null,
         &attr,
-        @ptrCast(&argv),
+        @ptrCast(argv.ptr),
         // `environ` is a libc variable, which translate-c does not surface; std
         // declares it directly.
         @ptrCast(std.c.environ),
@@ -82,6 +88,30 @@ pub fn openWith(program: [*:0]const u8, link: []const u8) ?std.c.pid_t {
     if (rc != 0) return null;
     return pid;
 }
+
+/// Start another myterm, beginning in `dir`.
+///
+/// `/proc/self/exe` rather than argv[0]: it is the actual binary regardless of how this
+/// process was invoked, so a window opened from a window opened from a shell alias
+/// still finds the right executable.
+///
+/// The directory is passed as an argument rather than applied with a chdir here — this
+/// process must not move, and `posix_spawn_file_actions_addchdir_np` is a glibc
+/// extension we would then depend on.
+pub fn newWindow(dir: []const u8) ?std.c.pid_t {
+    if (dir.len == 0 or dir.len > max_path_len) return null;
+    if (dir[0] != '/') return null;
+    for (dir) |ch| if (ch <= 0x1f or ch == 0x7f) return null;
+
+    var buf: [max_path_len + 1]u8 = undefined;
+    @memcpy(buf[0..dir.len], dir);
+    buf[dir.len] = 0;
+
+    var argv = [_:null]?[*:0]const u8{ "myterm", "--cwd", @ptrCast(&buf) };
+    return spawn("/proc/self/exe", &argv);
+}
+
+pub const max_path_len = 4096;
 
 /// Reaps launched handlers so they do not accumulate as zombies.
 ///
@@ -172,4 +202,23 @@ test "the reaper drops pids rather than blocking when full" {
     for (&reaper.pids, 1..) |*slot, i| slot.* = @intCast(i);
     reaper.track(999999); // no slot; must simply return
     try testing.expectEqual(@as(std.c.pid_t, 1), reaper.pids[0]);
+}
+
+test "newWindow refuses anything that is not an absolute path" {
+    // Only the rejections are exercised: a valid path would open a real window, which
+    // a test suite has no business doing.
+    for ([_][]const u8{
+        "",
+        "relative/path",
+        "~/home",
+        "/tmp/with\x00nul",
+        "/tmp/with\nnewline",
+    }) |bad| {
+        try testing.expect(newWindow(bad) == null);
+    }
+
+    var long: [max_path_len + 2]u8 = undefined;
+    @memset(&long, 'a');
+    long[0] = '/';
+    try testing.expect(newWindow(&long) == null);
 }

@@ -193,6 +193,30 @@ const App = struct {
         if (changed) self.needs_render = true;
     }
 
+    /// Open another window in the same directory.
+    ///
+    /// The directory comes from `/proc` first and OSC 7 only as a refinement, because
+    /// this machine's zsh — like most shells — never emits OSC 7. Building this on the
+    /// escape sequence alone would have shipped a binding that does nothing.
+    fn newWindowHere(self: *App) void {
+        var buf: [launch.max_path_len]u8 = undefined;
+        const announced = self.screen.cwd();
+        const dir = if (announced.len > 0)
+            announced
+        else
+            self.pty.cwd(&buf) orelse {
+                if (self.debug) std.debug.print("new window: no cwd\n", .{});
+                return;
+            };
+
+        if (self.debug) std.debug.print("new window in '{s}'\n", .{dir});
+        if (launch.newWindow(dir)) |pid| {
+            self.reaper.track(pid);
+        } else {
+            std.debug.print("myterm: could not open a window in '{s}'\n", .{dir});
+        }
+    }
+
     /// Called when the modifier state changes, so the underline appears the moment
     /// Ctrl goes down rather than on the next pointer motion.
     fn onModsChanged(ctx: *anyopaque) void {
@@ -582,13 +606,22 @@ const App = struct {
     }
 
     /// Application shortcuts. Returning true stops the key reaching the child.
-    fn onBinding(ctx: *anyopaque, sym: u32, ctrl: bool, shift: bool, _: bool) bool {
+    fn onBinding(ctx: *anyopaque, sym: u32, ctrl: bool, shift: bool, alt: bool) bool {
         const self: *App = @ptrCast(@alignCast(ctx));
         const grid = &self.screen.grid;
 
         // Hint mode swallows everything while it is up — see `hintsKey`.
         if (self.hint_on) {
             self.hintsKey(sym, shift);
+            return true;
+        }
+
+        // Alt + the `%` key opens another window in the same directory — the binding
+        // carried over from wezterm. Shift is not required explicitly: `%` needs it on
+        // this AZERTY layout but not on every layout, so the *character* is what is
+        // matched, not the physical key plus modifier.
+        if (alt and sym == c.XKB_KEY_percent) {
+            self.newWindowHere();
             return true;
         }
 
@@ -738,6 +771,20 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const args = parseArgs(init.args.vector);
     const argv = try buildArgv(gpa, args.child, init.environ);
     defer gpa.free(argv);
+
+    // Start where we were asked to. Before the fork, so the child inherits it — and
+    // failure is not fatal: a window that opens in the wrong directory beats one that
+    // does not open, and the directory came from another process's OSC 7.
+    if (args.cwd.len > 0) {
+        var dirz: [launch.max_path_len + 1]u8 = undefined;
+        if (args.cwd.len <= launch.max_path_len) {
+            @memcpy(dirz[0..args.cwd.len], args.cwd);
+            dirz[args.cwd.len] = 0;
+            if (std.c.chdir(@ptrCast(&dirz)) != 0) {
+                std.debug.print("myterm: could not enter '{s}'\n", .{args.cwd});
+            }
+        }
+    }
 
     // ── config before anything it configures ────────────────────────────────
     var diags = cfgmod.Diagnostics{};
@@ -1120,6 +1167,8 @@ fn gridSize(width: u32, height: u32, font: *const Font, pad: Padding) Dims {
 /// Command line: `-c path` picks a config, `-e cmd args...` a child command.
 const Args = struct {
     config_path: []const u8 = "",
+    /// Directory to start the child in; empty means inherit ours.
+    cwd: []const u8 = "",
     /// Everything from `-e` onwards, or the whole argv when absent.
     child: []const [*:0]const u8,
 };
@@ -1134,6 +1183,9 @@ fn parseArgs(argv: []const [*:0]const u8) Args {
             i + 1 < argv.len)
         {
             out.config_path = std.mem.span(argv[i + 1]);
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--cwd") and i + 1 < argv.len) {
+            out.cwd = std.mem.span(argv[i + 1]);
             i += 1;
         }
     }

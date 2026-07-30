@@ -713,17 +713,47 @@ pre-configure width and the wrapped-URL case did not wrap.
 `file://`, `mailto:`. A line containing `https://x/$(id>/tmp/pwn)` opens harmlessly and
 creates no file. → **Switch to myterm as daily driver here.**
 
-### Phase 5 — tabs and splits (≈3 weeks)
+### Phase 5 — new windows and tabs (≈1 week) — *rescoped 2026-07-30, in progress*
 
-Layout tree `Leaf(pane) | Split{dir, ratio, [child]}` per tab. Per-pane PTY, grid, parse
-thread, `TIOCSWINSZ`, and viewport rect. Geometric directional focus like sway. Bottom
-tab bar (matching your current wezterm/kitty configs) with per-pane title from OSC 0/2.
-Track cwd from **OSC 7** so new tabs and splits inherit the current directory — small
-feature, disproportionate daily payoff.
+**The layout tree is cancelled.** Asked what splits inside the terminal would buy, the
+answer was: nothing. sway already splits, natively, and better. What was actually missing
+is *starting somewhere*: a new window, or a new tab, in the directory you are already in.
 
-**Acceptance:** 4-way split, all panes live and independently resizable; killing a pane
-collapses its parent correctly; no PTY or thread leaks under repeated open/close
-(check with `/proc/self/fd` and valgrind).
+That removes `Leaf | Split{dir, ratio}`, geometric directional focus, per-pane viewport
+rects and pane-collapse-on-exit — three weeks of machinery for a job the compositor does.
+A reminder to ask before building: the original plan was written from what a terminal
+*can* do rather than from what this one is *for*.
+
+**Working-directory tracking (done).** `/proc/<child>/cwd` is the primary source and OSC 7
+only a refinement — the reverse of what the old plan assumed. This machine's zsh does not
+emit OSC 7 and most shells do not either, so a feature resting on the escape sequence
+would have shipped a binding that did nothing. `/proc` needs no cooperation from anyone,
+and it reads the *shell's* directory, which is what "here" means.
+
+OSC 7 is still honoured when a shell does emit it, with percent-decoding, and validated:
+absolute, no control characters, bounded. It becomes another process's starting directory,
+so it is checked even though it can never become a command. The first version of that
+validation was wrong in a way its own comment denied — it decoded straight into the stored
+buffer and bailed out partway, splicing the head of a rejected path onto the tail of the
+previous one (`/plain/path` became `/badin/path`). It decodes into scratch now and commits
+only on success.
+
+**New window (done).** `Alt`+`%` opens another myterm in the same directory — the binding
+carried over from wezterm. The *character* is matched rather than the physical key plus
+Shift, since `%` needs Shift on this AZERTY layout but not on every layout. Spawned via
+`/proc/self/exe` so a window opened from a window still finds the right binary, with the
+directory passed as `--cwd` rather than applied by chdir here (this process must not move,
+and `addchdir_np` is a glibc extension we would then depend on). Signals are reset in the
+child, as for the URL launcher.
+
+**Still to do: tabs.** Per-tab PTY, `Screen` and parser; a new tab inherits the directory
+the same way; bottom tab bar matching the existing kitty config, with the per-tab title
+from OSC 0/2. The tab bar needs the renderer to draw cells that are not in the grid, which
+hint mode has already proved out.
+
+**Acceptance:** `Alt`+`%` opens a window in the current directory with no shell
+configuration; a new tab does the same; no PTY leaks under repeated open/close (check
+`/proc/self/fd`).
 
 ### Phase 6 — config and live theming ✅ done (2026-07-30)
 

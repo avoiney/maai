@@ -234,6 +234,13 @@ pub const Screen = struct {
     title_buf: [256]u8 = undefined,
     title_len: usize = 0,
 
+    /// Working directory as announced by OSC 7, empty when never announced.
+    ///
+    /// Advisory only: most shells never emit it, so anything that needs the directory
+    /// reads `/proc` instead and treats this as a refinement.
+    cwd_buf: [1024]u8 = undefined,
+    cwd_len: usize = 0,
+
     pub fn init(gpa: std.mem.Allocator, cols: u32, rows: u32) !Screen {
         return initScrollback(gpa, cols, rows, gridmod.default_scrollback);
     }
@@ -647,6 +654,8 @@ pub const Screen = struct {
             self.title_len = n;
         } else if (std.mem.eql(u8, code, "8")) {
             self.setHyperlink(text);
+        } else if (std.mem.eql(u8, code, "7")) {
+            self.setCwd(text);
         } else if (std.mem.eql(u8, code, "4")) {
             self.setPaletteColors(text);
         } else if (std.mem.eql(u8, code, "104")) {
@@ -728,6 +737,57 @@ pub const Screen = struct {
             }
             self.dirty = true;
         }
+    }
+
+    pub fn cwd(self: *const Screen) []const u8 {
+        return self.cwd_buf[0..self.cwd_len];
+    }
+
+    /// `OSC 7 ; file://host/path ST` — the shell announcing where it is.
+    ///
+    /// The value comes from output, so a remote host can choose it. It ends up as the
+    /// starting directory of a *new terminal*, never as a command, but it is still
+    /// checked: absolute, no control characters, and bounded. A relative or malformed
+    /// path is ignored rather than half-applied.
+    fn setCwd(self: *Screen, text: []const u8) void {
+        var rest = text;
+        if (std.mem.startsWith(u8, rest, "file://")) {
+            rest = rest["file://".len..];
+            // Strip the hostname, which is empty or the local host and either way not
+            // ours to interpret. The path starts at the next slash.
+            const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return;
+            rest = rest[slash..];
+        }
+        if (rest.len == 0 or rest[0] != '/' or rest.len > self.cwd_buf.len) return;
+
+        // Percent-decoding, since OSC 7 carries a URI: a directory with a space in it
+        // arrives as %20.
+        //
+        // Decoded into scratch and copied over only on success. Writing straight into
+        // `cwd_buf` and bailing out partway leaves the head of the rejected path
+        // spliced onto the tail of the previous one — `/plain/path` became
+        // `/badin/path`, which is neither, and is exactly the half-application this
+        // validation exists to prevent.
+        var scratch: [1024]u8 = undefined;
+        var n: usize = 0;
+        var i: usize = 0;
+        while (i < rest.len) {
+            var ch = rest[i];
+            if (ch == '%' and i + 2 < rest.len) {
+                const hi = std.fmt.charToDigit(rest[i + 1], 16) catch return;
+                const lo = std.fmt.charToDigit(rest[i + 2], 16) catch return;
+                ch = @intCast(hi * 16 + lo);
+                i += 3;
+            } else {
+                i += 1;
+            }
+            if (ch <= 0x1f or ch == 0x7f) return;
+            if (n == scratch.len) return;
+            scratch[n] = ch;
+            n += 1;
+        }
+        @memcpy(self.cwd_buf[0..n], scratch[0..n]);
+        self.cwd_len = n;
     }
 
     /// `OSC 8 ; params ; URI ST` — everything printed from now on belongs to that

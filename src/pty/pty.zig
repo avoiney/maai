@@ -135,6 +135,28 @@ pub const Pty = struct {
     }
 
     /// True once the child has exited. Reaps it so it does not linger as a zombie.
+    /// The child's current working directory, via `/proc/<pid>/cwd`.
+    ///
+    /// This is the primary source, not a fallback. OSC 7 is the polite way for a shell
+    /// to announce its directory, but this machine's zsh does not emit it and most
+    /// distributions' shells do not either — so a feature built on OSC 8 alone would
+    /// simply not work here. `/proc` needs no cooperation from anyone.
+    ///
+    /// It is the *shell's* directory, which is what "open another window here" means,
+    /// rather than the foreground command's.
+    pub fn cwd(self: *Pty, buf: []u8) ?[]const u8 {
+        if (self.child < 0) return null;
+        var link: [64]u8 = undefined;
+        const path = std.fmt.bufPrintZ(&link, "/proc/{d}/cwd", .{self.child}) catch
+            return null;
+        const n = std.c.readlink(path, buf.ptr, buf.len);
+        if (n <= 0) return null;
+        const len: usize = @intCast(n);
+        // readlink does not terminate, and truncation would hand out a wrong path.
+        if (len >= buf.len) return null;
+        return buf[0..len];
+    }
+
     pub fn childExited(self: *Pty) bool {
         if (self.child < 0) return true;
         var status: c_int = 0;
@@ -156,3 +178,31 @@ pub const Pty = struct {
         }
     }
 };
+
+// ── tests ───────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "the child's working directory is readable without its cooperation" {
+    // This is the mechanism "open another window here" rests on, and it has to work
+    // with an unmodified shell: this machine's zsh never emits OSC 7, so a feature
+    // built on the escape sequence alone would do nothing at all here.
+    var argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", "sleep 5" };
+    var pty = Pty.spawn(20, 5, &argv) catch return error.SkipZigTest;
+    defer pty.deinit();
+
+    var buf: [1024]u8 = undefined;
+    const dir = pty.cwd(&buf) orelse return error.NoCwd;
+    // Inherited from us, and absolute.
+    try testing.expect(dir.len > 0);
+    try testing.expectEqual(@as(u8, '/'), dir[0]);
+    // readlink does not terminate its output; a stray NUL would mean we handed back
+    // the buffer's tail as part of the path.
+    try testing.expect(std.mem.indexOfScalar(u8, dir, 0) == null);
+}
+
+test "a dead child has no directory" {
+    var pty = Pty{ .master = -1, .child = -1 };
+    var buf: [64]u8 = undefined;
+    try testing.expect(pty.cwd(&buf) == null);
+}

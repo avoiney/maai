@@ -1157,3 +1157,32 @@ test "the bulk-copy path agrees with the walker" {
         try std.testing.expectEqualStrings(b, a);
     }
 }
+
+test "OSC 7 records the working directory, and refuses a bad one" {
+    var s = try Screen.init(std.testing.allocator, 10, 2);
+    defer s.deinit();
+
+    try std.testing.expectEqualStrings("", s.cwd());
+
+    feed(&s, "\x1b]7;file://host/home/user/src\x1b\\");
+    try std.testing.expectEqualStrings("/home/user/src", s.cwd());
+
+    // A URI, so a directory with a space arrives percent-encoded.
+    feed(&s, "\x1b]7;file://host/tmp/a%20b\x1b\\");
+    try std.testing.expectEqualStrings("/tmp/a b", s.cwd());
+
+    // Without the scheme, still accepted: some shells emit a bare path.
+    feed(&s, "\x1b]7;/plain/path\x1b\\");
+    try std.testing.expectEqualStrings("/plain/path", s.cwd());
+
+    // Refused, leaving the previous value: this ends up as another process's starting
+    // directory, so a relative or control-laden path is not half-applied.
+    for ([_][]const u8{
+        "\x1b]7;relative/path\x1b\\",
+        "\x1b]7;file://host/bad\x01path\x1b\\",
+        "\x1b]7;\x1b\\",
+    }) |seq| {
+        feed(&s, seq);
+        try std.testing.expectEqualStrings("/plain/path", s.cwd());
+    }
+}
