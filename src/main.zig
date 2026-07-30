@@ -21,6 +21,8 @@ const mouse = @import("term/mouse.zig");
 const urlmod = @import("term/url.zig");
 const hintsmod = @import("term/hints.zig");
 const launch = @import("launch.zig");
+const cfgmod = @import("config.zig");
+const watchmod = @import("watch.zig");
 const ptr = @import("wl/pointer.zig");
 const clip = @import("wl/clipboard.zig");
 
@@ -53,6 +55,7 @@ const App = struct {
     pty: *Pty,
     font: *const Font,
     pad: Padding,
+    cfg: *const cfgmod.Config,
     /// Set by MYTERM_DEBUG. Traces input and selection handling, which is
     /// otherwise invisible: these paths are driven by hardware events that cannot
     /// be reproduced from a script.
@@ -295,7 +298,11 @@ const App = struct {
         defer self.gpa.free(text);
 
         if (self.debug) std.debug.print("link: opening '{s}'\n", .{text});
-        if (launch.open(text)) |pid| {
+        var program: [512]u8 = undefined;
+        const name = self.cfg.url_launcher.slice();
+        @memcpy(program[0..name.len], name);
+        program[name.len] = 0;
+        if (launch.openWith(@ptrCast(&program), text)) |pid| {
             self.reaper.track(pid);
             return;
         }
@@ -448,7 +455,11 @@ const App = struct {
                     // Gated on `dragging`: a release that did not follow one of our
                     // presses — the button went down while the application owned the
                     // mouse — must not republish a stale selection.
-                    self.publishSelection(serial, &.{ .primary, .clipboard });
+                    if (self.cfg.copy_on_select) {
+                        self.publishSelection(serial, &.{ .primary, .clipboard });
+                    } else {
+                        self.publishSelection(serial, &.{.primary});
+                    }
                 }
                 self.needs_render = true;
             },
@@ -688,6 +699,8 @@ test {
     // references `main` — so without this block `zig build test` silently covered
     // almost nothing. Found by breaking an assertion in launch.zig on purpose and
     // watching the suite stay green.
+    _ = @import("config.zig");
+    _ = @import("watch.zig");
     _ = @import("launch.zig");
     _ = @import("font/font.zig");
     _ = @import("gfx/atlas.zig");
@@ -720,15 +733,21 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // debug allocator bookkeeping in the render path.
     const gpa = std.heap.c_allocator;
 
-    const argv = try buildArgv(gpa, init.args.vector, init.environ);
+    const args = parseArgs(init.args.vector);
+    const argv = try buildArgv(gpa, args.child, init.environ);
     defer gpa.free(argv);
 
-    // ── font first: cell geometry determines the initial window size ────────
-    var font = Font.init("FiraCode Nerd Font", "size=12:dpi=96") catch |err| {
-        std.debug.print(
-            "myterm: could not load 'FiraCode Nerd Font' ({s})\n",
-            .{@errorName(err)},
-        );
+    // ── config before anything it configures ────────────────────────────────
+    var diags = cfgmod.Diagnostics{};
+    var cfg = loadConfig(gpa, args.config_path, &diags);
+    diags.report();
+
+    // ── font: cell geometry determines the initial window size ──────────────
+    var font = loadFont(&cfg) catch |err| {
+        std.debug.print("myterm: could not load '{s}' ({s})\n", .{
+            cfg.font_family.slice(),
+            @errorName(err),
+        });
         return err;
     };
     defer font.deinit();
@@ -747,11 +766,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var cache = GlyphCache.init(gpa, &font, atlas_size);
     defer cache.deinit();
 
-    const pad = Padding{};
+    var pad = Padding{ .x = cfg.padding_x, .y = cfg.padding_y };
     var dims = gridSize(win.width, win.height, &font, pad);
 
-    var screen = try Screen.init(gpa, dims.cols, dims.rows);
+    var screen = try Screen.initScrollback(
+        gpa,
+        dims.cols,
+        dims.rows,
+        cfg.scrollback_lines,
+    );
     defer screen.deinit();
+    applyConfig(&screen, &cfg);
 
     var pty = Pty.spawn(dims.cols, dims.rows, argv.ptr) catch |err| {
         std.debug.print("myterm: could not spawn {s}: {s}\n", .{
@@ -770,6 +795,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .pty = &pty,
         .font = &font,
         .pad = pad,
+        .cfg = &cfg,
         .debug = std.c.getenv("MYTERM_DEBUG") != null,
     };
     win.keyboard.sink = .{ .ctx = &app, .write = App.writeToPty };
@@ -785,6 +811,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     };
     // Device queries (DA, DSR) answer back down the PTY.
     screen.reply = .{ .ctx = &app, .write = App.writeToPty };
+
+    // Live reload. A missing inotify fd is not fatal — the terminal simply stops
+    // noticing edits, which is what it did before this existed.
+    var watcher = watchmod.Watcher.init();
+    if (watcher) |*w| armWatches(w, args.config_path, &cfg);
+    defer if (watcher) |*w| w.deinit();
 
     var parser = vt.Parser(Screen).init(&screen);
 
@@ -827,7 +859,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // panes (phase 5), and foot demonstrates a single-threaded loop is entirely
     // competitive. Revisit with measurements rather than on principle.
     var read_buf: [read_chunk]u8 = undefined;
-    var fds: [2]std.posix.pollfd = undefined;
+    var fds: [3]std.posix.pollfd = undefined;
     var sync_started_ms: i64 = 0;
 
     while (!win.closed) {
@@ -864,6 +896,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
         fds[0] = .{ .fd = win.fd(), .events = std.posix.POLL.IN, .revents = 0 };
         fds[1] = .{ .fd = pty.master, .events = std.posix.POLL.IN, .revents = 0 };
+        // A negative fd is ignored by poll, which is how "no inotify" costs nothing.
+        fds[2] = .{
+            .fd = if (watcher) |*w| w.fd else -1,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        };
 
         // Block indefinitely unless a deadline needs us back sooner. Two can be
         // outstanding — the synchronized-output safety valve and the next key
@@ -875,6 +913,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (win.keyboard.repeat_at != 0) {
             const due: i32 = @intCast(@max(1, win.keyboard.repeat_at - now_ms));
             timeout = if (timeout < 0) due else @min(timeout, due);
+        }
+        if (watcher) |*w| {
+            if (w.timeout(now_ms)) |due| {
+                timeout = if (timeout < 0) due else @min(timeout, due);
+            }
         }
 
         _ = std.posix.poll(&fds, timeout) catch |err| {
@@ -911,6 +954,25 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 if (n == 0) break;
                 parser.feed(read_buf[0..n]);
                 drained += n;
+            }
+        }
+
+        if (watcher) |*w| {
+            if (fds[2].revents & std.posix.POLL.IN != 0) _ = w.drain(monotonicMs());
+            if (w.ready(monotonicMs())) {
+                reloadConfig(.{
+                    .gpa = gpa,
+                    .cfg = &cfg,
+                    .config_path = args.config_path,
+                    .screen = &screen,
+                    .font = &font,
+                    .cache = &cache,
+                    .pad = &pad,
+                    .pty = &pty,
+                    .app = &app,
+                    .win = &win,
+                    .watcher = w,
+                });
             }
         }
 
@@ -1053,6 +1115,174 @@ fn gridSize(width: u32, height: u32, font: *const Font, pad: Padding) Dims {
     };
 }
 
+/// Command line: `-c path` picks a config, `-e cmd args...` a child command.
+const Args = struct {
+    config_path: []const u8 = "",
+    /// Everything from `-e` onwards, or the whole argv when absent.
+    child: []const [*:0]const u8,
+};
+
+fn parseArgs(argv: []const [*:0]const u8) Args {
+    var out = Args{ .child = argv };
+    var i: usize = 1;
+    while (i < argv.len) : (i += 1) {
+        const arg = std.mem.span(argv[i]);
+        if (std.mem.eql(u8, arg, "-e")) break;
+        if ((std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--config")) and
+            i + 1 < argv.len)
+        {
+            out.config_path = std.mem.span(argv[i + 1]);
+            i += 1;
+        }
+    }
+    return out;
+}
+
+/// Where the config lives when `-c` did not say.
+fn defaultConfigPath(out: []u8) []const u8 {
+    if (std.c.getenv("XDG_CONFIG_HOME")) |xdg| {
+        const dir = std.mem.span(xdg);
+        if (dir.len > 0) {
+            return std.fmt.bufPrint(out, "{s}/myterm/myterm.conf", .{dir}) catch
+                "~/.config/myterm/myterm.conf";
+        }
+    }
+    return "~/.config/myterm/myterm.conf";
+}
+
+/// Load the config, then the theme.
+///
+/// The theme comes from the flavour file *only* when the config did not name one.
+/// Otherwise an explicit `theme` in the config would be silently overridden by a file
+/// the user may not even remember exists.
+fn loadConfig(
+    gpa: std.mem.Allocator,
+    path_arg: []const u8,
+    diags: *cfgmod.Diagnostics,
+) cfgmod.Config {
+    var buf: [1024]u8 = undefined;
+    const path = if (path_arg.len > 0) path_arg else defaultConfigPath(&buf);
+    var cfg = cfgmod.load(gpa, path, diags);
+    if (cfg.theme_path.len == 0) cfgmod.reloadTheme(gpa, &cfg, diags);
+    return cfg;
+}
+
+fn loadFont(cfg: *const cfgmod.Config) !Font {
+    var name: [512]u8 = undefined;
+    const family = cfg.font_family.slice();
+    @memcpy(name[0..family.len], family);
+    name[family.len] = 0;
+
+    var attrs: [64]u8 = undefined;
+    // dpi=96 with the compositor's scale applied separately; per-output scaling is
+    // phase 7's problem.
+    const spec = std.fmt.bufPrintZ(&attrs, "size={d:.1}:dpi=96", .{cfg.font_size}) catch
+        "size=12.0:dpi=96";
+    return Font.init(@ptrCast(&name), spec);
+}
+
+/// Push the settings that live on the Screen rather than in the Config.
+fn applyConfig(screen: *Screen, cfg: *const cfgmod.Config) void {
+    screen.theme = cfg.theme;
+    screen.selection.word_separators = cfg.word_separators.slice();
+    screen.modes.alternate_scroll = cfg.alternate_scroll;
+    screen.dirty = true;
+}
+
+/// Everything a reload may have to touch.
+const Live = struct {
+    gpa: std.mem.Allocator,
+    cfg: *cfgmod.Config,
+    config_path: []const u8,
+    screen: *Screen,
+    font: *Font,
+    cache: *GlyphCache,
+    pad: *Padding,
+    pty: *Pty,
+    app: *App,
+    win: *Window,
+    watcher: *watchmod.Watcher,
+};
+
+/// Re-read the config and apply what can be applied without restarting.
+fn reloadConfig(l: Live) void {
+    var diags = cfgmod.Diagnostics{};
+    const fresh = loadConfig(l.gpa, l.config_path, &diags);
+    diags.report();
+
+    const font_changed = !l.cfg.font_family.eql(fresh.font_family.slice()) or
+        l.cfg.font_size != fresh.font_size;
+    const geom_changed = l.cfg.padding_x != fresh.padding_x or
+        l.cfg.padding_y != fresh.padding_y;
+    // scrollback_lines is missing on purpose: changing it means reallocating the ring
+    // and deciding what to do with the history that no longer fits. It applies at the
+    // next start, which is what every other terminal does too.
+    if (l.cfg.scrollback_lines != fresh.scrollback_lines) {
+        std.debug.print("myterm: scrollback_lines applies at the next start\n", .{});
+    }
+
+    l.cfg.* = fresh;
+    applyConfig(l.screen, l.cfg);
+
+    if (font_changed) {
+        // Load the new font *before* dropping the old one: a bad font_family in the
+        // config must not leave the terminal with no font at all.
+        if (loadFont(l.cfg)) |next| {
+            l.font.deinit();
+            l.font.* = next;
+            // The atlas holds glyphs rasterized by the previous font, so it cannot be
+            // reused — every cached entry would draw the old size.
+            l.cache.deinit();
+            l.cache.* = GlyphCache.init(l.gpa, l.font, atlas_size);
+        } else |err| {
+            std.debug.print("myterm: keeping the old font, '{s}' failed ({s})\n", .{
+                l.cfg.font_family.slice(),
+                @errorName(err),
+            });
+        }
+    }
+
+    if (font_changed or geom_changed) {
+        l.pad.* = .{ .x = l.cfg.padding_x, .y = l.cfg.padding_y };
+        l.app.pad = l.pad.*;
+        const dims = gridSize(l.win.width, l.win.height, l.font, l.pad.*);
+        l.screen.resize(dims.cols, dims.rows) catch |err| {
+            std.debug.print("myterm: resize after reload failed: {s}\n", .{@errorName(err)});
+        };
+        l.pty.resize(dims.cols, dims.rows);
+        // Hint spans and the hover span are in absolute line coordinates, which the
+        // reflow just renumbered.
+        l.app.hintsExit();
+    }
+
+    // A new `theme` value points at a different file, so the watch list changes with it.
+    l.watcher.reset();
+    armWatches(l.watcher, l.config_path, l.cfg);
+    l.app.needs_render = true;
+}
+
+fn armWatches(
+    w: *watchmod.Watcher,
+    config_path_arg: []const u8,
+    cfg: *const cfgmod.Config,
+) void {
+    var buf: [1024]u8 = undefined;
+    const path = if (config_path_arg.len > 0)
+        config_path_arg
+    else
+        defaultConfigPath(&buf);
+
+    var expanded: [1024]u8 = undefined;
+    if (cfgmod.expandTilde(path, &expanded)) |p| w.add(p);
+
+    var flavour: [1024]u8 = undefined;
+    if (cfgmod.expandTilde(cfg.theme_flavour_file.slice(), &flavour)) |p| w.add(p);
+
+    // The resolved theme file, so editing the colours directly also applies. Already
+    // absolute — `applyThemeRef` expanded it.
+    if (cfg.theme_path.len > 0) w.add(cfg.theme_path.slice());
+}
+
 /// Build the child's argv: `-e cmd args...` runs a specific command, otherwise
 /// $SHELL and then zsh as a fallback.
 ///
@@ -1064,7 +1294,7 @@ fn buildArgv(
     args: []const [*:0]const u8,
     environ: std.process.Environ,
 ) ![:null]?[*:0]const u8 {
-    for (args[1..], 1..) |arg, i| {
+    for (args, 0..) |arg, i| {
         if (std.mem.eql(u8, std.mem.span(arg), "-e") and i + 1 < args.len) {
             const rest = args[i + 1 ..];
             const argv = try gpa.allocSentinel(?[*:0]const u8, rest.len, null);

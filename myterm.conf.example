@@ -1,0 +1,95 @@
+# myterm configuration — copy to ~/.config/myterm/myterm.conf
+#
+# One setting per line. `#` starts a comment. The separator may be a space or a
+# colon, so both of these are the same line:
+#
+#     font_size 12
+#     font_size: 12
+#
+# This is not YAML: no nesting, no lists, no quoting. It is a flat mapping, which is
+# all a terminal config needs, and it means the kitty theme files already on this
+# machine load unchanged.
+#
+# Every line below shows the default. An unknown setting or an unparseable value is
+# reported on stderr and skipped — a typo never stops the terminal from opening.
+#
+# The config, the theme file, and the flavour file are all watched: saving any of them
+# applies immediately. Two exceptions, both reported when you hit them:
+#   - scrollback_lines applies at the next start
+#   - a font that fails to load leaves the previous one in place
+
+# ── font and layout ──────────────────────────────────────────────────────────
+
+# Must be monospace. A name fontconfig cannot find is *substituted*, not refused, so
+# a typo here would otherwise silently give you a proportional font and overlapping
+# text; myterm measures the advances and refuses instead.
+# font_family FiraCode Nerd Font Ret
+# font_size 12
+
+# Left and top only, matching the existing kitty/wezterm setup.
+# padding_x 4
+# padding_y 0
+
+# Lines of history kept per window.
+# scrollback_lines 10000
+
+# ── behaviour ────────────────────────────────────────────────────────────────
+
+# Feed a finished selection to CLIPBOARD as well as PRIMARY, so Ctrl+Shift+V pastes
+# what was just selected. Not the platform default: it means a clipboard manager
+# records every mouse selection. Set to `no` for PRIMARY only.
+# copy_on_select yes
+
+# Word boundaries for double-click. Includes shell punctuation so double-clicking
+# inside a path or a URL grabs the whole thing.
+# word_separators  	"'`()[]{}<>|;:,!?*+=&^%$#@\
+
+# On the alternate screen with no mouse tracking, send cursor keys for the wheel.
+# This is what makes the wheel work in `less` and `man` (xterm's mode 1007).
+# alternate_scroll yes
+
+# The program handed a URL by Ctrl+click or hint mode. One program, no arguments:
+# it is passed an argv array, never a shell string, and a value with spaces is
+# refused rather than split.
+# url_launcher xdg-open
+
+# ── theme ────────────────────────────────────────────────────────────────────
+
+# A name or a path.
+#
+#   theme nightfox              looked up in theme_dir, trying .conf/.yaml/.yml
+#   theme: nord.yaml            same, extension included
+#   theme ~/themes/solarized    an absolute or ~ path, used as given
+#
+# Anything containing a `/` or starting with `~` is treated as a path; anything else
+# as a name. Leave it unset to follow theme_flavour_file instead.
+# theme nightfox
+
+# Where a *named* theme is looked up. Defaults to the directory this machine's
+# app-theme switcher already writes into, so its dayfox/nightfox files just work.
+# theme_dir ~/.config/kitty/themes
+
+# A file holding nothing but a theme name. Used only when `theme` is unset. The
+# switcher rewrites it, and myterm watches it — so flipping the flavour re-themes
+# every open window instantly, including text already on screen.
+# theme_flavour_file ~/.config/.app-theme-flavour
+
+# Pull in another file. Relative paths resolve against this file's directory.
+# include colors.conf
+
+# ── theme file format ────────────────────────────────────────────────────────
+#
+# Theme files use kitty's key names, because that is what this machine's themes are
+# written in. Colours accept #rgb, #rrggbb, #rrrgggbbb, #rrrrggggbbbb and
+# rgb:r/g/b. Keys myterm has no chrome for (tab bar, borders, bell) are ignored
+# quietly rather than reported.
+#
+#     background            #192330
+#     foreground            #cdcecf
+#     cursor                #cdcecf
+#     cursor_text_color     #192330
+#     selection_background  #2b3b51
+#     selection_foreground  #cdcecf
+#     hint_background       #dbc074      (myterm-specific: hint-mode labels)
+#     hint_foreground       #192330
+#     color0 ... color255   #rrggbb

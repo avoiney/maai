@@ -11,6 +11,8 @@ const c = @import("../c.zig").c;
 pub const Error = error{
     InitFailed,
     LoadFailed,
+    /// fontconfig substituted a proportional face, which a cell grid cannot use.
+    NotMonospace,
 };
 
 var fcft_ready = false;
@@ -51,6 +53,18 @@ pub const Font = struct {
             if (space.*.advance.x > 0) cell_w = @intCast(space.*.advance.x);
         }
 
+        // Reject a proportional font, because fontconfig will not.
+        //
+        // A typo in `font_family` does not fail: fontconfig substitutes its best
+        // match, which for an unknown name is whatever the system default is — here,
+        // Noto Sans. The terminal then draws every glyph at the width of a space and
+        // the output is unreadable overlapping text. Failing loudly lets the caller
+        // keep the font it already had.
+        if (!isMonospace(handle)) {
+            c.fcft_destroy(handle);
+            return Error.NotMonospace;
+        }
+
         return .{
             .handle = handle,
             .cell_w = cell_w,
@@ -61,6 +75,26 @@ pub const Font = struct {
             .strikeout_pos = handle.*.strikeout.position,
             .strikeout_thickness = @max(handle.*.strikeout.thickness, 1),
         };
+    }
+
+    /// Do a few narrow and wide characters share one advance?
+    ///
+    /// Measured rather than taken from fontconfig's `spacing` property, which plenty
+    /// of fonts set wrongly or not at all. `i` against `W` and `M` is the standard
+    /// check and catches every proportional face in practice.
+    fn isMonospace(handle: *c.struct_fcft_font) bool {
+        var advance: i32 = 0;
+        for ([_]u32{ 'i', 'W', 'M', 'l' }) |cp| {
+            const g = c.fcft_rasterize_char_utf32(handle, cp, c.FCFT_SUBPIXEL_NONE) orelse
+                continue;
+            if (g.*.advance.x <= 0) continue;
+            if (advance == 0) {
+                advance = g.*.advance.x;
+            } else if (g.*.advance.x != advance) {
+                return false;
+            }
+        }
+        return true;
     }
 
     pub fn deinit(self: *Font) void {

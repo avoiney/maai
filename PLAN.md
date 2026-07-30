@@ -679,16 +679,68 @@ feature, disproportionate daily payoff.
 collapses its parent correctly; no PTY or thread leaks under repeated open/close
 (check with `/proc/self/fd` and valgrind).
 
-### Phase 6 — config and live theming (≈1 week)
+### Phase 6 — config and live theming ✅ done (2026-07-30)
 
-Kitty-style parser with `include`. inotify watch on the config *and* on
-`~/.config/.app-theme-flavour`, so your `dayfox`/`nightfox` switch re-themes every open
-pane instantly instead of only at startup — a live upgrade over the current WezTerm
-setup. Themes carry 16 ANSI colors plus fg/bg/cursor/selection. `OSC 4/10/11/12` runtime
-color changes, and `OSC 104/110/111` resets.
+Reordered ahead of phase 5 deliberately: one week to make the terminal *habitable* beats
+three weeks of splits that sway already provides.
 
-**Acceptance:** editing config or flipping the flavour file re-themes without restart and
-without dropping a frame.
+**Colours resolve at draw time.** This was the prerequisite and it was not obvious: a
+`Style` stored resolved `Rgb`, so a theme reload could only ever affect text printed
+*afterwards* — everything already on screen and in the scrollback kept the old palette.
+Style slots now hold what the application asked for (`colour 4`, `default`, `#a1b2c3`) and
+`term/theme.zig` turns that into pixels per cell, per frame. Same indirection makes
+`OSC 4` behave: an application that redefines colour 4 expects text already drawn in
+colour 4 to change with it. The `Theme` is owned per `Screen`, because those OSC codes are
+per-terminal state.
+
+**Config format** (`config.zig`): flat `key value`, `#` comments, `include` with a depth
+cap against cycles. The separator may be a space *or* a colon, because the two
+conventions in play disagree — kitty theme files write `background #192330`, and
+`theme: nord.yaml` is what reads naturally when pointing at a file. One optional colon
+costs a line of parsing and the existing `~/.config/kitty/themes/*.conf` load unchanged.
+Not YAML, and deliberately: nesting, lists, anchors and quoting are a few thousand lines
+and a supply of surprises for no gain here.
+
+**`theme` takes a name or a path.** A value containing `/` or starting with `~` is a path;
+anything else is a name looked up in `theme_dir`, trying `.conf`, `.yaml`, `.yml`. So
+`theme nightfox`, `theme: nord.yaml` and `theme ~/themes/solarized` all work with no
+second setting to disambiguate.
+
+**Nothing is fatal.** An unknown key or unparseable value is collected into a bounded
+`Diagnostics`, printed, and skipped. A config that will not open the window because of a
+typo is worse than a config that ignores one line. `url_launcher` is the exception that
+gets stricter, not looser: a value with spaces is *refused* rather than split, because it
+is the one setting that names a process to run (§7).
+
+**Live reload** (`watch.zig`) watches the containing **directory**, not the file. Almost
+nothing edits in place — vim renames a temporary over the target, the theme switcher
+copies, `sed -i` replaces — so a watch on the file follows the dead inode and goes
+permanently silent after the first save. Events are filtered by basename, which matters
+because the flavour file lives in `~/.config`, a directory with constant traffic. A 60 ms
+debounce collapses the several events one save produces.
+
+Applied live: theme, padding, font family and size, `copy_on_select`, word separators,
+alternate scroll, launcher. `scrollback_lines` is not, and says so — changing it means
+reallocating the ring and deciding what to do with the history that no longer fits.
+
+**A bug this found:** a typo in `font_family` is not an error. fontconfig *substitutes*
+its best match, which for an unknown name is the system default — Noto Sans here, a
+**proportional** face. The terminal then drew every glyph at a space's width and the
+output was unreadable overlapping text. `Font.init` now measures the advances of `i`, `l`,
+`W`, `M` and refuses a face where they differ, so a reload keeps the working font and says
+why. Measured rather than trusting fontconfig's `spacing` property, which fonts set wrongly
+or not at all.
+
+**Verified by screenshot**, since this part *is* scriptable: `theme nightfox` → dark;
+rename a config with `theme dayfox` over it → light, **and the red/blue text printed before
+the change recoloured with it**, which is the whole point of the indirection; a
+`theme_flavour_file` flipped both ways by plain overwrite; `font_size 12` → `18` live; and
+a bogus `font_family` leaving the old font in place with `keeping the old font …
+(NotMonospace)` on stderr.
+
+`myterm.conf.example` documents every setting at its default.
+
+**Acceptance met:** editing config or flipping the flavour file re-themes without restart.
 
 ### Phase 7 — performance and typography (≈2–3 weeks)
 

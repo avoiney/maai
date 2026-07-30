@@ -58,4 +58,6 @@ pub const c = @cImport({
     @cInclude("spawn.h");
     @cInclude("stdlib.h");
     @cInclude("sys/mman.h");
+    // inotify, for live config and theme reload.
+    @cInclude("sys/inotify.h");
 });
