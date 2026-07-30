@@ -228,8 +228,11 @@ clavier.
 ## Détails mineurs
 
 - `restoreCursor` ne restaure pas `wrap_pending` (`src/term/screen.zig:558`).
-- DECSET 1002 et 1003 sont fusionnés sur `.any`, ce qui perd la distinction
-  entre motion-while-pressed et any-motion (`src/term/screen.zig:787`).
+- ~~DECSET 1002 et 1003 sont fusionnés sur `.any`, ce qui perd la distinction
+  entre motion-while-pressed et any-motion~~ — **corrigé** (2026-07-30) : les
+  quatre modes sont des bits indépendants dans `mouse.Modes`, et `mode()` retient
+  le plus capable. Le vrai défaut était plus grave que la distinction perdue :
+  `DECRST 1002` éteignait un suivi que 1003 voulait toujours.
 - `print()` avec un caractère large et `autowrap` désactivé jette le caractère au
   lieu d'écraser la dernière colonne, contrairement à xterm
   (`src/term/screen.zig:228`).

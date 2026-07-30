@@ -12,6 +12,14 @@ pub const button_left: u32 = 0x110; // BTN_LEFT
 pub const button_middle: u32 = 0x112; // BTN_MIDDLE
 pub const button_right: u32 = 0x111; // BTN_RIGHT
 
+// Side buttons. Which pair a mouse reports is not consistent: most five-button
+// devices send SIDE/EXTRA for back/forward, some send BACK/FORWARD, so both are
+// mapped rather than guessing.
+pub const button_side: u32 = 0x113; // BTN_SIDE
+pub const button_extra: u32 = 0x114; // BTN_EXTRA
+pub const button_forward: u32 = 0x115; // BTN_FORWARD
+pub const button_back: u32 = 0x116; // BTN_BACK
+
 pub const Handler = struct {
     ctx: *anyopaque,
     motion: *const fn (*anyopaque, x: f64, y: f64) void,

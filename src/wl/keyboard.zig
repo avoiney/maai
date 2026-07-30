@@ -14,6 +14,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const Modes = @import("../term/screen.zig").Modes;
+const mouse = @import("../term/mouse.zig");
 
 /// Where encoded key bytes go. Indirected so this module does not need to know
 /// about the PTY or the App.
@@ -105,15 +106,28 @@ pub const Keyboard = struct {
         ) > 0;
     }
 
+    /// Modifier state right now.
+    ///
+    /// Pointer events carry no modifier information of their own — `wl_pointer`
+    /// leaves that to the seat's keyboard — so mouse handling reads it from here.
+    pub fn activeMods(self: *Keyboard) mouse.Mods {
+        return .{
+            .shift = self.modActive("Shift"),
+            .alt = self.modActive("Mod1"),
+            .ctrl = self.modActive("Control"),
+        };
+    }
+
     /// Encode one key press into terminal input bytes. Returns a slice of `buf`,
     /// or null if the key produces nothing.
     fn encode(self: *Keyboard, keycode: u32, buf: []u8) ?[]const u8 {
         const state = self.state orelse return null;
         const sym = c.xkb_state_key_get_one_sym(state, keycode);
 
-        const shift = self.modActive("Shift");
-        const ctrl = self.modActive("Control");
-        const alt = self.modActive("Mod1");
+        const mods = self.activeMods();
+        const shift = mods.shift;
+        const ctrl = mods.ctrl;
+        const alt = mods.alt;
 
         // xterm's modifier parameter: 1 + shift(1) + alt(2) + ctrl(4).
         const mod: u8 = 1 +

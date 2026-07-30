@@ -483,12 +483,50 @@ every synthetic drag selected a single character. Double-click word selection is
 substitute, since it needs no motion at all. `MYTERM_DEBUG=1` traces input and selection
 handling, which is otherwise invisible.
 
+**Mouse reporting to applications (2026-07-30).** `term/mouse.zig` encodes events;
+`main.zig` decides who a click belongs to. The two are separate because they fail
+differently: encoding is a wire format that can be unit-tested exhaustively without a
+compositor, while ownership depends on live state — modifiers, scrollback position, and
+whether a drag is already in flight.
+
+- **Modes 9 / 1000 / 1002 / 1003** for what is reported, **1006** for how it is encoded.
+  Each is its own bit rather than one enum, because applications enable several and reset
+  them one at a time; collapsing them makes `DECRST 1002` switch off tracking that 1003
+  still wants, which surfaces as a mouse that dies after leaving a nested application.
+- **1005 and 1015 are recognised and ignored on purpose.** 1005 (UTF-8) is ambiguous by
+  construction — a coordinate byte in 0x80..0xff is indistinguishable from a UTF-8 lead
+  byte — and 1015 (urxvt) was the dead end 1006 replaced.
+- **Shift overrides**, always. While an application holds the mouse, Shift+drag is the only
+  way to select text out of nvim, tmux or lazygit, so it takes precedence over reporting.
+- **A press decides ownership, and everything up to the release follows it.** Deciding per
+  event would let pressing Shift mid-drag leave the application with a button stuck down: it
+  would never see the up. Switching tracking off mid-drag drops the pending state instead.
+- **Scrolled into history, the pointer is ours.** The application's coordinate space is what
+  it last drew; reporting a click on scrollback would make it act on unrelated text.
+- **Motion reports once per cell entered**, not once per pointer event — motion arrives at
+  device rate, and an application redrawing per report falls permanently behind.
+- **Wheel** notches encode as buttons 64/65, capped per axis event so a flick cannot hand
+  the child an unbounded burst.
+- **Alternate scroll (1007, default on)**: on the alternate screen with no tracking active
+  the wheel sends cursor keys, respecting DECCKM. Without it the wheel does nothing at all
+  in `less` or `man`, neither of which asks for mouse tracking.
+- The legacy encoding **clamps** coordinates at 223 rather than dropping the event: a click
+  at the far right of a wide window still lands somewhere plausible, and anything that
+  genuinely needs the real coordinate negotiates 1006.
+
+Verified by capturing the child's raw input (`stty raw; cat > log`) under synthetic clicks,
+then by driving nvim with `autocmd CursorMoved` writing its cursor position to a file —
+clicking grid cell (12, 9) put nvim's cursor at line 10, column 13, and (5, 3) at line 4,
+column 6. Method note for next time: `swaymsg seat - cursor press button4/button5` is *not*
+a wheel — sway maps those to `BTN_SIDE`/`BTN_EXTRA`, and they arrive as buttons 128/129.
+The compositor cannot synthesize axis events at all, so the wheel path was confirmed from
+real device input in the same capture rather than driven deliberately.
+
 **Still outstanding in this phase:** the Kitty keyboard protocol and legacy
 modifyOtherKeys (the sequences are currently recognised and ignored); xkbcommon-compose for
-dead keys; **mouse reporting to applications** (the modes are tracked but no events are
-emitted, so clicking inside nvim or Claude Code does nothing); a keyboard-driven visual
-select mode; configurable bindings; and a confirmation prompt for multi-line pastes, which
-needs UI that does not exist yet.
+dead keys; focus reporting (1004 is tracked but `CSI I`/`CSI O` are never sent); a
+keyboard-driven visual select mode; configurable bindings; and a confirmation prompt for
+multi-line pastes, which needs UI that does not exist yet.
 
 Original phase 3 scope, for reference:
 

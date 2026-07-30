@@ -17,6 +17,7 @@ const Screen = @import("term/screen.zig").Screen;
 const Pty = @import("pty/pty.zig").Pty;
 const vt = @import("vt/parser.zig");
 const sel = @import("term/selection.zig");
+const mouse = @import("term/mouse.zig");
 const ptr = @import("wl/pointer.zig");
 const clip = @import("wl/clipboard.zig");
 
@@ -32,6 +33,14 @@ const sync_timeout_ms = 150;
 
 /// Two clicks within this window at the same cell count as a double click.
 const multi_click_ms = 400;
+
+/// Wheel notches to honour in one axis event. A flick can deliver a large
+/// accumulated delta, and turning that into an unbounded burst of reports or cursor
+/// keys hands the child more input than the gesture meant.
+const max_wheel_notches = 16;
+/// Cursor keys sent per wheel notch under alternate scroll, matching the three
+/// lines the local scrollback moves.
+const arrows_per_notch = 3;
 
 const App = struct {
     gpa: std.mem.Allocator,
@@ -57,6 +66,15 @@ const App = struct {
     last_click_x: u32 = 0,
     click_count: u2 = 0,
 
+    /// Buttons the *application* currently holds, as `heldBit` values. Non-zero
+    /// means a reported drag is in progress.
+    held_mask: u8 = 0,
+    /// Last cell reported to the application, so motion reports once per cell
+    /// rather than once per pointer event. Starts out of range so the first motion
+    /// always reports.
+    report_col: u32 = std.math.maxInt(u32),
+    report_row: u32 = std.math.maxInt(u32),
+
     fn writeToPty(ctx: *anyopaque, bytes: []const u8) void {
         const self: *App = @ptrCast(@alignCast(ctx));
         // Typing snaps the view back to the live screen; otherwise the reply to
@@ -68,8 +86,8 @@ const App = struct {
         self.pty.write(bytes);
     }
 
-    /// Map surface-local pixels to a point in the grid, including scrollback.
-    fn pointAt(self: *App, px: f64, py: f64) sel.Point {
+    /// Map surface-local pixels to a cell on the *visible* screen.
+    fn cellAt(self: *App, px: f64, py: f64) CellPos {
         const grid = &self.screen.grid;
         const fx = @max(px - @as(f64, @floatFromInt(self.pad.x)), 0);
         const fy = @max(py - @as(f64, @floatFromInt(self.pad.y)), 0);
@@ -78,13 +96,107 @@ const App = struct {
         const row = @as(u32, @intFromFloat(fy / @as(f64, @floatFromInt(self.font.cell_h))));
 
         return .{
-            .line = grid.viewTop() + @min(row, grid.rows - 1),
-            .x = @min(col, grid.cols - 1),
+            .col = @min(col, grid.cols - 1),
+            .row = @min(row, grid.rows - 1),
         };
+    }
+
+    /// Same position as a point in the grid ring, which is what selection needs so
+    /// that a selection stays anchored to its text while the view scrolls.
+    fn pointAt(self: *App, px: f64, py: f64) sel.Point {
+        const cell = self.cellAt(px, py);
+        return .{ .line = self.screen.grid.viewTop() + cell.row, .x = cell.col };
+    }
+
+    /// Does this pointer event belong to the application rather than to us?
+    ///
+    /// A press decides, and every event until the matching release follows that
+    /// decision. Re-deciding per event would let pressing Shift mid-drag leave the
+    /// application with a button stuck down forever — it would never see the up.
+    fn mouseGoesToApp(self: *App, mods: mouse.Mods) bool {
+        if (self.screen.mouse.mode() == .off) {
+            // An application that switches tracking off mid-drag will never send
+            // the release we are holding the pointer for. Forget it here rather
+            // than routing every later event to nobody.
+            self.held_mask = 0;
+            return false;
+        }
+        if (self.held_mask != 0) return true; // the application's drag
+        if (self.dragging) return false; // ours
+
+        // Shift is the universal override, and it is not a nicety: while an
+        // application holds the mouse it is the only way to select text out of
+        // nvim, tmux or lazygit.
+        if (mods.shift) return false;
+        // Scrolled into history, the application's coordinate space no longer
+        // matches what is on screen — a report would make it act on unrelated text.
+        // Local selection and local scrolling stay available up there instead.
+        if (self.screen.grid.view != 0) return false;
+        return true;
+    }
+
+    fn reportMouse(self: *App, ev: mouse.Event) void {
+        var buf: [mouse.max_len]u8 = undefined;
+        const bytes = mouse.encode(
+            &buf,
+            self.screen.mouse.mode(),
+            self.screen.mouse.encoding(),
+            ev,
+        ) orelse return;
+        if (self.debug) {
+            // Every report starts with ESC; printing the rest verbatim keeps the
+            // trace readable without an escaping formatter.
+            std.debug.print("mouse -> app: {s} {s} at {d},{d}: ESC{s}\n", .{
+                @tagName(ev.button),
+                @tagName(ev.kind),
+                ev.col,
+                ev.row,
+                bytes[1..],
+            });
+        }
+        // Straight to the PTY rather than through `writeToPty`: a mouse report is
+        // not typing, and must not snap the view back to the live screen.
+        self.pty.write(bytes);
+    }
+
+    fn appButton(self: *App, code: u32, pressed: bool, cell: CellPos, mods: mouse.Mods) void {
+        const b = mouseButton(code) orelse return;
+        const bit = heldBit(b);
+        if (pressed) self.held_mask |= bit else self.held_mask &= ~bit;
+
+        self.report_col = cell.col;
+        self.report_row = cell.row;
+        self.reportMouse(.{
+            .button = b,
+            .kind = if (pressed) .press else .release,
+            .col = cell.col,
+            .row = cell.row,
+            .mods = mods,
+        });
     }
 
     fn onMotion(ctx: *anyopaque, px: f64, py: f64) void {
         const self: *App = @ptrCast(@alignCast(ctx));
+        const mods = self.win.keyboard.activeMods();
+
+        if (self.mouseGoesToApp(mods)) {
+            const cell = self.cellAt(px, py);
+            // One report per cell entered, not one per pointer event: motion
+            // arrives at device rate, and an application that redraws on each
+            // report would be permanently behind the pointer.
+            if (cell.col == self.report_col and cell.row == self.report_row) return;
+            self.report_col = cell.col;
+            self.report_row = cell.row;
+            self.reportMouse(.{
+                .button = heldButton(self.held_mask),
+                .kind = .motion,
+                .col = cell.col,
+                .row = cell.row,
+                .mods = mods,
+            });
+            return;
+        }
+
         if (!self.dragging) {
             if (self.debug) std.debug.print("motion {d:.0},{d:.0} (not dragging)\n", .{ px, py });
             return;
@@ -103,6 +215,16 @@ const App = struct {
 
     fn onButton(ctx: *anyopaque, button: u32, pressed: bool, serial: u32) void {
         const self: *App = @ptrCast(@alignCast(ctx));
+        const mods = self.win.keyboard.activeMods();
+
+        if (self.mouseGoesToApp(mods)) {
+            self.appButton(button, pressed, self.cellAt(
+                self.win.pointer.x,
+                self.win.pointer.y,
+            ), mods);
+            return;
+        }
+
         const p = self.pointAt(self.win.pointer.x, self.win.pointer.y);
 
         switch (button) {
@@ -133,7 +255,7 @@ const App = struct {
                             .{ p.line, p.x, self.click_count, @tagName(mode) },
                         );
                     }
-                } else {
+                } else if (self.dragging) {
                     self.dragging = false;
                     // Finishing a selection publishes it to PRIMARY, so middle-click
                     // paste works, *and* to CLIPBOARD so Ctrl+Shift+V picks it up.
@@ -141,6 +263,10 @@ const App = struct {
                     // means a clipboard manager records every mouse selection — but
                     // it is what was asked for here. Becomes a config option
                     // (`copy_on_select`) in phase 6.
+                    //
+                    // Gated on `dragging`: a release that did not follow one of our
+                    // presses — the button went down while the application owned the
+                    // mouse — must not republish a stale selection.
                     self.publishSelection(serial, &.{ .primary, .clipboard });
                 }
                 self.needs_render = true;
@@ -154,11 +280,52 @@ const App = struct {
 
     fn onAxis(ctx: *anyopaque, lines: f64) void {
         const self: *App = @ptrCast(@alignCast(ctx));
-        // Wheel down is positive; scrolling back through history is negative view
-        // motion, hence the inversion.
+        const mods = self.win.keyboard.activeMods();
+        // Wheel down is positive.
+        const up = lines < 0;
+        const notches = @min(
+            @as(usize, @intFromFloat(@abs(lines))),
+            max_wheel_notches,
+        );
+
+        if (self.mouseGoesToApp(mods)) {
+            const cell = self.cellAt(self.win.pointer.x, self.win.pointer.y);
+            for (0..notches) |_| {
+                self.reportMouse(.{
+                    .button = if (up) .wheel_up else .wheel_down,
+                    .kind = .press,
+                    .col = cell.col,
+                    .row = cell.row,
+                    .mods = mods,
+                });
+            }
+            return;
+        }
+
+        // The alternate screen has no scrollback of its own, so the wheel would
+        // otherwise do nothing at all here. xterm's mode 1007 turns it into cursor
+        // keys, which is what makes the wheel work in `less` and `man` — neither of
+        // which asks for mouse tracking.
+        if (self.screen.in_alt and self.screen.modes.alternate_scroll) {
+            self.sendArrows(up, notches * arrows_per_notch);
+            return;
+        }
+
+        // Scrolling back through history is negative view motion, hence the
+        // inversion.
         const delta: i64 = @intFromFloat(-lines * 3);
         self.screen.grid.scrollView(delta);
         self.needs_render = true;
+    }
+
+    fn sendArrows(self: *App, up: bool, count: usize) void {
+        // DECCKM applies to synthesised cursor keys exactly as to typed ones; an
+        // application in application-keypad mode does not recognise the CSI form.
+        const seq: []const u8 = if (self.screen.modes.app_cursor)
+            (if (up) "\x1bOA" else "\x1bOB")
+        else
+            (if (up) "\x1b[A" else "\x1b[B");
+        for (0..count) |_| self.pty.write(seq);
     }
 
     /// Publish the current selection to one or both selections. The text is
@@ -272,6 +439,47 @@ const App = struct {
         return false;
     }
 };
+
+/// A position on the visible screen, 0-based.
+const CellPos = struct { col: u32, row: u32 };
+
+/// evdev button code to the wire button number.
+///
+/// Unknown codes return null and are dropped rather than guessed at: a gaming
+/// mouse's extra buttons have no agreed terminal meaning.
+fn mouseButton(code: u32) ?mouse.Button {
+    return switch (code) {
+        ptr.button_left => .left,
+        ptr.button_middle => .middle,
+        ptr.button_right => .right,
+        ptr.button_side, ptr.button_back => .back,
+        ptr.button_extra, ptr.button_forward => .forward,
+        else => null,
+    };
+}
+
+fn heldBit(b: mouse.Button) u8 {
+    return switch (b) {
+        .left => 1,
+        .middle => 2,
+        .right => 4,
+        .back => 8,
+        .forward => 16,
+        // The wheel has no release, so nothing to track.
+        else => 0,
+    };
+}
+
+/// Which button a motion report should name. With several down, the first in this
+/// order wins — the wire format has room for exactly one.
+fn heldButton(mask: u8) mouse.Button {
+    if (mask & 1 != 0) return .left;
+    if (mask & 2 != 0) return .middle;
+    if (mask & 4 != 0) return .right;
+    if (mask & 8 != 0) return .back;
+    if (mask & 16 != 0) return .forward;
+    return .none;
+}
 
 /// Zig 0.16 hands argv and environ to `main` rather than exposing them as
 /// globals, so we take the `Init.Minimal` form.

@@ -8,6 +8,7 @@
 const std = @import("std");
 const cellmod = @import("cell.zig");
 const gridmod = @import("grid.zig");
+const mousemod = @import("mouse.zig");
 const Grid = gridmod.Grid;
 const width = @import("width.zig");
 const sel = @import("selection.zig");
@@ -24,7 +25,7 @@ pub const Reply = struct {
     write: *const fn (*anyopaque, []const u8) void,
 };
 
-pub const MouseMode = enum { off, x10, button, any };
+pub const MouseModes = mousemod.Modes;
 
 /// Garbage-collection pacing for one interned table.
 ///
@@ -95,6 +96,11 @@ pub const Modes = struct {
     bracketed_paste: bool = false,
     /// DECSET 1004.
     focus_events: bool = false,
+    /// DECSET 1007. On the alternate screen, with no mouse tracking active, the
+    /// wheel sends cursor keys instead of moving a scrollback that does not exist.
+    /// Defaults on, as in xterm: without it the wheel does nothing at all in `less`
+    /// or `man`, which is the single most common wheel use in a terminal.
+    alternate_scroll: bool = true,
 };
 
 pub const Screen = struct {
@@ -137,8 +143,9 @@ pub const Screen = struct {
     insert_mode: bool = false,
 
     modes: Modes = .{},
-    mouse_mode: MouseMode = .off,
-    mouse_sgr: bool = false,
+    /// What to report to the application, and how. Read by the pointer handling in
+    /// `main.zig`, which owns the local-versus-application decision.
+    mouse: MouseModes = .{},
     /// DECSET 2026. While set, the renderer holds off presenting so an app's
     /// multi-write screen update appears atomically instead of tearing.
     sync_output: bool = false,
@@ -852,10 +859,18 @@ pub const Screen = struct {
                 },
                 7 => self.autowrap = set, // DECAWM
                 25 => self.cursor_visible = set, // DECTCEM
-                1000 => self.mouse_mode = if (set) .button else .off,
-                1002, 1003 => self.mouse_mode = if (set) .any else .off,
-                1006 => self.mouse_sgr = set,
+                // Mouse tracking. Each mode is its own bit — see mouse.Modes for
+                // why collapsing them breaks nested applications.
+                9 => self.mouse.x10 = set,
+                1000 => self.mouse.button = set,
+                1002 => self.mouse.drag = set,
+                1003 => self.mouse.any = set,
+                1006 => self.mouse.sgr = set,
+                // 1005 (UTF-8) and 1015 (urxvt) are recognised and ignored on
+                // purpose; mouse.zig explains why neither is worth having.
+                1005, 1015 => {},
                 1004 => self.modes.focus_events = set,
+                1007 => self.modes.alternate_scroll = set,
                 // 47 and 1047 switch buffers without touching the cursor; 1048 is
                 // cursor save/restore alone; 1049 is the combination everything
                 // actually uses.
@@ -929,7 +944,7 @@ pub const Screen = struct {
         self.margin_top = 0;
         self.margin_bottom = self.grid.rows - 1;
         self.modes = .{};
-        self.mouse_mode = .off;
+        self.mouse = .{};
         self.sync_output = false;
         self.resetTabs();
         self.grid.clearVisible(0);
@@ -1664,6 +1679,48 @@ test "application cursor keys and bracketed paste modes are tracked" {
     feed(&s, "\x1b[?1l\x1b[?2004l");
     try std.testing.expect(!s.modes.app_cursor);
     try std.testing.expect(!s.modes.bracketed_paste);
+}
+
+test "mouse tracking modes are independent bits" {
+    var s = try Screen.init(std.testing.allocator, 10, 3);
+    defer s.deinit();
+
+    try std.testing.expectEqual(mousemod.Mode.off, s.mouse.mode());
+
+    // What nvim sends: button tracking, drag tracking, SGR encoding.
+    feed(&s, "\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+    try std.testing.expectEqual(mousemod.Mode.drag, s.mouse.mode());
+    try std.testing.expectEqual(mousemod.Encoding.sgr, s.mouse.encoding());
+
+    // Adding any-motion tracking wins while it is set...
+    feed(&s, "\x1b[?1003h");
+    try std.testing.expectEqual(mousemod.Mode.any, s.mouse.mode());
+    // ...and dropping it falls back to what is still enabled rather than to off.
+    feed(&s, "\x1b[?1003l");
+    try std.testing.expectEqual(mousemod.Mode.drag, s.mouse.mode());
+    feed(&s, "\x1b[?1002l");
+    try std.testing.expectEqual(mousemod.Mode.button, s.mouse.mode());
+
+    feed(&s, "\x1b[?1000l\x1b[?1006l");
+    try std.testing.expectEqual(mousemod.Mode.off, s.mouse.mode());
+    try std.testing.expectEqual(mousemod.Encoding.normal, s.mouse.encoding());
+}
+
+test "x10 mouse mode and alternate scroll are tracked, and RIS clears them" {
+    var s = try Screen.init(std.testing.allocator, 10, 3);
+    defer s.deinit();
+
+    // Alternate scroll defaults on, as in xterm.
+    try std.testing.expect(s.modes.alternate_scroll);
+    feed(&s, "\x1b[?1007l");
+    try std.testing.expect(!s.modes.alternate_scroll);
+
+    feed(&s, "\x1b[?9h");
+    try std.testing.expectEqual(mousemod.Mode.x10, s.mouse.mode());
+
+    feed(&s, "\x1bc");
+    try std.testing.expectEqual(mousemod.Mode.off, s.mouse.mode());
+    try std.testing.expect(s.modes.alternate_scroll);
 }
 
 test "synchronized output mode is tracked" {
