@@ -387,12 +387,18 @@ pub const Renderer = struct {
 
         for (bar, 0..) |cell, i| {
             const x = pad.x + @as(u32, @intCast(i)) * font.cell_w;
-            const last = i + 1 == bar.len;
-            const w = if (last and viewport_w > x) viewport_w - x else font.cell_w;
+
+            // The strip runs edge to edge. `pad` is the *text*'s margin — it keeps
+            // glyphs off the window border — and applying it to chrome leaves a sliver
+            // of terminal background beside the bar, which reads as the bar being
+            // misaligned. The glyphs keep the padding so they stay in the same columns
+            // as the text above them; only the background ignores it.
+            const left = if (i == 0) 0 else x;
+            const right = if (i + 1 == bar.len) @max(viewport_w, x + font.cell_w) else x + font.cell_w;
 
             // Before the glyph, since both live in the foreground list and the later
             // instance wins.
-            self.solid(x, @intCast(top), w, height, cell.bg);
+            self.solid(left, @intCast(top), right - left, height, cell.bg);
             if (cell.cp != ' ') {
                 self.emitGlyph(cache, font, x, top, cell.cp, cell.fg);
             }
