@@ -59,9 +59,15 @@
 #
 # Modifiers are `ctrl`, `shift`, `alt`, joined with `+`. The key is an xkb keysym
 # name — `c`, `percent`, `Page_Up`, `F5`, `Tab` — the same names used in
-# /usr/share/X11/xkb/symbols, so there is one vocabulary rather than two. Case does
-# not matter, and `shift+c` is written as it reads: no need to spell the shifted
-# keysym.
+# /usr/share/X11/xkb/symbols, so there is one vocabulary rather than two.
+#
+# Write the combination as it reads; the shifted spellings are undone for you:
+#   - `shift+c` matches, without spelling the keysym as `C`
+#   - `shift+tab` matches, without knowing xkb calls it `ISO_Left_Tab`
+#   - for punctuation, Shift is how the character is *typed* and is ignored — `%` is
+#     Shift+ù here and unshifted elsewhere, so `alt+percent` works either way.
+#     Letters and digits keep Shift as a real distinction, so `ctrl+c` and
+#     `ctrl+shift+c` stay different.
 #
 # A later line replaces an earlier one, so a `key` here overrides the default. The
 # action `none` *unbinds* a combination, handing it back to applications — which is

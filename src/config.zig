@@ -118,7 +118,12 @@ pub const Bindings = struct {
 
     /// Add or replace. A later line wins, which is what makes `include` and a
     /// user override behave the way anyone would expect.
-    pub fn add(self: *Bindings, binding: Binding) void {
+    pub fn add(self: *Bindings, raw: Binding) void {
+        var binding = raw;
+        // Normalised on the way in so a table never holds two entries that mean the
+        // same combination.
+        if (!binding.numrow and shiftSelectsChar(binding.sym)) binding.shift = false;
+
         for (self.items[0..self.len]) |*existing| {
             if (existing.sameCombo(binding)) {
                 existing.action = binding.action;
@@ -141,7 +146,10 @@ pub const Bindings = struct {
     ) ?Action {
         const key = normalizeSym(sym);
         for (self.items[0..self.len]) |b| {
-            if (b.ctrl != ctrl or b.shift != shift or b.alt != alt) continue;
+            // For a punctuation key, Shift is how the character was typed, not part of
+            // the combination — see `shiftSelectsChar`.
+            const want_shift = if (!b.numrow and shiftSelectsChar(b.sym)) false else shift;
+            if (b.ctrl != ctrl or b.shift != want_shift or b.alt != alt) continue;
             const hit = if (b.numrow)
                 numRowIndex(keycode) != null
             else
@@ -163,6 +171,21 @@ pub const Bindings = struct {
 ///
 /// Any config that had to know these substitutions would be a trap, so they are undone
 /// here instead — in one place, where the next one can be added.
+/// Is Shift merely *how this character is typed*, rather than a modifier of its own?
+///
+/// Printable ASCII that is not alphanumeric — `%`, `&`, `$`, `_`. Which of those need
+/// Shift depends entirely on the layout: `%` is `Shift+ù` on this AZERTY and unshifted
+/// nowhere near there on a US keyboard. Requiring Shift in the binding would make the
+/// config layout-specific, which is the very thing matching the character was meant to
+/// avoid — so for these the Shift state is ignored.
+///
+/// Letters and digits are excluded deliberately. For them Shift *is* the distinction, and
+/// `ctrl+c` must stay different from `ctrl+shift+c`.
+fn shiftSelectsChar(sym: u32) bool {
+    if (sym < 0x21 or sym > 0x7e) return false;
+    return !std.ascii.isAlphanumeric(@intCast(sym));
+}
+
 fn normalizeSym(sym: u32) u32 {
     if (sym >= 'A' and sym <= 'Z') return sym + 32;
     if (sym == c.XKB_KEY_ISO_Left_Tab) return c.XKB_KEY_Tab;
@@ -1041,4 +1064,32 @@ test "Shift+Tab is reported as ISO_Left_Tab and must still match `tab`" {
     // Shift+Tab *without* Ctrl stays the application's: it is how every shell walks
     // completions backwards.
     try testing.expect(b.lookup(c.XKB_KEY_ISO_Left_Tab, 0, false, true, false) == null);
+}
+
+test "Shift needed to type a character is not part of the combination" {
+    // The regression: `%` is Shift+ù on this AZERTY, so Alt+Shift+ù arrives with Shift
+    // held — and the default, written `alt+percent`, required Shift *absent*. The window
+    // never opened. The hardcoded check this table replaced ignored Shift, which is why
+    // it worked before.
+    const b = Bindings.defaults();
+    try testing.expectEqual(Action.new_window, b.lookup('%', 0, false, true, true).?);
+    // ...and equally on a layout where no Shift is needed.
+    try testing.expectEqual(Action.new_window, b.lookup('%', 0, false, false, true).?);
+
+    // Letters keep Shift as a real distinction, or copy and interrupt would collide.
+    try testing.expectEqual(Action.copy, b.lookup('c', 0, true, true, false).?);
+    try testing.expect(b.lookup('c', 0, true, false, false) == null);
+}
+
+test "writing shift into a punctuation binding is harmless, not a second entry" {
+    var cfg = Config{};
+    var diags = Diagnostics{};
+    parseInto(
+        \\key alt+shift+percent new_window
+        \\key alt+percent hints
+    , &cfg, &diags);
+    try testing.expectEqual(@as(usize, 0), diags.len);
+    // Both spellings name the same combination, so the second replaced the first rather
+    // than sitting behind it forever.
+    try testing.expectEqual(Action.hints, cfg.bindings.lookup('%', 0, false, true, true).?);
 }
