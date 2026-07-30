@@ -746,14 +746,43 @@ directory passed as `--cwd` rather than applied by chdir here (this process must
 and `addchdir_np` is a glibc extension we would then depend on). Signals are reset in the
 child, as for the URL launcher.
 
-**Still to do: tabs.** Per-tab PTY, `Screen` and parser; a new tab inherits the directory
-the same way; bottom tab bar matching the existing kitty config, with the per-tab title
-from OSC 0/2. The tab bar needs the renderer to draw cells that are not in the grid, which
-hint mode has already proved out.
+**Still to do: tabs.** Specified below rather than started, because it restructures the
+event loop and the renderer at once — the same class of risk as the reflow emit path, and
+worth beginning with a full context window rather than the tail of one.
+
+*Bindings, as chosen:* `Ctrl+Tab` next, `Ctrl+Shift+Tab` previous — the convention every
+other application uses. `Ctrl+Shift+T` opens one, inheriting the directory the same way
+`Alt`+`%` does. A tab closes when its child exits; the window closes with the last tab.
+
+**`Ctrl+Tab` collides with the Kitty keyboard protocol**, and it is worth writing down:
+`Ctrl+Tab` has no legacy encoding, so flag 1 gives it one (`CSI 9;5u`) — meaning we have
+just made it available to applications and are now taking it back. Our binding has first
+refusal, so nvim will never see it. Accepted deliberately; configurable bindings (still
+outstanding from phase 3) are the way out.
+
+*Structure.* A `Tab` owns a `Screen`, a `Pty` and a parser. The parser holds a `*Screen`,
+so tabs must live at stable addresses — heap-allocated, held as `[]*Tab`, never as a
+`[]Tab` that reallocation would move under the parser.
+
+*Order of work, refactor before feature:*
+
+1. Make the event loop poll a **dynamic** set of PTYs with exactly one tab, so the
+   restructuring is verifiable on its own: behaviour must be identical to today. This is
+   the risky part — background tabs have to keep draining while hidden, or a build running
+   in one tab stalls the moment you look at another.
+2. Then the feature: a second tab, switching, the bar.
+
+*Geometry.* The bar takes one row, so the grid shrinks by one and every tab's PTY needs
+the new size — not just the visible one, or a background tab writes at the wrong width and
+its content reflows wrongly when shown.
+
+*The bar itself* draws cells that are not in the grid, which hint mode already proved out:
+a moving index over a prepared list, bar-specific colours from the theme. Per-tab title
+from OSC 0/2, which `Screen` already records.
 
 **Acceptance:** `Alt`+`%` opens a window in the current directory with no shell
-configuration; a new tab does the same; no PTY leaks under repeated open/close (check
-`/proc/self/fd`).
+configuration; a new tab does the same; a build running in a hidden tab keeps making
+progress; no PTY leaks under repeated open/close (check `/proc/self/fd`).
 
 ### Phase 6 — config and live theming ✅ done (2026-07-30)
 
