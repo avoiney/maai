@@ -115,14 +115,32 @@ pub fn main() !void {
         \\
     , .{ @tagName(@import("builtin").mode), runs });
 
-    try benchParseAscii(gpa);
-    try benchParseSgr(gpa);
-    try benchParseUtf8(gpa);
-    try benchReflowWidth(gpa);
-    try benchReflowHeightOnly(gpa);
-    try benchScroll(gpa);
-    try benchStyleChurn(gpa);
-    try benchResolveColors(gpa);
+    // `MYTERM_BENCH=<substring>` runs only the matching cases. Added for profiling:
+    // a profiler pointed at the whole suite reports the parse cases, which drown out
+    // whatever is being investigated, and callgrind's --toggle-collect cannot latch
+    // onto a function the optimiser inlined.
+    const filter: ?[]const u8 = if (std.c.getenv("MYTERM_BENCH")) |f|
+        std.mem.span(f)
+    else
+        null;
+
+    const cases = [_]struct { name: []const u8, run: *const fn (std.mem.Allocator) anyerror!void }{
+        .{ .name = "parse-ascii", .run = benchParseAscii },
+        .{ .name = "parse-sgr", .run = benchParseSgr },
+        .{ .name = "parse-utf8", .run = benchParseUtf8 },
+        .{ .name = "reflow-width", .run = benchReflowWidth },
+        .{ .name = "reflow-height", .run = benchReflowHeightOnly },
+        .{ .name = "scroll", .run = benchScroll },
+        .{ .name = "styles", .run = benchStyleChurn },
+        .{ .name = "resolve-colors", .run = benchResolveColors },
+    };
+
+    for (cases) |case| {
+        if (filter) |f| {
+            if (std.mem.indexOf(u8, case.name, f) == null) continue;
+        }
+        try case.run(gpa);
+    }
 }
 
 // ── rendering ───────────────────────────────────────────────────────────────

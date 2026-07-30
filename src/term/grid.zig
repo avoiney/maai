@@ -25,6 +25,16 @@ pub const Row = struct {
     /// This row's content continues on the next row (soft wrap), as opposed to
     /// ending at a hard newline.
     wrapped: bool = false,
+    /// A double-width character may live in this row.
+    ///
+    /// Conservative — set when one is written, never cleared except by blanking the
+    /// row — and that is enough, because it only ever gates a *fast path*. Reflow can
+    /// count a line's new rows arithmetically when none of its rows carry this, and
+    /// must walk cell by cell when any does: a wide pair that would straddle a row
+    /// boundary moves whole to the next row, which no formula predicts.
+    ///
+    /// Measured worth: the walk was 3-4 ms of an 11.5 ms reflow.
+    has_wide: bool = false,
 };
 
 /// Where the cursor is, in visible-screen coordinates. Reflow has to move it, so
@@ -152,6 +162,11 @@ pub const Grid = struct {
         return self.count - self.rows;
     }
 
+    /// Note that a wide character now lives on visible row `y`.
+    pub fn markWide(self: *const Grid, y: u32) void {
+        self.rowMeta(y).has_wide = true;
+    }
+
     pub fn rowMeta(self: *const Grid, y: u32) *Row {
         return self.line(self.screenTop() + y);
     }
@@ -180,6 +195,7 @@ pub const Grid = struct {
         const r = self.line(self.count - 1);
         @memset(r.cells, blankCell(style));
         r.wrapped = false;
+        r.has_wide = false;
         return r;
     }
 
@@ -195,6 +211,7 @@ pub const Grid = struct {
             const r = self.rowMeta(y);
             @memset(r.cells, blankCell(style));
             r.wrapped = false;
+            r.has_wide = false;
         }
     }
 
@@ -224,6 +241,7 @@ pub const Grid = struct {
         const s = self.rowMeta(src);
         @memcpy(d.cells, s.cells);
         d.wrapped = s.wrapped;
+        d.has_wide = s.has_wide;
     }
 
     /// Scroll rows [top, bottom] up by `n`, blanking those exposed at the bottom.
@@ -278,6 +296,7 @@ pub const Grid = struct {
         var y: u32 = 0;
         while (y < copy_rows) : (y += 1) {
             @memcpy(buf[y].cells[0..copy_cols], self.row(y)[0..copy_cols]);
+            buf[y].has_wide = self.rowMeta(y).has_wide;
         }
 
         self.gpa.free(self.slab);
@@ -301,6 +320,8 @@ pub const Grid = struct {
         len: usize,
         /// Rows it will occupy at the new width. Filled in by pass 2.
         new_rows: usize = 1,
+        /// Any of its source rows may hold a double-width character.
+        has_wide: bool = false,
     };
 
     /// Walks a logical line at a target width, placing each character so that a
@@ -316,20 +337,38 @@ pub const Grid = struct {
         len: usize,
         cols: u32,
 
+        /// Source position as (row within the logical line, column), never as a flat
+        /// offset.
+        ///
+        /// This is the whole performance story of reflow. A flat offset needs
+        /// `off / g.cols` and `off % g.cols` to locate the source cell, and
+        /// `Grid.line` then takes a ring modulo on top — three hardware divisions per
+        /// cell. Counting and emitting both walk, and the emit pass re-read each cell
+        /// through the same path, so it was six divisions per emitted cell. Callgrind
+        /// put those three source lines at 20% of the entire reflow benchmark.
+        ///
+        /// Walking rows costs one ring lookup per *row* — 10k instead of 2.4M — and
+        /// none of the divisions.
+        src_line: usize = 0,
+        src_x: u32 = 0,
+        /// Cells of the current source row, cached across the row.
+        src_cells: ?[]const Cell = null,
+
+        /// Cells consumed, which is the flat offset the cursor logic compares against.
         off: usize = 0,
         row: usize = 0,
         x: u32 = 0,
 
-        const Step = struct { row: usize, x: u32, off: usize, w: u8 };
+        /// The cell travels *with* the step, so the caller never looks it up again.
+        const Step = struct { row: usize, x: u32, off: usize, w: u8, cell: Cell };
 
         fn next(self: *Wrap) ?Step {
             while (self.off < self.len) {
-                const src = self.cellAt(self.off);
+                const src = self.take();
+
                 // Spacers carry no content; the lead reproduces them.
-                if (src.wide == 2) {
-                    self.off += 1;
-                    continue;
-                }
+                if (src.wide == 2) continue;
+
                 const w: u8 = if (src.wide == 1) 2 else 1;
                 // The `x > 0` guard keeps a width-1 grid from looping forever on a
                 // wide character that can never fit.
@@ -337,21 +376,61 @@ pub const Grid = struct {
                     self.row += 1;
                     self.x = 0;
                 }
-                const step = Step{ .row = self.row, .x = self.x, .off = self.off, .w = w };
+                const step = Step{
+                    .row = self.row,
+                    .x = self.x,
+                    .off = self.off - 1,
+                    .w = w,
+                    .cell = src,
+                };
                 self.x += w;
-                self.off += 1;
                 return step;
             }
             return null;
         }
 
-        fn cellAt(self: *const Wrap, off: usize) Cell {
-            // Wrapped rows are exactly `g.cols` wide, so an offset maps uniformly
-            // onto (old row, old column).
-            const r = self.g.line(self.line_start + off / self.g.cols);
-            return r.cells[off % self.g.cols];
+        /// Consume one source cell, advancing to the next source row when this one is
+        /// exhausted. A wrapped row is exactly `g.cols` wide, which is what makes the
+        /// bookkeeping this simple.
+        fn take(self: *Wrap) Cell {
+            const cells = self.src_cells orelse blk: {
+                const c = self.g.line(self.line_start + self.src_line).cells;
+                self.src_cells = c;
+                break :blk c;
+            };
+            const cell = cells[self.src_x];
+            self.src_x += 1;
+            self.off += 1;
+            if (self.src_x == self.g.cols) {
+                self.src_x = 0;
+                self.src_line += 1;
+                self.src_cells = null;
+            }
+            return cell;
         }
     };
+
+    /// How many rows a logical line will occupy at `cols`.
+    ///
+    /// Arithmetic when the line holds no double-width character, which is the case for
+    /// almost every line of almost every session. Only a wide pair straddling a row
+    /// boundary makes the answer non-obvious — it moves whole to the next row, leaving
+    /// a blank column — and only then is the cell-by-cell walk needed.
+    ///
+    /// This is worth the branch: the walk was measured at 3-4 ms of an 11.5 ms reflow
+    /// with 10k lines of scrollback, on content with no wide characters at all.
+    fn plannedRows(self: *const Grid, l: Logical, cols: u32) usize {
+        if (l.has_wide) return self.countWrappedRows(l, cols);
+        const rows = (l.len + cols - 1) / cols;
+        const arithmetic = @max(rows, 1);
+        // The two must agree whenever the fast path is taken; a stale `has_wide` would
+        // otherwise mis-wrap silently. Debug builds carry the cross-check so the test
+        // suite is what catches it, not the user.
+        if (std.debug.runtime_safety) {
+            std.debug.assert(arithmetic == self.countWrappedRows(l, cols));
+        }
+        return arithmetic;
+    }
 
     fn countWrappedRows(self: *const Grid, l: Logical, cols: u32) usize {
         var it = Wrap{ .g = self, .line_start = l.start, .len = l.len, .cols = cols };
@@ -410,8 +489,10 @@ pub const Grid = struct {
         while (i < self.count) {
             const first = i;
             var total: usize = 0;
+            var wide = false;
             while (true) {
                 const r = self.line(i);
+                wide = wide or r.has_wide;
                 const is_last = !(r.wrapped and i + 1 < self.count);
                 if (i == cur_abs) {
                     cur_logical = logical.items.len;
@@ -427,6 +508,7 @@ pub const Grid = struct {
                 .start = first,
                 .old_rows = i - first,
                 .len = total,
+                .has_wide = wide,
             });
         }
 
@@ -445,7 +527,7 @@ pub const Grid = struct {
         const new_cap = @as(usize, rows) + self.scrollback_max;
         var total_new: usize = 0;
         for (logical.items) |*l| {
-            l.new_rows = self.countWrappedRows(l.*, cols);
+            l.new_rows = self.plannedRows(l.*, cols);
             total_new += l.new_rows;
         }
 
@@ -481,8 +563,9 @@ pub const Grid = struct {
                 const di = grow - drop;
                 if (di >= new_cap) break;
 
-                const src = it.cellAt(st.off);
+                const src = st.cell;
                 buf[di].cells[st.x] = src;
+                if (st.w == 2) buf[di].has_wide = true;
                 if (st.w == 2 and st.x + 1 < cols) {
                     buf[di].cells[st.x + 1] = .{
                         .content = Cell.empty,

@@ -393,6 +393,7 @@ pub const Screen = struct {
         };
         if (w == 2 and x + 1 < self.grid.cols) {
             self.breakPairAt(x + 1);
+            self.grid.markWide(self.cursor_y);
             self.grid.at(x + 1, self.cursor_y).* = .{
                 .content = Cell.empty,
                 .style = self.pen_id,
@@ -442,6 +443,7 @@ pub const Screen = struct {
         {
             self.breakPairAt(x + 1);
             cell.wide = 1;
+            self.grid.markWide(self.cursor_y);
             self.grid.at(x + 1, self.cursor_y).* = .{
                 .content = Cell.empty,
                 .style = cell.style,
@@ -2425,6 +2427,39 @@ test "the session's first grapheme cluster survives a reflow" {
     const cluster = s.graphemes.get(s.grid.at(4, 0).content);
     try std.testing.expectEqual(@as(u21, 'e'), cluster[0]);
     try std.testing.expectEqual(@as(u21, 0x0301), cluster[1]);
+}
+
+test "a wide pair survives being reflowed twice" {
+    // The arithmetic row count is only valid for lines with no wide character, so the
+    // `has_wide` marker has to survive reflow itself. One resize would not catch a
+    // marker that reflow forgets to carry: the *second* one would then take the fast
+    // path on a line that needs the walk, and mis-wrap silently.
+    var s = try Screen.initScrollback(std.testing.allocator, 8, 3, 16);
+    defer s.deinit();
+
+    feed(&s, "ab日cd日ef");
+    try s.resize(6, 3);
+    try s.resize(5, 3);
+    try s.resize(9, 3);
+
+    // Every wide cell still has its spacer, and no spacer is orphaned.
+    var line: usize = 0;
+    var pairs: usize = 0;
+    while (line < s.grid.count) : (line += 1) {
+        const cells = s.grid.line(line).cells;
+        for (cells, 0..) |cell, x| {
+            if (cell.wide == 1) {
+                pairs += 1;
+                try std.testing.expect(x + 1 < cells.len);
+                try std.testing.expectEqual(@as(u2, 2), cells[x + 1].wide);
+            }
+            if (cell.wide == 2) {
+                try std.testing.expect(x > 0);
+                try std.testing.expectEqual(@as(u2, 1), cells[x - 1].wide);
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), pairs);
 }
 
 test "reflow keeps double-width pairs intact across a row break" {

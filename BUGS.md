@@ -82,11 +82,63 @@ Deux enseignements de la mesure :
    ligne garde sa largeur et ses drapeaux ; `rows` n'est que « combien du ring est
    visible ». Voie rapide en O(rows) : 1200× plus rapide, et 190× moins d'allocation.
 
-Reste ouvert : le changement de **largeur** coûte toujours 11,4 ms et 19,2 MiB. À
-75 Hz pendant un glisser de bord latéral, c'est 0,85 s de travail par seconde — le
-budget de trame de 13 ms est dépassé. Pistes non tentées : ne pas `memset` le slab
-que l'on va réécrire ; ne reflower que l'historique réellement atteignable et
-différer le reste. À mesurer de nouveau avant de choisir.
+### §R1 — reflow en largeur, profilé le 2026-07-30
+
+**Les deux pistes notées ici étaient fausses, et le profilage l'a montré.**
+
+`perf` est inutilisable sur cette machine (`perf_event_paranoid = 4`, il faut root).
+`valgrind --tool=callgrind` marche, avec deux pièges :
+
+- il meurt en SIGILL sur le code généré pour ce Zen — recompiler avec
+  `-Dcpu=x86_64_v2` ;
+- `zig-out/bin/bench` était **périmé**. `installArtifact` s'accroche à l'étape par
+  défaut, donc `zig build bench -Doptimize=ReleaseFast` exécutait le binaire optimisé
+  depuis le cache en laissant un binaire **Debug** dans `zig-out/bin`. Mon premier
+  profil ne mesurait donc rien de pertinent. Corrigé : l'étape `bench` installe
+  maintenant, et `MYTERM_BENCH=<motif>` filtre les cas — un profileur braqué sur toute
+  la suite ne rapporte que les cas d'analyse, qui noient le reste.
+
+Profil de `resizeReflow` seul, en instructions :
+
+| Ligne | Ir | Part |
+|---|---|---|
+| `&self.buf[(self.start + i) % self.buf.len]` (`Grid.line`) | 291,0 M | 13,4 % |
+| `self.g.line(self.line_start + off / self.g.cols)` | 103,5 M | 4,8 % |
+| `r.cells[off % self.g.cols]` | 41,4 M | 1,9 % |
+| `@memset(slab, blankCell(0))` | 20,1 M | **0,9 %** |
+
+Trois divisions matérielles par cellule, six en comptant la relecture de la passe
+d'émission. Et le `memset` que cette section soupçonnait pèse **0,9 %** : la piste
+« ne pas memset ce qu'on va réécrire » ne valait rien.
+
+**Mais retirer les divisions n'a rien donné de mesurable** (10,7–11,4 contre
+11,0–11,7 ms). Le nombre d'instructions n'est pas le temps : ce cœur a un diviseur
+rapide et beaucoup d'exécution dans le désordre. Le changement est conservé — le
+code est plus simple et la cellule voyage avec le pas — mais il ne faut pas le
+créditer d'un gain.
+
+Ce qui a payé vient d'une **ablation** : remplacer la passe de comptage par de
+l'arithmétique fait passer de 11,8–14,5 à 8,8–9,2 ms. D'où le correctif : un drapeau
+`Row.has_wide`, conservateur, permet de compter les rangées arithmétiquement quand la
+ligne logique ne contient aucun caractère double largeur — seule une paire à cheval sur
+une limite de rangée rend la réponse non calculable. Les builds de debug vérifient que
+les deux chemins s'accordent, donc c'est la suite de tests qui attrape un drapeau
+périmé, pas l'utilisateur.
+
+A/B entrelacé, sept manches, machine en usage réel :
+
+| | min | médiane |
+|---|---|---|
+| avant | 12,77 ms | ~13,5 ms |
+| après | **9,79 ms** | **~11,0 ms** |
+
+Sous le budget de trame de 13 ms à 75 Hz, mais sans marge confortable.
+
+**Reste ouvert.** L'ablation situe la passe d'émission à ~9 ms : 2,4 M de cellules
+écrites une par une. La suite est d'émettre par `@memcpy` pour les lignes sans double
+largeur — le drapeau `has_wide` qui vient d'être ajouté est exactement ce qui le rend
+possible. L'autre piste, ne reflower que l'historique atteignable, reste un changement
+architectural à ne pas entamer sans besoin.
 
 Bug supplémentaire trouvé hors relevé, signalé à l'usage : **coller dans myterm ce
 qu'on venait d'y copier ne faisait rien.** Interblocage sur soi-même — on demandait

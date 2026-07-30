@@ -833,3 +833,37 @@ test "nothing is reported without the modifier that makes it ambiguous" {
     hold(&kbd, false, true);
     try testing.expect(kittyFor(&kbd, c.XKB_KEY_a, &buf) == null);
 }
+
+test "the protocol is reachable through encode, not just through encodeKitty" {
+    // The tests above call `encodeKitty` directly, so they say nothing about whether
+    // `encode` ever *reaches* it. That gap hid a real bug once: Tab and Ctrl+I came out
+    // identical in a live terminal while every unit test passed.
+    var kbd = azerty() orelse return error.SkipZigTest;
+    defer kbd.deinit();
+
+    var modes = Modes{};
+    kbd.modes = &modes;
+
+    var buf: [32]u8 = undefined;
+    const code_i = keycodeFor(&kbd, c.XKB_KEY_i).?;
+    const code_tab = keycodeFor(&kbd, c.XKB_KEY_Tab).?;
+
+    // Legacy: both are 0x09, which is the whole problem.
+    hold(&kbd, true, false);
+    try testing.expectEqualStrings("\t", kbd.encode(code_i, &buf).?);
+    hold(&kbd, false, false);
+    try testing.expectEqualStrings("\t", kbd.encode(code_tab, &buf).?);
+
+    // With the flag on, they must differ.
+    modes.kitty_flags = 1;
+    hold(&kbd, true, false);
+    try testing.expectEqualStrings("\x1b[105;5u", kbd.encode(code_i, &buf).?);
+    hold(&kbd, false, false);
+    try testing.expectEqualStrings("\t", kbd.encode(code_tab, &buf).?);
+
+    // And Escape, the other headline.
+    const code_esc = keycodeFor(&kbd, c.XKB_KEY_Escape).?;
+    try testing.expectEqualStrings("\x1b[27u", kbd.encode(code_esc, &buf).?);
+    modes.kitty_flags = 0;
+    try testing.expectEqualStrings("\x1b", kbd.encode(code_esc, &buf).?);
+}

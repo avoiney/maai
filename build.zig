@@ -128,6 +128,14 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| bench_run.addArgs(args);
     const bench_step = b.step("bench", "Run core benchmarks (use -Doptimize=ReleaseFast)");
     bench_step.dependOn(&bench_run.step);
+    // Install *as part of the bench step*, not only as part of the default step.
+    //
+    // `installArtifact` attaches to the default step, so `zig build bench
+    // -Doptimize=ReleaseFast` ran the optimised binary from the cache while leaving a
+    // stale **Debug** one in zig-out/bin. Anyone profiling `zig-out/bin/bench` — which
+    // the comment above suggests doing — measured the wrong build entirely. Cost me a
+    // round of callgrind output that meant nothing.
+    bench_step.dependOn(&b.addInstallArtifact(bench, .{}).step);
 }
 
 /// Ask pkg-config where a package keeps its data files. Runs at configure time,
