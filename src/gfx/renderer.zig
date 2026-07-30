@@ -256,7 +256,7 @@ pub const Renderer = struct {
         self.fg_list.clearRetainingCapacity();
         self.build(screen, hints, cache, font, pad);
 
-        const bg = cellmod.default_bg;
+        const bg = screen.theme.bg;
         c.glClearColor(
             @as(f32, @floatFromInt(bg.r)) / 255.0,
             @as(f32, @floatFromInt(bg.g)) / 255.0,
@@ -338,7 +338,8 @@ pub const Renderer = struct {
         font: *const Font,
         pad: Padding,
     ) void {
-        const default_bg = cellmod.default_bg;
+        const theme = &screen.theme;
+        const default_bg = theme.bg;
         // The viewport is the live screen only when the user has not scrolled back.
         const view_top = screen.grid.viewTop();
         const scrolled = screen.grid.view != 0;
@@ -366,10 +367,10 @@ pub const Renderer = struct {
                         self.bg_list.append(self.gpa, .{
                             .cell = .{ @intCast(x), @intCast(y) },
                             .color = .{
-                                cellmod.hint_bg.r,
-                                cellmod.hint_bg.g,
-                                cellmod.hint_bg.b,
-                                cellmod.hint_bg.a,
+                                theme.hint_bg.r,
+                                theme.hint_bg.g,
+                                theme.hint_bg.b,
+                                theme.hint_bg.a,
                             },
                         }) catch {};
                         self.emitGlyph(
@@ -378,20 +379,22 @@ pub const Renderer = struct {
                             pad.x + x * font.cell_w,
                             pad.y + y * font.cell_h,
                             ch,
-                            cellmod.hint_fg,
+                            theme.hint_fg,
                         );
                         continue;
                     }
                 }
 
-                var fg = style.fg;
-                var bg = style.bg;
+                // Colour slots hold requests; the theme turns them into pixels
+                // here, which is what lets a theme reload repaint old text.
+                var fg = theme.resolve(style.fg, .fg);
+                var bg = theme.resolve(style.bg, .bg);
                 if (style.attrs.inverse) std.mem.swap(Rgb, &fg, &bg);
                 if (style.attrs.dim) fg = dim(fg);
 
                 if (screen.selection.contains(line, x)) {
-                    bg = cellmod.selection_bg;
-                    fg = cellmod.selection_fg;
+                    bg = theme.selection_bg;
+                    fg = theme.selection_fg;
                 }
 
                 // No cursor while scrolled back: it belongs to the live screen,
@@ -399,8 +402,8 @@ pub const Renderer = struct {
                 const on_cursor = !scrolled and screen.cursor_visible and
                     x == screen.cursor_x and y == screen.cursor_y;
                 if (on_cursor) {
-                    bg = cellmod.default_cursor;
-                    fg = default_bg;
+                    bg = theme.cursor;
+                    fg = theme.cursor_text;
                 }
 
                 if (!bg.eq(default_bg)) {
@@ -457,7 +460,7 @@ pub const Renderer = struct {
                         uy,
                         font.cell_w,
                         @intCast(font.underline_thickness),
-                        style.ul,
+                        theme.resolve(style.ul, .ul),
                     );
                 }
                 if (style.attrs.strike) {

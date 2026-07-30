@@ -5,6 +5,7 @@
 //! touching every file that reads the grid.
 
 const std = @import("std");
+const Color = @import("theme.zig").Color;
 
 pub const Rgb = packed struct(u32) {
     r: u8,
@@ -37,10 +38,13 @@ pub const Attrs = packed struct(u16) {
 
 /// Interned, so cells store a 16-bit id rather than ~14 bytes of colour and
 /// attributes. A typical screen uses well under 100 distinct styles.
+///
+/// The colour slots hold *requests* — "colour 4", "default", "#a1b2c3" — resolved
+/// against a `Theme` at draw time. See theme.zig for why that indirection matters.
 pub const Style = struct {
-    fg: Rgb,
-    bg: Rgb,
-    ul: Rgb,
+    fg: Color,
+    bg: Color,
+    ul: Color,
     attrs: Attrs = .{},
     /// Index into `LinkTable` (OSC 8). 0 = none.
     ///
@@ -50,9 +54,9 @@ pub const Style = struct {
     hyperlink: u16 = 0,
 
     pub const default: Style = .{
-        .fg = default_fg,
-        .bg = default_bg,
-        .ul = default_fg,
+        .fg = Color.default,
+        .bg = Color.default,
+        .ul = Color.default,
     };
 };
 
@@ -295,63 +299,6 @@ pub const GraphemeTable = struct {
     }
 };
 
-// ── Default colours ─────────────────────────────────────────────────────────
-// A dark nightfox-ish default. Phase 6 replaces these with parsed themes and
-// hooks up the ~/.config/.app-theme-flavour watch.
-
-pub const default_fg = Rgb.rgb(0xcd, 0xce, 0xcf);
-pub const default_bg = Rgb.rgb(0x19, 0x1a, 0x21);
-pub const default_cursor = Rgb.rgb(0x71, 0x9c, 0xd6);
-pub const selection_bg = Rgb.rgb(0x2b, 0x3b, 0x51);
-pub const selection_fg = Rgb.rgb(0xe4, 0xe4, 0xe5);
-/// Hint-mode labels. Deliberately loud: they cover real text, so they have to read
-/// as an overlay rather than as content.
-pub const hint_bg = Rgb.rgb(0xdb, 0xc0, 0x74);
-pub const hint_fg = Rgb.rgb(0x19, 0x1a, 0x21);
-
-pub const ansi16 = [16]Rgb{
-    Rgb.rgb(0x39, 0x3b, 0x44), // 0 black
-    Rgb.rgb(0xc9, 0x4f, 0x6d), // 1 red
-    Rgb.rgb(0x81, 0xb2, 0x9a), // 2 green
-    Rgb.rgb(0xdb, 0xc0, 0x74), // 3 yellow
-    Rgb.rgb(0x71, 0x9c, 0xd6), // 4 blue
-    Rgb.rgb(0x9d, 0x79, 0xd6), // 5 magenta
-    Rgb.rgb(0x63, 0xcd, 0xcf), // 6 cyan
-    Rgb.rgb(0xdf, 0xdf, 0xe0), // 7 white
-    Rgb.rgb(0x57, 0x5b, 0x66), // 8  bright black
-    Rgb.rgb(0xd1, 0x69, 0x83), // 9  bright red
-    Rgb.rgb(0x8e, 0xbe, 0xa6), // 10 bright green
-    Rgb.rgb(0xe0, 0xc9, 0x89), // 11 bright yellow
-    Rgb.rgb(0x86, 0xab, 0xdc), // 12 bright blue
-    Rgb.rgb(0xba, 0xa1, 0xe2), // 13 bright magenta
-    Rgb.rgb(0x7a, 0xd5, 0xd6), // 14 bright cyan
-    Rgb.rgb(0xe4, 0xe4, 0xe5), // 15 bright white
-};
-
-/// The xterm 256-colour palette: 16 base colours, a 6x6x6 cube, then 24 greys.
-pub const palette256: [256]Rgb = blk: {
-    var p: [256]Rgb = undefined;
-    for (ansi16, 0..) |col, i| p[i] = col;
-
-    const steps = [6]u8{ 0, 95, 135, 175, 215, 255 };
-    var i: usize = 16;
-    for (steps) |r| {
-        for (steps) |g| {
-            for (steps) |b| {
-                p[i] = Rgb.rgb(r, g, b);
-                i += 1;
-            }
-        }
-    }
-
-    var grey: u8 = 8;
-    while (i < 256) : (i += 1) {
-        p[i] = Rgb.rgb(grey, grey, grey);
-        grey += 10;
-    }
-    break :blk p;
-};
-
 test "cell is 8 bytes and zeroed cell is the default style" {
     const c: Cell = .{};
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(Cell));
@@ -368,12 +315,12 @@ test "style interning dedupes and assigns 0 to default" {
     try std.testing.expectEqual(@as(u16, 0), try table.intern(gpa, Style.default));
 
     var red = Style.default;
-    red.fg = ansi16[1];
+    red.fg = Color.indexed(1);
     const a = try table.intern(gpa, red);
     const b = try table.intern(gpa, red);
     try std.testing.expectEqual(a, b);
     try std.testing.expect(a != 0);
-    try std.testing.expect(table.get(a).fg.eq(ansi16[1]));
+    try std.testing.expect(table.get(a).fg.eql(Color.indexed(1)));
 }
 
 test "link interning dedupes, reserves 0, and fails closed when full" {
@@ -418,12 +365,4 @@ test "link replace renumbers from 1 and keeps dedup working" {
     try std.testing.expectEqualStrings(kept, links.get(1));
     // The map was rebuilt against the new bytes, so interning finds the survivor.
     try std.testing.expectEqual(@as(u16, 1), links.intern(gpa, kept));
-}
-
-test "palette256 cube and greyscale land on known xterm values" {
-    // 16 is the first cube entry (pure black), 231 the last (pure white).
-    try std.testing.expect(palette256[16].eq(Rgb.rgb(0, 0, 0)));
-    try std.testing.expect(palette256[231].eq(Rgb.rgb(255, 255, 255)));
-    try std.testing.expect(palette256[232].eq(Rgb.rgb(8, 8, 8)));
-    try std.testing.expect(palette256[255].eq(Rgb.rgb(238, 238, 238)));
 }

@@ -9,6 +9,7 @@ const std = @import("std");
 const cellmod = @import("cell.zig");
 const gridmod = @import("grid.zig");
 const mousemod = @import("mouse.zig");
+const thememod = @import("theme.zig");
 const urlmod = @import("url.zig");
 const Grid = gridmod.Grid;
 const width = @import("width.zig");
@@ -18,6 +19,7 @@ const parser = @import("../vt/parser.zig");
 const Cell = cellmod.Cell;
 const Style = cellmod.Style;
 const Rgb = cellmod.Rgb;
+const Color = thememod.Color;
 const StyleTable = cellmod.StyleTable;
 
 /// Where replies to device queries go — normally the PTY.
@@ -121,6 +123,9 @@ pub const Screen = struct {
     /// OSC 8 hyperlink targets. Cells reach them through their style's
     /// `hyperlink` id.
     links: cellmod.LinkTable = .{},
+    /// Colours the styles resolve against. Owned per screen because OSC 4/10/11 are
+    /// per-terminal state: one pane redefining colour 4 must not repaint another.
+    theme: thememod.Theme = .{},
     /// Mouse/keyboard text selection. Lives here so the renderer can highlight it
     /// from the same place it reads cells.
     selection: sel.Selection = .{},
@@ -576,9 +581,12 @@ pub const Screen = struct {
         // There is deliberately no title *query* support, and never will be: output
         // can set the title, and a terminal that reports it back lets a compromised
         // remote host echo arbitrary bytes onto our input stream (PLAN.md §7).
-        const semi = std.mem.indexOfScalar(u8, data, ';') orelse return;
-        const code = data[0..semi];
-        const text = data[semi + 1 ..];
+        // The separator is optional: `OSC 104 ST` (reset the whole palette) and
+        // `OSC 110 ST` carry no argument at all, and requiring one silently dropped
+        // every reset sequence.
+        const semi = std.mem.indexOfScalar(u8, data, ';');
+        const code = if (semi) |i| data[0..i] else data;
+        const text = if (semi) |i| data[i + 1 ..] else "";
 
         if (std.mem.eql(u8, code, "0") or std.mem.eql(u8, code, "2")) {
             const n = @min(text.len, self.title_buf.len);
@@ -586,9 +594,87 @@ pub const Screen = struct {
             self.title_len = n;
         } else if (std.mem.eql(u8, code, "8")) {
             self.setHyperlink(text);
+        } else if (std.mem.eql(u8, code, "4")) {
+            self.setPaletteColors(text);
+        } else if (std.mem.eql(u8, code, "104")) {
+            self.resetPaletteColors(text);
+        } else if (std.mem.eql(u8, code, "10")) {
+            // 10 takes fg, and a second argument means bg — xterm's chained form,
+            // which `tput` and some prompt themes emit.
+            self.setDynamicColors(text, &.{ .fg, .bg, .cursor });
+        } else if (std.mem.eql(u8, code, "11")) {
+            self.setDynamicColors(text, &.{ .bg, .cursor });
+        } else if (std.mem.eql(u8, code, "12")) {
+            self.setDynamicColors(text, &.{.cursor});
+        } else if (std.mem.eql(u8, code, "110")) {
+            self.theme.fg = thememod.default_fg;
+            self.dirty = true;
+        } else if (std.mem.eql(u8, code, "111")) {
+            self.theme.bg = thememod.default_bg;
+            self.theme.cursor_text = thememod.default_bg;
+            self.dirty = true;
+        } else if (std.mem.eql(u8, code, "112")) {
+            self.theme.cursor = thememod.default_cursor;
+            self.dirty = true;
         }
-        // OSC 7 (cwd), 4/10/11 (palette) and 52 (clipboard) land in phases 5-6.
-        // OSC 52 *reads* stay denied by default regardless.
+        // OSC 7 (cwd) lands with phase 5's tabs, which is what needs it. OSC 52
+        // *reads* stay denied by default regardless (PLAN.md §7).
+    }
+
+    /// `OSC 4 ; index ; spec [; index ; spec]* ST`
+    ///
+    /// A `?` in place of a spec is a *query*, and goes unanswered — deliberately, and
+    /// for the same reason as the title query. It would let output read back state it
+    /// had just written, which is a channel, and it buys us nothing (PLAN.md §7).
+    fn setPaletteColors(self: *Screen, text: []const u8) void {
+        var it = std.mem.splitScalar(u8, text, ';');
+        while (it.next()) |idx_str| {
+            const spec = it.next() orelse return;
+            const idx = std.fmt.parseUnsigned(u16, idx_str, 10) catch continue;
+            if (idx > 255) continue;
+            const col = thememod.parseColor(spec) orelse continue;
+            self.theme.palette[idx] = col;
+            self.dirty = true;
+        }
+    }
+
+    /// `OSC 104 [; index]* ST` — reset listed entries, or the whole palette when the
+    /// list is empty.
+    fn resetPaletteColors(self: *Screen, text: []const u8) void {
+        const trimmed = std.mem.trim(u8, text, " ");
+        if (trimmed.len == 0) {
+            self.theme.palette = thememod.default_palette;
+            self.dirty = true;
+            return;
+        }
+        var it = std.mem.splitScalar(u8, trimmed, ';');
+        while (it.next()) |idx_str| {
+            const idx = std.fmt.parseUnsigned(u16, idx_str, 10) catch continue;
+            if (idx > 255) continue;
+            self.theme.palette[idx] = thememod.default_palette[idx];
+            self.dirty = true;
+        }
+    }
+
+    const DynamicSlot = enum { fg, bg, cursor };
+
+    fn setDynamicColors(self: *Screen, text: []const u8, slots: []const DynamicSlot) void {
+        var it = std.mem.splitScalar(u8, text, ';');
+        for (slots) |slot| {
+            const spec = it.next() orelse return;
+            const col = thememod.parseColor(spec) orelse continue;
+            switch (slot) {
+                .fg => self.theme.fg = col,
+                .bg => {
+                    self.theme.bg = col;
+                    // Text under the cursor block sits on the cursor colour, so it
+                    // tracks the background rather than staying at the old one.
+                    self.theme.cursor_text = col;
+                },
+                .cursor => self.theme.cursor = col,
+            }
+            self.dirty = true;
+        }
     }
 
     /// `OSC 8 ; params ; URI ST` — everything printed from now on belongs to that
@@ -1107,22 +1193,22 @@ pub const Screen = struct {
                 27 => self.pen.attrs.inverse = false,
                 28 => self.pen.attrs.invisible = false,
                 29 => self.pen.attrs.strike = false,
-                30...37 => self.pen.fg = cellmod.ansi16[p - 30],
+                30...37 => self.pen.fg = Color.indexed(@intCast(p - 30)),
                 38 => if (extendedColor(params, &i)) |col| {
                     self.pen.fg = col;
                 },
-                39 => self.pen.fg = cellmod.default_fg,
-                40...47 => self.pen.bg = cellmod.ansi16[p - 40],
+                39 => self.pen.fg = Color.default,
+                40...47 => self.pen.bg = Color.indexed(@intCast(p - 40)),
                 48 => if (extendedColor(params, &i)) |col| {
                     self.pen.bg = col;
                 },
-                49 => self.pen.bg = cellmod.default_bg,
+                49 => self.pen.bg = Color.default,
                 58 => if (extendedColor(params, &i)) |col| {
                     self.pen.ul = col;
                 },
-                59 => self.pen.ul = cellmod.default_fg,
-                90...97 => self.pen.fg = cellmod.ansi16[p - 90 + 8],
-                100...107 => self.pen.bg = cellmod.ansi16[p - 100 + 8],
+                59 => self.pen.ul = Color.default,
+                90...97 => self.pen.fg = Color.indexed(@intCast(p - 90 + 8)),
+                100...107 => self.pen.bg = Color.indexed(@intCast(p - 100 + 8)),
                 else => {},
             }
         }
@@ -1316,19 +1402,22 @@ pub const Screen = struct {
 /// Accepts the semicolon form (`38;5;n`, `38;2;r;g;b`) and the colon form
 /// (`38:5:n`, `38:2:r:g:b`). TODO(phase 2): the colon form may also carry a
 /// colour-space id — `38:2::r:g:b` — which we currently misread.
-fn extendedColor(params: *const parser.Params, i: *usize) ?Rgb {
+fn extendedColor(params: *const parser.Params, i: *usize) ?Color {
     switch (params.get(i.* + 1, 0)) {
+        // `5;n` stays an *index*, not the colour it currently resolves to: an
+        // application that later redefines colour n with OSC 4 expects this text to
+        // change with it.
         5 => {
             const idx = params.get(i.* + 2, 0);
             i.* += 2;
-            return cellmod.palette256[@min(idx, 255)];
+            return Color.indexed(@intCast(@min(idx, 255)));
         },
         2 => {
             const r = params.get(i.* + 2, 0);
             const g = params.get(i.* + 3, 0);
             const b = params.get(i.* + 4, 0);
             i.* += 4;
-            return Rgb.rgb(
+            return Color.rgb(
                 @intCast(@min(r, 255)),
                 @intCast(@min(g, 255)),
                 @intCast(@min(b, 255)),
@@ -1429,13 +1518,13 @@ test "SGR truecolor and 256-colour set the pen" {
     defer s.deinit();
 
     feed(&s, "\x1b[38;2;10;20;30mA");
-    try std.testing.expect(s.styles.get(s.grid.at(0, 0).style).fg.eq(Rgb.rgb(10, 20, 30)));
+    try std.testing.expect(s.styles.get(s.grid.at(0, 0).style).fg.eql(Color.rgb(10, 20, 30)));
 
     feed(&s, "\x1b[38;5;196mB");
-    try std.testing.expect(s.styles.get(s.grid.at(1, 0).style).fg.eq(cellmod.palette256[196]));
+    try std.testing.expect(s.styles.get(s.grid.at(1, 0).style).fg.eql(Color.indexed(196)));
 
     feed(&s, "\x1b[0mC");
-    try std.testing.expect(s.styles.get(s.grid.at(2, 0).style).fg.eq(cellmod.default_fg));
+    try std.testing.expect(s.styles.get(s.grid.at(2, 0).style).fg.eql(Color.default));
 }
 
 test "SGR 4:3 selects curly underline without also setting italic" {
@@ -1719,7 +1808,7 @@ test "save and restore cursor round-trips position and pen" {
 
     try std.testing.expectEqual(@as(u32, 1), s.cursor_y);
     try std.testing.expectEqual(@as(u32, 3), s.cursor_x);
-    try std.testing.expect(s.pen.fg.eq(cellmod.ansi16[1]));
+    try std.testing.expect(s.pen.fg.eql(Color.indexed(1)));
 }
 
 test "device attributes and cursor position report" {
@@ -1801,6 +1890,65 @@ test "application cursor keys and bracketed paste modes are tracked" {
     feed(&s, "\x1b[?1l\x1b[?2004l");
     try std.testing.expect(!s.modes.app_cursor);
     try std.testing.expect(!s.modes.bracketed_paste);
+}
+
+test "OSC 4 redefines palette entries, and 104 puts them back" {
+    var s = try Screen.init(std.testing.allocator, 10, 2);
+    defer s.deinit();
+
+    feed(&s, "\x1b]4;1;#ff0000;2;rgb:00/ff/00\x1b\\");
+    try std.testing.expect(s.theme.palette[1].eq(Rgb.rgb(255, 0, 0)));
+    try std.testing.expect(s.theme.palette[2].eq(Rgb.rgb(0, 255, 0)));
+
+    // Text printed *before* the change resolves through the palette, so it moves
+    // with it — that is the point of storing the index rather than the pixels.
+    feed(&s, "\x1b[31mred");
+    const cell_style = s.styles.get(s.grid.at(0, 0).style);
+    try std.testing.expect(cell_style.fg.eql(Color.indexed(1)));
+    try std.testing.expect(s.theme.resolve(cell_style.fg, .fg).eq(Rgb.rgb(255, 0, 0)));
+
+    feed(&s, "\x1b]104;1\x1b\\");
+    try std.testing.expect(s.theme.palette[1].eq(thememod.default_ansi16[1]));
+    try std.testing.expect(s.theme.palette[2].eq(Rgb.rgb(0, 255, 0))); // untouched
+
+    feed(&s, "\x1b]104\x1b\\"); // no list: everything
+    try std.testing.expect(s.theme.palette[2].eq(thememod.default_ansi16[2]));
+}
+
+test "OSC 10/11/12 set the dynamic colours, and 110-112 reset them" {
+    var s = try Screen.init(std.testing.allocator, 10, 2);
+    defer s.deinit();
+
+    feed(&s, "\x1b]10;#010203\x1b\\\x1b]11;#040506\x1b\\\x1b]12;#070809\x1b\\");
+    try std.testing.expect(s.theme.fg.eq(Rgb.rgb(1, 2, 3)));
+    try std.testing.expect(s.theme.bg.eq(Rgb.rgb(4, 5, 6)));
+    try std.testing.expect(s.theme.cursor.eq(Rgb.rgb(7, 8, 9)));
+
+    // xterm's chained form: 10 with several arguments walks fg, bg, cursor.
+    feed(&s, "\x1b]10;#111111;#222222\x1b\\");
+    try std.testing.expect(s.theme.fg.eq(Rgb.rgb(0x11, 0x11, 0x11)));
+    try std.testing.expect(s.theme.bg.eq(Rgb.rgb(0x22, 0x22, 0x22)));
+
+    feed(&s, "\x1b]110\x1b\\\x1b]111\x1b\\\x1b]112\x1b\\");
+    try std.testing.expect(s.theme.fg.eq(thememod.default_fg));
+    try std.testing.expect(s.theme.bg.eq(thememod.default_bg));
+    try std.testing.expect(s.theme.cursor.eq(thememod.default_cursor));
+}
+
+test "colour queries go unanswered" {
+    var s = try Screen.init(std.testing.allocator, 10, 2);
+    defer s.deinit();
+
+    var sink = Sink{};
+    s.reply = .{ .ctx = &sink, .write = Sink.write };
+
+    // Answering would let output read back state it just wrote. It is a channel with
+    // no upside, exactly like the title query.
+    feed(&s, "\x1b]4;1;?\x1b\\\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]12;?\x1b\\");
+    try std.testing.expectEqual(@as(usize, 0), sink.len);
+    // ...and a query must not corrupt the colour it asked about.
+    try std.testing.expect(s.theme.palette[1].eq(thememod.default_ansi16[1]));
+    try std.testing.expect(s.theme.fg.eq(thememod.default_fg));
 }
 
 test "OSC 8 marks printed cells, and an empty URI ends the run" {
@@ -2137,7 +2285,7 @@ test "style ids are reclaimed rather than exhausting the table" {
     try std.testing.expect(s.styles.list.items.len < 300);
     // The most recent style is intact, so collection did not corrupt live data.
     const st = s.styles.get(s.grid.at(0, 0).style);
-    try std.testing.expect(st.fg.eq(Rgb.rgb(999 % 256, (999 / 256) % 256, 7)));
+    try std.testing.expect(st.fg.eql(Color.rgb(999 % 256, (999 / 256) % 256, 7)));
 }
 
 test "styles referenced only from scrollback survive collection" {
@@ -2158,7 +2306,7 @@ test "styles referenced only from scrollback survive collection" {
         const cells = s.grid.line(line).cells;
         if (cells[0].content != 'R') continue;
         found = true;
-        try std.testing.expect(s.styles.get(cells[0].style).fg.eq(cellmod.ansi16[1]));
+        try std.testing.expect(s.styles.get(cells[0].style).fg.eql(Color.indexed(1)));
     }
     try std.testing.expect(found);
 }
@@ -2192,8 +2340,8 @@ test "collection keeps id 0 as the default style" {
     s.collectGarbage();
 
     // A zeroed Cell must still mean "default", so id 0 cannot be renumbered.
-    try std.testing.expect(s.styles.get(0).fg.eq(cellmod.default_fg));
-    try std.testing.expect(s.styles.get(0).bg.eq(cellmod.default_bg));
+    try std.testing.expect(s.styles.get(0).fg.eql(Color.default));
+    try std.testing.expect(s.styles.get(0).bg.eql(Color.default));
 }
 
 test "resize keeps the alternate screen in step with the primary" {

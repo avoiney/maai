@@ -12,6 +12,7 @@ test {
     _ = @import("term/mouse.zig");
     _ = @import("term/screen.zig");
     _ = @import("term/selection.zig");
+    _ = @import("term/theme.zig");
     _ = @import("term/url.zig");
     _ = @import("term/width.zig");
     _ = @import("vt/parser.zig");
