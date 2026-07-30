@@ -672,9 +672,12 @@ const App = struct {
     }
 
     /// Application shortcuts. Returning true stops the key reaching the child.
+    ///
+    /// The table comes from the config, so a combination can be moved or handed back to
+    /// applications with `key <combo> none` — which matters for the ones we take that
+    /// the keyboard protocol would otherwise make available.
     fn onBinding(ctx: *anyopaque, sym: u32, ctrl: bool, shift: bool, alt: bool) bool {
         const self: *App = @ptrCast(@alignCast(ctx));
-        const grid = &self.screen.grid;
 
         // Hint mode swallows everything while it is up — see `hintsKey`.
         if (self.hint_on) {
@@ -682,65 +685,33 @@ const App = struct {
             return true;
         }
 
-        // Alt + the `%` key opens another window in the same directory — the binding
-        // carried over from wezterm. Shift is not required explicitly: `%` needs it on
-        // this AZERTY layout but not on every layout, so the *character* is what is
-        // matched, not the physical key plus modifier.
-        if (alt and sym == c.XKB_KEY_percent) {
-            self.newWindowHere();
-            return true;
+        const action = self.cfg.bindings.lookup(sym, ctrl, shift, alt) orelse return false;
+        const grid = &self.screen.grid;
+        switch (action) {
+            .none => return false,
+            .copy => self.publishSelection(self.win.keyboard.last_serial, &.{.clipboard}),
+            .paste => self.pasteFrom(.clipboard),
+            .paste_primary => self.pasteFrom(.primary),
+            .hints => self.hintsEnter(),
+            .new_window => self.newWindowHere(),
+            .scroll_page_up => {
+                grid.scrollView(@intCast(grid.rows / 2));
+                self.needs_render = true;
+            },
+            .scroll_page_down => {
+                grid.scrollView(-@as(i64, @intCast(grid.rows / 2)));
+                self.needs_render = true;
+            },
+            .scroll_top => {
+                grid.scrollView(@intCast(grid.maxView()));
+                self.needs_render = true;
+            },
+            .scroll_bottom => {
+                grid.resetView();
+                self.needs_render = true;
+            },
         }
-
-        if (ctrl and shift) {
-            switch (sym) {
-                c.XKB_KEY_C, c.XKB_KEY_c => {
-                    self.publishSelection(self.win.keyboard.last_serial, &.{.clipboard});
-                    return true;
-                },
-                c.XKB_KEY_V, c.XKB_KEY_v => {
-                    self.pasteFrom(.clipboard);
-                    return true;
-                },
-                // Label every link on screen; type a label to open it, or hold
-                // Shift while typing it to copy the target instead. This is the
-                // keyboard route to a URL — no pointer involved.
-                c.XKB_KEY_U, c.XKB_KEY_u => {
-                    self.hintsEnter();
-                    return true;
-                },
-                else => {},
-            }
-        }
-
-        // Scrollback navigation. Shift+Page keys are the convention, and shifted so
-        // full-screen applications still receive plain Page Up/Down.
-        if (shift) {
-            switch (sym) {
-                c.XKB_KEY_Page_Up => {
-                    grid.scrollView(@intCast(grid.rows / 2));
-                    self.needs_render = true;
-                    return true;
-                },
-                c.XKB_KEY_Page_Down => {
-                    grid.scrollView(-@as(i64, @intCast(grid.rows / 2)));
-                    self.needs_render = true;
-                    return true;
-                },
-                c.XKB_KEY_Home => {
-                    grid.scrollView(@intCast(grid.maxView()));
-                    self.needs_render = true;
-                    return true;
-                },
-                c.XKB_KEY_End => {
-                    grid.resetView();
-                    self.needs_render = true;
-                    return true;
-                },
-                else => {},
-            }
-        }
-
-        return false;
+        return true;
     }
 };
 

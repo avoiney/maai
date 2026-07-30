@@ -17,6 +17,7 @@
 //! because of a typo.
 
 const std = @import("std");
+const c = @import("c.zig").c;
 const thememod = @import("term/theme.zig");
 const urlmod = @import("term/url.zig");
 const Theme = thememod.Theme;
@@ -26,6 +27,95 @@ const Rgb = @import("term/cell.zig").Rgb;
 pub const max_include_depth = 8;
 /// No config or theme file has any business being larger.
 pub const max_file_bytes = 1 << 20;
+
+/// What a key can be made to do.
+///
+/// Names, not function pointers: the config names an action and `main.zig` decides what
+/// it means, so a typo in a config file cannot become anything but a diagnostic.
+pub const Action = enum {
+    /// Explicitly unbound. Distinct from absent: it is how you *free* a combination we
+    /// bind by default, handing it back to applications.
+    none,
+    copy,
+    paste,
+    paste_primary,
+    hints,
+    new_window,
+    scroll_page_up,
+    scroll_page_down,
+    scroll_top,
+    scroll_bottom,
+};
+
+pub const Binding = struct {
+    /// Keysym, normalised to lower case — with Shift held xkb reports `C`, not `c`, and
+    /// a config that had to know that would be a trap.
+    sym: u32,
+    ctrl: bool = false,
+    shift: bool = false,
+    alt: bool = false,
+    action: Action,
+
+    fn sameCombo(a: Binding, b: Binding) bool {
+        return a.sym == b.sym and a.ctrl == b.ctrl and a.shift == b.shift and
+            a.alt == b.alt;
+    }
+};
+
+pub const Bindings = struct {
+    pub const capacity = 64;
+
+    items: [capacity]Binding = undefined,
+    len: usize = 0,
+
+    /// What the terminal binds when the config says nothing.
+    pub fn defaults() Bindings {
+        var b = Bindings{};
+        // Ctrl+Shift is the terminal's own namespace: in the legacy encoding it
+        // collapses onto Ctrl+key, so applications cannot bind it and lose nothing.
+        b.add(.{ .sym = 'c', .ctrl = true, .shift = true, .action = .copy });
+        b.add(.{ .sym = 'v', .ctrl = true, .shift = true, .action = .paste });
+        b.add(.{ .sym = 'u', .ctrl = true, .shift = true, .action = .hints });
+        // Carried over from wezterm. The character is matched, not the physical key.
+        b.add(.{ .sym = '%', .alt = true, .action = .new_window });
+        // Shifted so full-screen applications still receive plain Page Up/Down.
+        b.add(.{ .sym = c.XKB_KEY_Page_Up, .shift = true, .action = .scroll_page_up });
+        b.add(.{ .sym = c.XKB_KEY_Page_Down, .shift = true, .action = .scroll_page_down });
+        b.add(.{ .sym = c.XKB_KEY_Home, .shift = true, .action = .scroll_top });
+        b.add(.{ .sym = c.XKB_KEY_End, .shift = true, .action = .scroll_bottom });
+        return b;
+    }
+
+    /// Add or replace. A later line wins, which is what makes `include` and a
+    /// user override behave the way anyone would expect.
+    pub fn add(self: *Bindings, binding: Binding) void {
+        for (self.items[0..self.len]) |*existing| {
+            if (existing.sameCombo(binding)) {
+                existing.action = binding.action;
+                return;
+            }
+        }
+        if (self.len == capacity) return;
+        self.items[self.len] = binding;
+        self.len += 1;
+    }
+
+    pub fn lookup(self: *const Bindings, sym: u32, ctrl: bool, shift: bool, alt: bool) ?Action {
+        const key = normalizeSym(sym);
+        for (self.items[0..self.len]) |b| {
+            if (b.sym == key and b.ctrl == ctrl and b.shift == shift and b.alt == alt) {
+                return if (b.action == .none) null else b.action;
+            }
+        }
+        return null;
+    }
+};
+
+/// With Shift held, xkb reports the shifted keysym — `C` for Ctrl+Shift+C. Lowering
+/// letters means a config writes `ctrl+shift+c` and means it.
+fn normalizeSym(sym: u32) u32 {
+    return if (sym >= 'A' and sym <= 'Z') sym + 32 else sym;
+}
 
 pub const Config = struct {
     // ── font and layout ────────────────────────────────────────────────────
@@ -50,6 +140,8 @@ pub const Config = struct {
     alternate_scroll: bool = true,
     /// The program handed a URL, as an argv[0]. Never a shell string.
     url_launcher: Str = .init("xdg-open"),
+    /// Keyboard shortcuts the terminal keeps for itself.
+    bindings: Bindings = Bindings.defaults(),
 
     // ── theme ──────────────────────────────────────────────────────────────
     theme: Theme = .{},
@@ -375,6 +467,8 @@ fn applyKey(
             return;
         }
         cfg.url_launcher.set(value);
+    } else if (std.mem.eql(u8, key, "key")) {
+        parseBinding(cfg, value, path, entry.line, diags);
     } else if (std.mem.eql(u8, key, "theme_dir")) {
         cfg.theme_dir.set(value);
     } else if (std.mem.eql(u8, key, "theme_flavour_file")) {
@@ -388,6 +482,73 @@ fn applyKey(
     } else {
         diags.add(path, entry.line, "unknown setting");
     }
+}
+
+/// `key ctrl+shift+c copy` — a combination, whitespace, an action.
+///
+/// Key names come from xkbcommon rather than a table of our own: `c`, `percent`,
+/// `Page_Up`, `F5`, `Tab` all work, and they are the names already written in
+/// `/usr/share/X11/xkb/symbols`, so there is one vocabulary rather than two.
+fn parseBinding(
+    cfg: *Config,
+    value: []const u8,
+    path: []const u8,
+    line: usize,
+    diags: *Diagnostics,
+) void {
+    const sep = std.mem.indexOfAny(u8, value, " \t") orelse {
+        diags.add(path, line, "key needs a combination and an action");
+        return;
+    };
+    const combo = value[0..sep];
+    const action_name = std.mem.trim(u8, value[sep..], " \t");
+
+    const action = std.meta.stringToEnum(Action, action_name) orelse {
+        diags.add(path, line, "unknown action");
+        return;
+    };
+
+    var binding = Binding{ .sym = 0, .action = action };
+    var it = std.mem.splitScalar(u8, combo, '+');
+    var key_name: ?[]const u8 = null;
+    while (it.next()) |part| {
+        if (part.len == 0) continue;
+        if (std.ascii.eqlIgnoreCase(part, "ctrl") or std.ascii.eqlIgnoreCase(part, "control")) {
+            binding.ctrl = true;
+        } else if (std.ascii.eqlIgnoreCase(part, "shift")) {
+            binding.shift = true;
+        } else if (std.ascii.eqlIgnoreCase(part, "alt")) {
+            binding.alt = true;
+        } else {
+            // Anything not a modifier is the key, and there can only be one.
+            if (key_name != null) {
+                diags.add(path, line, "more than one key in the combination");
+                return;
+            }
+            key_name = part;
+        }
+    }
+
+    const name = key_name orelse {
+        diags.add(path, line, "combination has no key");
+        return;
+    };
+
+    var namez: [64]u8 = undefined;
+    if (name.len >= namez.len) {
+        diags.add(path, line, "key name too long");
+        return;
+    }
+    @memcpy(namez[0..name.len], name);
+    namez[name.len] = 0;
+
+    const sym = c.xkb_keysym_from_name(@ptrCast(&namez), c.XKB_KEYSYM_CASE_INSENSITIVE);
+    if (sym == c.XKB_KEY_NoSymbol) {
+        diags.add(path, line, "unknown key name");
+        return;
+    }
+    binding.sym = normalizeSym(sym);
+    cfg.bindings.add(binding);
 }
 
 // ── line scanning ───────────────────────────────────────────────────────────
@@ -678,4 +839,73 @@ test "booleans accept the spellings people actually write" {
     try testing.expectEqual(false, parseBool("no").?);
     try testing.expectEqual(false, parseBool("off").?);
     try testing.expect(parseBool("perhaps") == null);
+}
+
+test "bindings parse a combination and an action" {
+    var cfg = Config{};
+    var diags = Diagnostics{};
+    parseInto(
+        \\key ctrl+shift+f copy
+        \\key alt+percent new_window
+        \\key shift+Page_Up scroll_top
+    , &cfg, &diags);
+    try testing.expectEqual(@as(usize, 0), diags.len);
+
+    try testing.expectEqual(Action.copy, cfg.bindings.lookup('f', true, true, false).?);
+    try testing.expectEqual(Action.new_window, cfg.bindings.lookup('%', false, false, true).?);
+    // Names come from xkbcommon, so the xkb spelling works as written.
+    try testing.expectEqual(
+        Action.scroll_top,
+        cfg.bindings.lookup(c.XKB_KEY_Page_Up, false, true, false).?,
+    );
+
+    // The modifiers are part of the match: the same key without them is not bound.
+    try testing.expect(cfg.bindings.lookup('f', false, false, false) == null);
+}
+
+test "Shift does not have to be spelled into the keysym" {
+    // xkb reports `C` when Shift is held, so a config writing `ctrl+shift+c` would
+    // never match unless lookups normalise. This is the trap that normalisation avoids.
+    const b = Bindings.defaults();
+    try testing.expectEqual(Action.copy, b.lookup('C', true, true, false).?);
+    try testing.expectEqual(Action.copy, b.lookup('c', true, true, false).?);
+}
+
+test "a later line overrides an earlier one, and `none` frees a combination" {
+    var cfg = Config{};
+    var diags = Diagnostics{};
+
+    // Ctrl+Shift+C is a default; rebinding it must replace rather than shadow.
+    parseInto("key ctrl+shift+c hints", &cfg, &diags);
+    try testing.expectEqual(Action.hints, cfg.bindings.lookup('c', true, true, false).?);
+
+    // ...and handing it back to applications is what `none` is for. This is the escape
+    // hatch for combinations the keyboard protocol would otherwise expose.
+    parseInto("key ctrl+shift+c none", &cfg, &diags);
+    try testing.expect(cfg.bindings.lookup('c', true, true, false) == null);
+    try testing.expectEqual(@as(usize, 0), diags.len);
+}
+
+test "a malformed binding is reported and the defaults survive" {
+    var cfg = Config{};
+    var diags = Diagnostics{};
+    parseInto(
+        \\key ctrl+shift+c nonsense_action
+        \\key ctrl+nosuchkey copy
+        \\key ctrl+shift copy
+        \\key ctrl+a+b copy
+        \\key onlyacombo
+    , &cfg, &diags);
+
+    try testing.expectEqual(@as(usize, 5), diags.len);
+    // Every line was refused, so copy is still where it was.
+    try testing.expectEqual(Action.copy, cfg.bindings.lookup('c', true, true, false).?);
+}
+
+test "the binding table saturates rather than overflowing" {
+    var b = Bindings{};
+    for (0..Bindings.capacity + 10) |i| {
+        b.add(.{ .sym = @intCast('a' + i), .action = .copy });
+    }
+    try testing.expectEqual(Bindings.capacity, b.len);
 }

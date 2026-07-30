@@ -53,6 +53,36 @@
 # refused rather than split.
 # url_launcher xdg-open
 
+# ── keyboard shortcuts ───────────────────────────────────────────────────────
+#
+#     key <combination> <action>
+#
+# Modifiers are `ctrl`, `shift`, `alt`, joined with `+`. The key is an xkb keysym
+# name — `c`, `percent`, `Page_Up`, `F5`, `Tab` — the same names used in
+# /usr/share/X11/xkb/symbols, so there is one vocabulary rather than two. Case does
+# not matter, and `shift+c` is written as it reads: no need to spell the shifted
+# keysym.
+#
+# A later line replaces an earlier one, so a `key` here overrides the default. The
+# action `none` *unbinds* a combination, handing it back to applications — which is
+# what you want for any shortcut a full-screen program needs. Under the Kitty
+# keyboard protocol applications can see combinations the legacy encoding could not
+# express, so this is the escape hatch when the terminal and an application want the
+# same key.
+#
+# Actions: copy, paste, paste_primary, hints, new_window, scroll_page_up,
+#          scroll_page_down, scroll_top, scroll_bottom, none
+#
+# The defaults:
+# key ctrl+shift+c copy
+# key ctrl+shift+v paste
+# key ctrl+shift+u hints
+# key alt+percent new_window
+# key shift+Page_Up scroll_page_up
+# key shift+Page_Down scroll_page_down
+# key shift+Home scroll_top
+# key shift+End scroll_bottom
+
 # ── theme ────────────────────────────────────────────────────────────────────
 
 # A name or a path.

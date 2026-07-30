@@ -569,10 +569,27 @@ Control held. That covers the disambiguation table, the base codepoint ignoring 
 the property that matters most — with no modifier held, every key falls through to exactly
 the bytes it produced before the protocol existed.
 
+**Configurable bindings (2026-07-30).** `key <combination> <action>` in the config, with
+key names taken from **xkbcommon** rather than a table of our own — `c`, `percent`,
+`Page_Up`, `F5` are the names already written in `/usr/share/X11/xkb/symbols`, so there is
+one vocabulary rather than two, and `xkb_keysym_from_name` does the work.
+
+Lookups normalise letter keysyms to lower case, because xkb reports `C` when Shift is
+held: a config writing `ctrl+shift+c` would otherwise never match, which is a trap rather
+than a feature.
+
+**`none` unbinds**, and that is the point of doing this now. The keyboard protocol makes
+combinations available that legacy could not express, and the terminal takes some of them
+— `Ctrl+Tab` will be one. `key ctrl+tab none` hands it back. A default that cannot be
+given up is a default that eventually fights an application.
+
+A later line replaces an earlier one, so `include` and user overrides behave as anyone
+would expect, and a malformed line is reported and skipped like every other setting.
+
 **Still outstanding in this phase:** legacy modifyOtherKeys; kitty flags 2/4/8/16; focus
 reporting (1004 is tracked but `CSI I`/`CSI O` are never sent); a keyboard-driven visual
-select mode; configurable bindings; and a confirmation prompt for multi-line pastes, which
-needs UI that does not exist yet.
+select mode; and a confirmation prompt for multi-line pastes, which needs UI that does not
+exist yet.
 
 Original phase 3 scope, for reference:
 
