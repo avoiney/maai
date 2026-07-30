@@ -152,10 +152,21 @@ pub const Bindings = struct {
     }
 };
 
-/// With Shift held, xkb reports the shifted keysym — `C` for Ctrl+Shift+C. Lowering
-/// letters means a config writes `ctrl+shift+c` and means it.
+/// Undo what Shift does to a keysym, so a combination is written as it reads.
+///
+/// With Shift held xkb reports the *shifted* keysym, which is a different symbol and not
+/// merely a case: `C` for Ctrl+Shift+C, and — the one that bit — **`ISO_Left_Tab` for
+/// Shift+Tab**. A default bound to `Tab` therefore never matched Ctrl+Shift+Tab, the key
+/// fell through to the legacy encoder as `CSI Z`, and zsh ran `reverse-menu-complete`.
+/// Which looked like the terminal doing something bizarre rather than like a binding that
+/// simply was not there.
+///
+/// Any config that had to know these substitutions would be a trap, so they are undone
+/// here instead — in one place, where the next one can be added.
 fn normalizeSym(sym: u32) u32 {
-    return if (sym >= 'A' and sym <= 'Z') sym + 32 else sym;
+    if (sym >= 'A' and sym <= 'Z') return sym + 32;
+    if (sym == c.XKB_KEY_ISO_Left_Tab) return c.XKB_KEY_Tab;
+    return sym;
 }
 
 pub const Config = struct {
@@ -1006,4 +1017,28 @@ test "the tab defaults are what was agreed" {
     try testing.expectEqual(Action.tab_prev, b.lookup(c.XKB_KEY_Tab, 0, true, true, false).?);
     // Plain Tab is untouched, which is the whole point of putting ours behind Ctrl.
     try testing.expect(b.lookup(c.XKB_KEY_Tab, 0, false, false, false) == null);
+}
+
+test "Shift+Tab is reported as ISO_Left_Tab and must still match `tab`" {
+    // The regression this exists for: Ctrl+Shift+Tab reached the shell as CSI Z and zsh
+    // ran reverse-menu-complete, because xkb substitutes a different keysym under Shift
+    // and the default was bound to Tab.
+    const b = Bindings.defaults();
+    try testing.expectEqual(
+        Action.tab_prev,
+        b.lookup(c.XKB_KEY_ISO_Left_Tab, 0, true, true, false).?,
+    );
+    // Written as `tab` in a config, matched either way.
+    var cfg = Config{};
+    var diags = Diagnostics{};
+    parseInto("key ctrl+shift+tab tab_next", &cfg, &diags);
+    try testing.expectEqual(@as(usize, 0), diags.len);
+    try testing.expectEqual(
+        Action.tab_next,
+        cfg.bindings.lookup(c.XKB_KEY_ISO_Left_Tab, 0, true, true, false).?,
+    );
+
+    // Shift+Tab *without* Ctrl stays the application's: it is how every shell walks
+    // completions backwards.
+    try testing.expect(b.lookup(c.XKB_KEY_ISO_Left_Tab, 0, false, true, false) == null);
 }
