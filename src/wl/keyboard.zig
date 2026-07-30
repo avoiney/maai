@@ -34,6 +34,15 @@ pub const Keyboard = struct {
     xkb: ?*c.struct_xkb_context = null,
     keymap: ?*c.struct_xkb_keymap = null,
     state: ?*c.struct_xkb_state = null,
+    /// Dead keys and Compose sequences.
+    ///
+    /// Not optional polish on this machine: the layout is French AZERTY, where `^`
+    /// and `¨` are *dead* keys — `key <AD11> { [dead_circumflex, dead_diaeresis…] }`.
+    /// A dead keysym has no UTF-8 of its own, so `xkb_state_key_get_utf8` returns
+    /// zero bytes for it. Without compose handling the key silently produced nothing
+    /// and the following letter arrived unaccented: `être` came out as `etre`.
+    compose_table: ?*c.struct_xkb_compose_table = null,
+    compose_state: ?*c.struct_xkb_compose_state = null,
     wl_kbd: ?*c.struct_wl_keyboard = null,
     sink: ?Sink = null,
     bindings: ?Bindings = null,
@@ -90,6 +99,34 @@ pub const Keyboard = struct {
 
     pub fn init(self: *Keyboard) void {
         self.xkb = c.xkb_context_new(c.XKB_CONTEXT_NO_FLAGS);
+        self.initCompose();
+    }
+
+    /// Build the compose table from the locale's Compose file.
+    ///
+    /// Failure is not fatal: without a table, dead keys behave as they did before
+    /// this existed. A missing Compose file is a real configuration, not a bug.
+    fn initCompose(self: *Keyboard) void {
+        const xkb = self.xkb orelse return;
+
+        // The same precedence libX11 uses. `xkb_compose_table_new_from_locale` reads
+        // the env itself, but only LC_ALL/LC_CTYPE/LANG in that order, and being
+        // explicit here documents what decides which Compose file is used.
+        const locale = std.c.getenv("LC_ALL") orelse
+            std.c.getenv("LC_CTYPE") orelse
+            std.c.getenv("LANG") orelse
+            "C.UTF-8";
+
+        self.compose_table = c.xkb_compose_table_new_from_locale(
+            xkb,
+            locale,
+            c.XKB_COMPOSE_COMPILE_NO_FLAGS,
+        );
+        const table = self.compose_table orelse return;
+        self.compose_state = c.xkb_compose_state_new(
+            table,
+            c.XKB_COMPOSE_STATE_NO_FLAGS,
+        );
     }
 
     pub fn attach(self: *Keyboard, wl_kbd: *c.struct_wl_keyboard) void {
@@ -98,6 +135,8 @@ pub const Keyboard = struct {
     }
 
     pub fn deinit(self: *Keyboard) void {
+        if (self.compose_state) |s| c.xkb_compose_state_unref(s);
+        if (self.compose_table) |t| c.xkb_compose_table_unref(t);
         if (self.state) |s| c.xkb_state_unref(s);
         if (self.keymap) |k| c.xkb_keymap_unref(k);
         if (self.xkb) |x| c.xkb_context_unref(x);
@@ -125,11 +164,56 @@ pub const Keyboard = struct {
         };
     }
 
+    /// What compose handling did with a key.
+    const Composed = union(enum) {
+        /// Not part of a sequence; carry on with normal encoding.
+        passthrough,
+        /// Mid-sequence, or a cancelled one. The key produces no output.
+        swallowed,
+        /// A finished sequence, already encoded as UTF-8.
+        text: []const u8,
+    };
+
+    fn compose(self: *Keyboard, sym: u32, buf: []u8) Composed {
+        const cs = self.compose_state orelse return .passthrough;
+        if (c.xkb_compose_state_feed(cs, sym) != c.XKB_COMPOSE_FEED_ACCEPTED) {
+            return .passthrough;
+        }
+
+        switch (c.xkb_compose_state_get_status(cs)) {
+            c.XKB_COMPOSE_COMPOSING => return .swallowed,
+            c.XKB_COMPOSE_COMPOSED => {
+                const n = c.xkb_compose_state_get_utf8(cs, @ptrCast(buf.ptr), buf.len);
+                c.xkb_compose_state_reset(cs);
+                if (n <= 0 or @as(usize, @intCast(n)) > buf.len) return .swallowed;
+                return .{ .text = buf[0..@intCast(n)] };
+            },
+            c.XKB_COMPOSE_CANCELLED => {
+                // An invalid sequence, `^` then `q`. Dropped rather than emitting the
+                // raw key, which is what xkbcommon's own documented handling does:
+                // the cancelling keysym is not the character the user meant, and
+                // emitting it would put a stray letter in a command line.
+                c.xkb_compose_state_reset(cs);
+                return .swallowed;
+            },
+            // XKB_COMPOSE_NOTHING: fed, but not the start of any sequence.
+            else => return .passthrough,
+        }
+    }
+
     /// Encode one key press into terminal input bytes. Returns a slice of `buf`,
     /// or null if the key produces nothing.
     fn encode(self: *Keyboard, keycode: u32, buf: []u8) ?[]const u8 {
         const state = self.state orelse return null;
         const sym = c.xkb_state_key_get_one_sym(state, keycode);
+
+        // Before everything else: a dead key must not fall through to the function-key
+        // tables or to xkb's UTF-8 translation, which has nothing to give for it.
+        switch (self.compose(sym, buf)) {
+            .passthrough => {},
+            .swallowed => return null,
+            .text => |t| return t,
+        }
 
         const mods = self.activeMods();
         const shift = mods.shift;
@@ -287,6 +371,9 @@ fn handleKeymap(
     if (self.keymap) |k| c.xkb_keymap_unref(k);
     self.keymap = keymap;
     self.state = state;
+    // A layout switch mid-sequence would otherwise leave a half-composed character
+    // waiting for a key that no longer exists.
+    if (self.compose_state) |cs| c.xkb_compose_state_reset(cs);
 }
 
 fn handleKey(
@@ -329,7 +416,13 @@ fn handleKey(
 
     const sink = self.sink orelse return;
     var buf: [64]u8 = undefined;
-    const bytes = self.encode(keycode, &buf) orelse return;
+    const bytes = self.encode(keycode, &buf) orelse {
+        // Produced nothing — a dead key, or a key this encoder has no bytes for.
+        // Any repeat still running belongs to a key that is no longer the one being
+        // pressed, so holding `a` and then tapping `^` must not keep streaming `a`.
+        self.stopRepeat();
+        return;
+    };
     sink.write(sink.ctx, bytes);
 
     // Arm repeat, but only for keys the keymap marks as repeating — otherwise
@@ -396,3 +489,90 @@ fn handleLeave(
     _: u32,
     _: ?*c.struct_wl_surface,
 ) callconv(.c) void {}
+
+// ── tests ───────────────────────────────────────────────────────────────────
+//
+// Compose is testable without a keyboard because `compose` takes a *keysym*: the
+// sequence `dead_circumflex, e` can be fed directly, which is exactly what the
+// layout produces and what no script on this machine can synthesize.
+
+const testing = std.testing;
+
+/// A keyboard with only the compose machinery — no Wayland, no keymap.
+fn composeOnly() ?Keyboard {
+    var kbd = Keyboard{};
+    kbd.xkb = c.xkb_context_new(c.XKB_CONTEXT_NO_FLAGS);
+    kbd.initCompose();
+    if (kbd.compose_state == null) {
+        kbd.deinit();
+        return null;
+    }
+    return kbd;
+}
+
+test "a dead key composes with the next letter" {
+    var kbd = composeOnly() orelse return error.SkipZigTest;
+    defer kbd.deinit();
+
+    var buf: [64]u8 = undefined;
+
+    // `^` alone produces nothing and holds the sequence open. Before this existed the
+    // key silently did nothing *and* nothing was held, so the next letter came out
+    // bare: `être` typed as `etre`.
+    try testing.expect(kbd.compose(c.XKB_KEY_dead_circumflex, &buf) == .swallowed);
+
+    switch (kbd.compose(c.XKB_KEY_e, &buf)) {
+        .text => |t| try testing.expectEqualStrings("ê", t),
+        else => return error.NotComposed,
+    }
+}
+
+test "the diaeresis dead key composes too" {
+    var kbd = composeOnly() orelse return error.SkipZigTest;
+    defer kbd.deinit();
+
+    var buf: [64]u8 = undefined;
+    try testing.expect(kbd.compose(c.XKB_KEY_dead_diaeresis, &buf) == .swallowed);
+    switch (kbd.compose(c.XKB_KEY_e, &buf)) {
+        .text => |t| try testing.expectEqualStrings("ë", t),
+        else => return error.NotComposed,
+    }
+}
+
+test "an ordinary key passes straight through" {
+    var kbd = composeOnly() orelse return error.SkipZigTest;
+    defer kbd.deinit();
+
+    var buf: [64]u8 = undefined;
+    // Otherwise every keystroke would route through compose and normal typing would
+    // lose its function keys and control bytes.
+    try testing.expect(kbd.compose(c.XKB_KEY_a, &buf) == .passthrough);
+    try testing.expect(kbd.compose(c.XKB_KEY_Return, &buf) == .passthrough);
+    try testing.expect(kbd.compose(c.XKB_KEY_F5, &buf) == .passthrough);
+}
+
+test "an invalid sequence is dropped, and does not wedge the state" {
+    var kbd = composeOnly() orelse return error.SkipZigTest;
+    defer kbd.deinit();
+
+    var buf: [64]u8 = undefined;
+    try testing.expect(kbd.compose(c.XKB_KEY_dead_circumflex, &buf) == .swallowed);
+    // `^q` is not a sequence in any Compose file.
+    try testing.expect(kbd.compose(c.XKB_KEY_q, &buf) == .swallowed);
+
+    // The important half: the state was reset, so the *next* sequence still works.
+    // A wedged compose state would silently eat every following keystroke.
+    try testing.expect(kbd.compose(c.XKB_KEY_dead_circumflex, &buf) == .swallowed);
+    switch (kbd.compose(c.XKB_KEY_o, &buf)) {
+        .text => |t| try testing.expectEqualStrings("ô", t),
+        else => return error.NotComposed,
+    }
+}
+
+test "with no compose table, keys pass through unchanged" {
+    // A machine with no Compose file for its locale must still be typable.
+    var kbd = Keyboard{};
+    defer kbd.deinit();
+    var buf: [64]u8 = undefined;
+    try testing.expect(kbd.compose(c.XKB_KEY_dead_circumflex, &buf) == .passthrough);
+}

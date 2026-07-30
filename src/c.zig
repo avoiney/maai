@@ -44,6 +44,9 @@ pub const c = @cImport({
 
     // ── Input ──────────────────────────────────────────────────────────────
     @cInclude("xkbcommon/xkbcommon.h");
+    // Compose sequences: dead keys. `^` on this machine's AZERTY layout emits
+    // dead_circumflex, which has no UTF-8 of its own — see keyboard.zig.
+    @cInclude("xkbcommon/xkbcommon-compose.h");
 
     // ── PTY / process ──────────────────────────────────────────────────────
     // forkpty and openpty live in libc proper since glibc 2.34, so no -lutil.
