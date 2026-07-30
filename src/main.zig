@@ -167,15 +167,24 @@ const App = struct {
 
     /// Lay the tab bar out, one column per cell.
     ///
-    /// Built here rather than in the renderer because it is *layout* — how a title is
-    /// truncated, where the separators go, which tab is active — and the renderer's job
-    /// is to put cells on screen.
+    /// Built here rather than in the renderer because it is *layout* — truncation,
+    /// separators, numbering, which tab is active — and the renderer's job is to put
+    /// cells on screen. It also owns the colours, since powerline needs a cell holding
+    /// two tabs' colours at once.
     fn buildBar(self: *App) []const rendermod.BarCell {
         const cols = self.screen.grid.cols;
+        const theme = &self.screen.theme;
+        const powerline = self.cfg.tab_bar_style == .powerline;
+        const sep = self.cfg.tab_powerline_style.separator();
         var n: usize = 0;
+
+        const room = @min(cols, self.bar.len);
 
         for (self.tabs[0..self.tab_count], 0..) |t, i| {
             const active = i == self.active;
+            const fg = if (active) theme.bar_active_fg else theme.bar_inactive_fg;
+            const bg = if (active) theme.bar_active_bg else theme.bar_inactive_bg;
+
             var label: [64]u8 = undefined;
             const title = t.screen.title();
             const text = if (title.len > 0)
@@ -187,16 +196,31 @@ const App = struct {
             // like it occupies, rather than one per byte.
             var it = (std.unicode.Utf8View.init(text) catch continue).iterator();
             while (it.nextCodepoint()) |cp| {
-                if (n == cols or n == self.bar.len) break;
-                self.bar[n] = .{ .cp = cp, .active = active };
+                if (n == room) break;
+                self.bar[n] = .{ .cp = cp, .fg = fg, .bg = bg };
                 n += 1;
             }
-            if (n == cols or n == self.bar.len) break;
+            if (n == room) break;
+
+            if (powerline) {
+                // The separator wears the colour of the tab it leaves, on the background
+                // of whatever comes next. That is the whole trick: the glyph reads as
+                // the edge of the previous tab rather than as a character of its own.
+                const next_bg = if (i + 1 < self.tab_count)
+                    (if (i + 1 == self.active) theme.bar_active_bg else theme.bar_inactive_bg)
+                else
+                    theme.bar_bg;
+                self.bar[n] = .{ .cp = sep, .fg = bg, .bg = next_bg };
+                n += 1;
+                if (n == room) break;
+            }
         }
 
         // The strip runs the full width, so the bar reads as a bar and not as a label
-        // floating on the background.
-        while (n < cols and n < self.bar.len) : (n += 1) self.bar[n] = .{};
+        // floating on the terminal background.
+        while (n < room) : (n += 1) {
+            self.bar[n] = .{ .cp = ' ', .fg = theme.bar_inactive_fg, .bg = theme.bar_bg };
+        }
         return self.bar[0..n];
     }
 

@@ -28,6 +28,33 @@ pub const max_include_depth = 8;
 /// No config or theme file has any business being larger.
 pub const max_file_bytes = 1 << 20;
 
+/// How the tab bar is drawn.
+pub const BarStyle = enum {
+    /// Flat blocks of colour.
+    plain,
+    /// Separator glyphs between tabs, each carrying the colour of the tab it leaves on
+    /// the background of the one it enters — which is what makes the edge read as a
+    /// shape rather than a character. Needs a Nerd Font for the glyphs; the machine's
+    /// FiraCode Nerd Font has them.
+    powerline,
+};
+
+/// Which separator glyph. Names and codepoints follow kitty, whose config on this
+/// machine already says `tab_powerline_style slanted`.
+pub const PowerlineStyle = enum {
+    angled,
+    slanted,
+    round,
+
+    pub fn separator(self: PowerlineStyle) u21 {
+        return switch (self) {
+            .angled => 0xe0b0,
+            .slanted => 0xe0bc,
+            .round => 0xe0b4,
+        };
+    }
+};
+
 /// What a key can be made to do.
 ///
 /// Names, not function pointers: the config names an action and `main.zig` decides what
@@ -217,6 +244,8 @@ pub const Config = struct {
     url_launcher: Str = .init("xdg-open"),
     /// Keyboard shortcuts the terminal keeps for itself.
     bindings: Bindings = Bindings.defaults(),
+    tab_bar_style: BarStyle = .powerline,
+    tab_powerline_style: PowerlineStyle = .slanted,
 
     // ── theme ──────────────────────────────────────────────────────────────
     theme: Theme = .{},
@@ -433,7 +462,7 @@ pub fn parseTheme(
         }
 
         const slot: ?*Rgb =
-            if (std.mem.eql(u8, key, "background")) &theme.bg else if (std.mem.eql(u8, key, "foreground")) &theme.fg else if (std.mem.eql(u8, key, "cursor")) &theme.cursor else if (std.mem.eql(u8, key, "cursor_text_color")) &theme.cursor_text else if (std.mem.eql(u8, key, "selection_background")) &theme.selection_bg else if (std.mem.eql(u8, key, "selection_foreground")) &theme.selection_fg else if (std.mem.eql(u8, key, "hint_background")) &theme.hint_bg else if (std.mem.eql(u8, key, "hint_foreground")) &theme.hint_fg else if (std.mem.eql(u8, key, "tab_bar_background")) &theme.bar_bg else if (std.mem.eql(u8, key, "inactive_tab_foreground")) &theme.bar_fg else if (std.mem.eql(u8, key, "active_tab_background")) &theme.bar_active_bg else if (std.mem.eql(u8, key, "active_tab_foreground")) &theme.bar_active_fg else null;
+            if (std.mem.eql(u8, key, "background")) &theme.bg else if (std.mem.eql(u8, key, "foreground")) &theme.fg else if (std.mem.eql(u8, key, "cursor")) &theme.cursor else if (std.mem.eql(u8, key, "cursor_text_color")) &theme.cursor_text else if (std.mem.eql(u8, key, "selection_background")) &theme.selection_bg else if (std.mem.eql(u8, key, "selection_foreground")) &theme.selection_fg else if (std.mem.eql(u8, key, "hint_background")) &theme.hint_bg else if (std.mem.eql(u8, key, "hint_foreground")) &theme.hint_fg else if (std.mem.eql(u8, key, "tab_bar_background")) &theme.bar_bg else if (std.mem.eql(u8, key, "inactive_tab_background")) &theme.bar_inactive_bg else if (std.mem.eql(u8, key, "inactive_tab_foreground")) &theme.bar_inactive_fg else if (std.mem.eql(u8, key, "active_tab_background")) &theme.bar_active_bg else if (std.mem.eql(u8, key, "active_tab_foreground")) &theme.bar_active_fg else null;
 
         if (slot) |s| {
             s.* = thememod.parseColor(value) orelse {
@@ -542,6 +571,16 @@ fn applyKey(
             return;
         }
         cfg.url_launcher.set(value);
+    } else if (std.mem.eql(u8, key, "tab_bar_style")) {
+        cfg.tab_bar_style = std.meta.stringToEnum(BarStyle, value) orelse {
+            diags.add(path, entry.line, "expected plain or powerline");
+            return;
+        };
+    } else if (std.mem.eql(u8, key, "tab_powerline_style")) {
+        cfg.tab_powerline_style = std.meta.stringToEnum(PowerlineStyle, value) orelse {
+            diags.add(path, entry.line, "expected angled, slanted or round");
+            return;
+        };
     } else if (std.mem.eql(u8, key, "key")) {
         parseBinding(cfg, value, path, entry.line, diags);
     } else if (std.mem.eql(u8, key, "theme_dir")) {

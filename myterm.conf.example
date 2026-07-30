@@ -53,6 +53,19 @@
 # refused rather than split.
 # url_launcher xdg-open
 
+# ── tab bar ──────────────────────────────────────────────────────────────────
+
+# `powerline` draws a separator glyph between tabs, wearing the colour of the tab it
+# leaves on the background of the one it enters — which is what makes the edge read as
+# a shape rather than a character. `plain` draws flat blocks instead.
+#
+# Powerline needs the separator glyphs, which live in the Nerd Font private-use range.
+# With a font that lacks them the separators come out blank; `plain` is the way out.
+# tab_bar_style powerline
+
+# angled (), slanted (), round (). Names and glyphs follow kitty.
+# tab_powerline_style slanted
+
 # ── keyboard shortcuts ───────────────────────────────────────────────────────
 #
 #     key <combination> <action>
@@ -138,8 +151,9 @@
 #     selection_foreground  #cdcecf
 #     hint_background       #dbc074      (myterm-specific: hint-mode labels)
 #     hint_foreground       #192330
-#     tab_bar_background    #192330
+#     tab_bar_background      #192330    (the strip behind the tabs)
+#     inactive_tab_background #2b3b51
 #     inactive_tab_foreground #738091
-#     active_tab_background #719cd6
-#     active_tab_foreground #131a24
+#     active_tab_background   #719cd6
+#     active_tab_foreground   #131a24
 #     color0 ... color255   #rrggbb

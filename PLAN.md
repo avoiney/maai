@@ -815,8 +815,13 @@ resize the grid and reflow what you were reading. It also matches the existing k
 config, which shows the bar from the first tab.
 
 *Layout lives with the application, not the renderer.* `App.buildBar` produces one
-`BarCell` per column — codepoint plus "is this the active tab" — and the renderer draws
-that row like any other. Truncation, separators and numbering are layout decisions; the
+`BarCell` per column — codepoint, foreground, background — and the renderer draws that row
+like any other. The colours are explicit rather than a flag the renderer maps, because
+powerline needs a separator whose foreground is the tab it *leaves* and whose background is
+the one it *enters*: two tabs' colours in one cell, which no flag can express. That is also
+the whole trick — the glyph reads as the edge of the previous tab instead of as a character.
+`tab_bar_style` and `tab_powerline_style` follow kitty's names and glyphs, defaulting to
+`powerline`/`slanted` to match the config already on this machine. Truncation, separators and numbering are layout decisions; the
 renderer's job is putting cells on screen. Titles are decoded as UTF-8 so an accented
 title occupies the columns it looks like it occupies.
 

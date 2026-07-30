@@ -29,7 +29,11 @@ const Hint = @import("../term/hints.zig").Hint;
 /// tab is active — is layout, which belongs with the application, not the renderer.
 pub const BarCell = struct {
     cp: u21 = ' ',
-    active: bool = false,
+    /// Explicit rather than a flag the renderer maps to colours. Powerline needs a
+    /// separator whose foreground is the tab it leaves and whose background is the one
+    /// it enters — two different tabs' colours in one cell, which no flag can express.
+    fg: Rgb,
+    bg: Rgb,
 };
 
 const Rgb = cellmod.Rgb;
@@ -354,13 +358,12 @@ pub const Renderer = struct {
         pad: Padding,
     ) void {
         if (bar.len == 0) return;
-        const theme = &screen.theme;
         const y = screen.grid.rows;
 
         for (bar, 0..) |cell, i| {
             const x: u32 = @intCast(i);
-            const bg = if (cell.active) theme.bar_active_bg else theme.bar_bg;
-            const fg = if (cell.active) theme.bar_active_fg else theme.bar_fg;
+            const bg = cell.bg;
+            const fg = cell.fg;
 
             self.bg_list.append(self.gpa, .{
                 .cell = .{ @intCast(x), @intCast(y) },
