@@ -18,6 +18,8 @@ const Pty = @import("pty/pty.zig").Pty;
 const vt = @import("vt/parser.zig");
 const sel = @import("term/selection.zig");
 const mouse = @import("term/mouse.zig");
+const urlmod = @import("term/url.zig");
+const launch = @import("launch.zig");
 const ptr = @import("wl/pointer.zig");
 const clip = @import("wl/clipboard.zig");
 
@@ -75,6 +77,9 @@ const App = struct {
     report_col: u32 = std.math.maxInt(u32),
     report_row: u32 = std.math.maxInt(u32),
 
+    /// Launched URL handlers awaiting reaping.
+    reaper: launch.Reaper = .{},
+
     fn writeToPty(ctx: *anyopaque, bytes: []const u8) void {
         const self: *App = @ptrCast(@alignCast(ctx));
         // Typing snaps the view back to the live screen; otherwise the reply to
@@ -126,12 +131,66 @@ const App = struct {
 
         // Shift is the universal override, and it is not a nicety: while an
         // application holds the mouse it is the only way to select text out of
-        // nvim, tmux or lazygit.
-        if (mods.shift) return false;
+        // nvim, tmux or lazygit. Ctrl is ours too, since it opens links — see
+        // `link_mod` for why that modifier and not another.
+        if (mods.shift or mods.ctrl) return false;
         // Scrolled into history, the application's coordinate space no longer
         // matches what is on screen — a report would make it act on unrelated text.
         // Local selection and local scrolling stay available up there instead.
         if (self.screen.grid.view != 0) return false;
+        return true;
+    }
+
+    /// Recompute what the pointer is hovering, and reflect it in the cursor shape.
+    ///
+    /// Only while the link modifier is held: underlining every URL the pointer
+    /// crosses while you are simply reading is noise, and the underline is a promise
+    /// that a click *right now* will open it.
+    fn updateHover(self: *App, mods: mouse.Mods) void {
+        const before = self.screen.hover;
+        self.screen.hover = if (mods.ctrl)
+            urlmod.find(&self.screen.grid, self.pointAt(
+                self.win.pointer.x,
+                self.win.pointer.y,
+            ))
+        else
+            null;
+
+        self.win.pointer.setShape(if (self.screen.hover != null) .pointer else .text);
+
+        const changed = if (before) |b|
+            if (self.screen.hover) |a| !a.eql(b) else true
+        else
+            self.screen.hover != null;
+        if (changed) self.needs_render = true;
+    }
+
+    /// Called when the modifier state changes, so the underline appears the moment
+    /// Ctrl goes down rather than on the next pointer motion.
+    fn onModsChanged(ctx: *anyopaque) void {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        self.updateHover(self.win.keyboard.activeMods());
+    }
+
+    /// Open whatever is under the pointer, if it is a link. Returns true if it was.
+    fn openLinkAt(self: *App, at: sel.Point) bool {
+        const span = urlmod.find(&self.screen.grid, at) orelse return false;
+        const text = urlmod.text(
+            self.gpa,
+            &self.screen.grid,
+            &self.screen.graphemes,
+            span,
+        ) catch return false;
+        defer self.gpa.free(text);
+
+        if (self.debug) std.debug.print("link: opening '{s}'\n", .{text});
+        if (launch.open(text)) |pid| {
+            self.reaper.track(pid);
+            return true;
+        }
+        // Rejected by the allowlist or the spawn failed. Say so rather than looking
+        // like a click that did nothing.
+        std.debug.print("myterm: refused to open '{s}'\n", .{text});
         return true;
     }
 
@@ -199,6 +258,7 @@ const App = struct {
 
         if (!self.dragging) {
             if (self.debug) std.debug.print("motion {d:.0},{d:.0} (not dragging)\n", .{ px, py });
+            self.updateHover(mods);
             return;
         }
         const p = self.pointAt(px, py);
@@ -229,6 +289,10 @@ const App = struct {
 
         switch (button) {
             ptr.button_left => {
+                // Ctrl+click opens a link instead of selecting. Only when there is
+                // one under the pointer, so Ctrl+click elsewhere still selects.
+                if (pressed and mods.ctrl and self.openLinkAt(p)) return;
+
                 if (pressed) {
                     const now = monotonicMs();
                     const same_cell = p.line == self.last_click_line and
@@ -481,6 +545,32 @@ fn heldButton(mask: u8) mouse.Button {
     return .none;
 }
 
+test {
+    // Test discovery follows *referenced* declarations, and in test mode nothing
+    // references `main` — so without this block `zig build test` silently covered
+    // almost nothing. Found by breaking an assertion in launch.zig on purpose and
+    // watching the suite stay green.
+    _ = @import("launch.zig");
+    _ = @import("font/font.zig");
+    _ = @import("gfx/atlas.zig");
+    _ = @import("gfx/egl.zig");
+    _ = @import("gfx/glyph_cache.zig");
+    _ = @import("gfx/renderer.zig");
+    _ = @import("pty/pty.zig");
+    _ = @import("term/cell.zig");
+    _ = @import("term/grid.zig");
+    _ = @import("term/mouse.zig");
+    _ = @import("term/screen.zig");
+    _ = @import("term/selection.zig");
+    _ = @import("term/url.zig");
+    _ = @import("term/width.zig");
+    _ = @import("vt/parser.zig");
+    _ = @import("wl/clipboard.zig");
+    _ = @import("wl/keyboard.zig");
+    _ = @import("wl/pointer.zig");
+    _ = @import("wl/window.zig");
+}
+
 /// Zig 0.16 hands argv and environ to `main` rather than exposing them as
 /// globals, so we take the `Init.Minimal` form.
 pub fn main(init: std.process.Init.Minimal) !void {
@@ -546,6 +636,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     win.keyboard.bindings = .{ .ctx = &app, .handle = App.onBinding };
     // DECCKM and friends change how keys encode, so the encoder needs to see them.
     win.keyboard.modes = &screen.modes;
+    win.keyboard.on_mods = .{ .ctx = &app, .changed = App.onModsChanged };
     win.pointer.handler = .{
         .ctx = &app,
         .motion = App.onMotion,
@@ -695,6 +786,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
             screen.dirty = false;
             app.needs_render = true;
         }
+
+        // Collect any URL handler that has finished. Cheap: it only touches slots
+        // that hold a live pid.
+        app.reaper.poll();
 
         if (pty.hung_up or pty.childExited()) break;
     }

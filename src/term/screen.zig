@@ -9,6 +9,7 @@ const std = @import("std");
 const cellmod = @import("cell.zig");
 const gridmod = @import("grid.zig");
 const mousemod = @import("mouse.zig");
+const urlmod = @import("url.zig");
 const Grid = gridmod.Grid;
 const width = @import("width.zig");
 const sel = @import("selection.zig");
@@ -120,6 +121,10 @@ pub const Screen = struct {
     /// Mouse/keyboard text selection. Lives here so the renderer can highlight it
     /// from the same place it reads cells.
     selection: sel.Selection = .{},
+    /// The URL under the pointer while the link modifier is held, for the renderer
+    /// to underline. Set by pointer handling, not by the parser — it lives beside
+    /// `selection` for the same reason: this is where the renderer already looks.
+    hover: ?urlmod.Span = null,
 
     cursor_x: u32 = 0,
     cursor_y: u32 = 0,
@@ -243,6 +248,9 @@ pub const Screen = struct {
         // Reflow renumbers lines, so selection coordinates no longer refer to the
         // text the user picked. Dropping it beats highlighting the wrong region.
         self.selection.clear();
+        // Reflow renumbers lines, so a span held in absolute coordinates would
+        // highlight unrelated text.
+        self.hover = null;
 
         // A region that spanned the whole screen should keep spanning it.
         if (was_full_height) {

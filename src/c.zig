@@ -53,6 +53,9 @@ pub const c = @cImport({
     @cInclude("termios.h");
     @cInclude("sys/ioctl.h");
     @cInclude("signal.h");
+    // posix_spawn, for launching a URL handler with an argv *array* — see
+    // launch.zig and PLAN.md §7. Never a shell string.
+    @cInclude("spawn.h");
     @cInclude("stdlib.h");
     @cInclude("sys/mman.h");
 });

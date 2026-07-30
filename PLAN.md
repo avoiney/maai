@@ -552,21 +552,61 @@ Original phase 3 scope, for reference:
 **Acceptance:** select-to-PRIMARY and middle-click round-trip against `wl-paste -p`;
 `Ctrl+Shift+C` round-trips against `wl-paste`; both interoperate with Chrome and nvim.
 
-### Phase 4 — links (≈1 week) — *your stated requirement*
+### Phase 4 — links (≈1 week) — *your stated requirement* — *in progress*
 
-- **OSC 8** explicit hyperlinks resolved through the per-pane registry.
-- **Plain-text URL scanner** over the grid: scheme allowlist, balanced-paren and
-  trailing-punctuation handling, and joining across `wrapped` rows.
-- **Hover**: underline the match and switch to a pointer via `cursor-shape-v1` while the
-  configured modifier is held (default `Ctrl`, so hover never fights selection).
-- **Click to open**: `posix_spawn` with an **argv array** — see §7, this is a real
-  security boundary, not a style preference.
-- **Hint mode**: keybind overlays a letter label on every visible match; press to open,
-  or with a modifier to copy the URL instead.
+**Plain-text scanning, hover and Ctrl+click done (2026-07-30).**
 
-**Acceptance:** click and hint-open both launch Chrome for `https://`, `file://`,
-`mailto:`. A line containing `https://x/$(id>/tmp/pwn)` opens harmlessly and creates no
-file. → **Switch to myterm as daily driver here.**
+- **`term/url.zig`** scans in *grid coordinates*, never on an extracted string. Hover
+  detection runs on pointer motion, which arrives at device rate; building a logical
+  line's text there would mean allocating on that path. A logical line can also be
+  thousands of rows long after wrapping.
+- **The scheme allowlist is the security boundary**, and it is the same list the launcher
+  enforces. There is no route from "text on screen" to "argument to a program" that skips
+  it: `javascript:`, `data:` and `vscode://` are simply not links.
+- **Trailing punctuation and unbalanced brackets are trimmed**, balanced ones kept —
+  both cases are common, `…/Foo_(bar)` needs its paren and `(see https://x/)` must not
+  steal one. Soft wraps are followed; hard breaks end the match.
+- **The leftmost scheme in a run wins**, so `https://host/r?u=https://other/` is one URL
+  with a colon in its path rather than two. A scheme must also start a word, or every
+  string ending in something scheme-shaped becomes a link.
+- **Hover underlines only while the modifier is held.** The underline is a promise that a
+  click *right now* opens that link, so showing it while you are merely reading would be
+  both noise and a lie. It draws in the foreground colour, not `ul` — it is our UI, not an
+  attribute the application asked for.
+- **The modifier is `Ctrl`**, which makes the pointer local exactly as `Shift` does, so a
+  link stays clickable while nvim holds the mouse. **This takes `Ctrl` away from the
+  planned `Ctrl`+drag block selection** — that moves to `Alt`+drag, which is also what
+  kitty and iTerm use. `Ctrl`+wheel is likewise ours, and phase 7 wants it for font size.
+- **`launch.zig` spawns with `posix_spawnp` and an argv array**, plus: the allowlist
+  re-checked (OSC 8 will carry URIs chosen freely by the writing process), no control
+  characters, a length cap, and **signals reset in the child** — dispositions survive
+  `exec`, and this process ignores SIGPIPE, the same trap already sprung once via the
+  shell. Handlers are reaped by a tracked-pid poll, because a bare `waitpid(-1)` would
+  steal the shell's exit status from `Pty.childExited` and a blocking wait would hang the
+  loop until the browser exits.
+
+**Method note — the test suite was not running.** `zig build test` covered almost nothing:
+Zig's test discovery follows *referenced* declarations, and in test mode nothing references
+`main`, so every module reached only through it was skipped. Found by breaking an assertion
+in `launch.zig` on purpose and watching the suite stay green. `main.zig` now has an explicit
+`test {}` block importing every file; the count went from a handful to 108.
+
+**Method note — the modifier could not be synthesized.** `swaymsg seat - cursor` presses
+buttons but cannot hold a modifier, no key-injection tool is installed, and `/dev/uinput` is
+root-only. So the scanner and the launcher are unit-tested (including that
+`https://x/$(id>/tmp/pwn)` stays one argument and that the hostile schemes are refused), but
+`Ctrl`+hover and `Ctrl`+click needed a human at the keyboard.
+
+**Still outstanding in this phase:**
+
+- **OSC 8** explicit hyperlinks. `Style.hyperlink` is already reserved for the id; what is
+  missing is the URI registry, its own reclamation pass, and OSC 8 parsing.
+- **Hint mode**: a keybind overlaying a letter label on every visible match. Needs the
+  renderer to draw cells that are not in the grid, which nothing else needs yet.
+
+**Acceptance:** click and hint-open both launch the desktop handler for `https://`,
+`file://`, `mailto:`. A line containing `https://x/$(id>/tmp/pwn)` opens harmlessly and
+creates no file. → **Switch to myterm as daily driver here.**
 
 ### Phase 5 — tabs and splits (≈3 weeks)
 

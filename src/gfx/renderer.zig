@@ -392,6 +392,22 @@ pub const Renderer = struct {
                     }
                 }
 
+                // A hovered link underlines even where the text carries no
+                // underline attribute of its own, and in the foreground colour
+                // rather than `ul` — the point is to show what a click will act on,
+                // not to render an attribute the application asked for.
+                const hovered = if (screen.hover) |h| h.contains(line, x) else false;
+                if (hovered and style.attrs.underline == .none) {
+                    const uy = @as(i64, cell_y) + font.baseline - font.underline_pos;
+                    self.solid(
+                        cell_x,
+                        uy,
+                        font.cell_w,
+                        @intCast(font.underline_thickness),
+                        fg,
+                    );
+                }
+
                 // Decorations reuse the foreground program as untextured solid
                 // rects, so they need no extra pass or shader.
                 if (style.attrs.underline != .none) {

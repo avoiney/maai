@@ -39,6 +39,13 @@ pub const Keyboard = struct {
     bindings: ?Bindings = null,
     /// Terminal modes that change how keys encode. Borrowed from the Screen.
     modes: ?*const Modes = null,
+    /// Called when the modifier state changes. Link hovering depends on whether
+    /// Ctrl is held, and without this the highlight would only appear once the
+    /// pointer next moved.
+    on_mods: ?struct {
+        ctx: *anyopaque,
+        changed: *const fn (*anyopaque) void,
+    } = null,
 
     /// Serial of the most recent input event. The compositor requires a recent one
     /// to accept a clipboard claim, which is what stops a background client from
@@ -361,6 +368,7 @@ fn handleModifiers(
     const self: *Keyboard = @ptrCast(@alignCast(data.?));
     const state = self.state orelse return;
     _ = c.xkb_state_update_mask(state, depressed, latched, locked, 0, 0, group);
+    if (self.on_mods) |h| h.changed(h.ctx);
 }
 
 fn handleRepeatInfo(

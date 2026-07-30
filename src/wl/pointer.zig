@@ -43,6 +43,14 @@ pub const Pointer = struct {
     /// touchpad's many small deltas still add up to whole lines.
     axis_accum: f64 = 0,
 
+    /// Serial of the last `enter`. cursor-shape-v1 requires it for every shape
+    /// change, not just the first.
+    enter_serial: u32 = 0,
+    /// Current shape, so a change per motion event does not become a request per
+    /// motion event. Null means unknown — the compositor resets the cursor on
+    /// `enter`, so the next request has to go out even if the shape is unchanged.
+    shape: ?Shape = null,
+
     pub fn attach(self: *Pointer, wl_pointer: *c.struct_wl_pointer) void {
         self.wl_pointer = wl_pointer;
         _ = c.wl_pointer_add_listener(wl_pointer, &pointer_listener, self);
@@ -58,15 +66,30 @@ pub const Pointer = struct {
         if (self.wl_pointer) |p| c.wl_pointer_release(p);
     }
 
-    /// An I-beam over the grid. Via cursor-shape-v1 the compositor picks the theme
-    /// and size, so we neither load an XCursor theme nor manage a cursor surface.
-    fn setTextCursor(self: *Pointer, serial: u32) void {
+    /// Via cursor-shape-v1 the compositor picks the theme and size, so we neither
+    /// load an XCursor theme nor manage a cursor surface.
+    pub const Shape = enum {
+        /// An I-beam over the grid.
+        text,
+        /// A hand over something clickable.
+        pointer,
+
+        fn value(self: Shape) u32 {
+            return switch (self) {
+                .text => c.WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_TEXT,
+                .pointer => c.WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_POINTER,
+            };
+        }
+    };
+
+    pub fn setShape(self: *Pointer, shape: Shape) void {
+        if (self.shape == shape) return;
         const dev = self.shape_device orelse return;
-        c.wp_cursor_shape_device_v1_set_shape(
-            dev,
-            serial,
-            c.WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_TEXT,
-        );
+        // The protocol wants the serial of the *enter* event, not of whatever
+        // prompted the change, so the entry serial is kept for exactly this.
+        if (self.enter_serial == 0) return;
+        c.wp_cursor_shape_device_v1_set_shape(dev, self.enter_serial, shape.value());
+        self.shape = shape;
     }
 };
 
@@ -97,7 +120,9 @@ fn handleEnter(
     const self: *Pointer = @ptrCast(@alignCast(data.?));
     self.x = fixedToDouble(sx);
     self.y = fixedToDouble(sy);
-    self.setTextCursor(serial);
+    self.enter_serial = serial;
+    self.shape = null;
+    self.setShape(.text);
 }
 
 fn handleLeave(
