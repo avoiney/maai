@@ -304,6 +304,10 @@ pub const default_bg = Rgb.rgb(0x19, 0x1a, 0x21);
 pub const default_cursor = Rgb.rgb(0x71, 0x9c, 0xd6);
 pub const selection_bg = Rgb.rgb(0x2b, 0x3b, 0x51);
 pub const selection_fg = Rgb.rgb(0xe4, 0xe4, 0xe5);
+/// Hint-mode labels. Deliberately loud: they cover real text, so they have to read
+/// as an overlay rather than as content.
+pub const hint_bg = Rgb.rgb(0xdb, 0xc0, 0x74);
+pub const hint_fg = Rgb.rgb(0x19, 0x1a, 0x21);
 
 pub const ansi16 = [16]Rgb{
     Rgb.rgb(0x39, 0x3b, 0x44), // 0 black

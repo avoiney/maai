@@ -552,7 +552,7 @@ Original phase 3 scope, for reference:
 **Acceptance:** select-to-PRIMARY and middle-click round-trip against `wl-paste -p`;
 `Ctrl+Shift+C` round-trips against `wl-paste`; both interoperate with Chrome and nvim.
 
-### Phase 4 — links (≈1 week) — *your stated requirement* — *in progress*
+### Phase 4 — links (≈1 week) — *your stated requirement* ✅ done (2026-07-30)
 
 **Plain-text scanning, hover and Ctrl+click done (2026-07-30).**
 
@@ -621,9 +621,33 @@ themselves. Zig's `@memcpy` asserts non-overlap in debug, so it aborted; in rele
 would have been silent corruption. `replace` now takes the compacted bytes and spans, and
 asserts the buffers are disjoint.
 
-**Still outstanding in this phase:** **hint mode** — a keybind overlaying a letter label on
-every visible match. Needs the renderer to draw cells that are not in the grid, which
-nothing else needs yet.
+**Hint mode (2026-07-30).** `Ctrl+Shift+U` labels every link on screen; a letter opens it,
+`Shift`+letter copies the target to CLIPBOARD.
+
+- **Labels come from the home row outward** (`asdfghjkl` then the rows above and below),
+  so the common case is one keystroke on a key the hand is already resting on.
+- **Labels are all one character or all two**, never a mix: a mix makes the first
+  keystroke ambiguous — you cannot tell whether to expect a second one.
+- **Hint mode swallows every key**, including ones that mean nothing to it. A keystroke
+  leaking to the shell from here would be typed into a command line hidden behind the
+  labels. Modifier presses are the exception, or holding `Shift` to copy would cancel the
+  mode before the label was typed.
+- **A label replaces its cell rather than drawing over it** — two glyphs in one cell is
+  illegible. The renderer finds a cell's label with a single moving index, because
+  `hints.collect` returns them in the same reading order the draw loop walks.
+- **Scanning uses `url.startsAt`**, not `find`: asking "does a URL begin here" is a scheme
+  comparison, whereas `find` walks back to the start of the run for every cell it is asked
+  about. Accepted matches are also skipped past, which is what stops
+  `https://a/?u=https://b/` from being labelled twice.
+- Hint spans are dropped on resize, for the same reason `Screen.resize` drops the hover
+  span: reflow renumbers lines, so every span would point at unrelated text.
+
+The renderer takes the hints as a *parameter* rather than reading them off the `Screen`,
+unlike `selection` and `hover`. Those are plain values the Screen can own; hint storage
+belongs to the caller, and parking a slice into `App` inside `Screen` would be a cycle
+waiting to dangle.
+
+**Phase 4 is complete.** → **Switch to myterm as daily driver.**
 
 **Acceptance:** click and hint-open both launch the desktop handler for `https://`,
 `file://`, `mailto:`. A line containing `https://x/$(id>/tmp/pwn)` opens harmlessly and

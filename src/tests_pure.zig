@@ -8,6 +8,7 @@
 test {
     _ = @import("term/cell.zig");
     _ = @import("term/grid.zig");
+    _ = @import("term/hints.zig");
     _ = @import("term/mouse.zig");
     _ = @import("term/screen.zig");
     _ = @import("term/selection.zig");

@@ -67,6 +67,18 @@ pub const Span = struct {
     }
 };
 
+/// A URL that begins *exactly* at `p`, if any.
+///
+/// Separate from `find` for hint mode, which walks every visible cell: asking "does
+/// one start here" is a scheme comparison, whereas `find` would walk back to the
+/// start of the run at every cell it is asked about.
+pub fn startsAt(grid: *const Grid, p: Point) ?Span {
+    if (p.line >= grid.count or p.x >= grid.cols) return null;
+    if (schemeAt(grid, p) == null) return null;
+    if (precededByAlnum(grid, p)) return null;
+    return extend(grid, p);
+}
+
 /// The URL under `at`, if any.
 pub fn find(grid: *const Grid, at: Point) ?Span {
     if (at.line >= grid.count or at.x >= grid.cols) return null;
@@ -97,24 +109,25 @@ pub fn find(grid: *const Grid, at: Point) ?Span {
         p = next(grid, p) orelse break;
     }
     const from = start orelse return null;
+    const span = extend(grid, from) orelse return null;
 
-    // Walk right to the end of the run.
+    // `at` may have been inside the punctuation `extend` trimmed, in which case the
+    // click was not on the link.
+    if (!span.contains(at.line, at.x)) return null;
+    return span;
+}
+
+/// From a confirmed scheme start, walk to the end of the run and trim.
+fn extend(grid: *const Grid, from: Point) ?Span {
     var end = from;
-    steps = 0;
+    var steps: usize = 0;
     while (next(grid, end)) |q| {
         if (!isBody(charAt(grid, q))) break;
         steps += 1;
         if (steps > max_run_cells) return null;
         end = q;
     }
-
-    end = trimEnd(grid, from, end);
-
-    // `at` may have been inside the punctuation we just trimmed, in which case the
-    // click was not on the link.
-    const span = Span{ .start = from, .end = end };
-    if (!span.contains(at.line, at.x)) return null;
-    return span;
+    return .{ .start = from, .end = trimEnd(grid, from, end) };
 }
 
 /// Extract a span as UTF-8. Caller owns the result.

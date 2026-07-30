@@ -20,6 +20,7 @@ const cellmod = @import("../term/cell.zig");
 const Screen = @import("../term/screen.zig").Screen;
 const Font = @import("../font/font.zig").Font;
 const GlyphCache = @import("glyph_cache.zig").GlyphCache;
+const Hint = @import("../term/hints.zig").Hint;
 
 const Rgb = cellmod.Rgb;
 
@@ -241,6 +242,10 @@ pub const Renderer = struct {
     pub fn draw(
         self: *Renderer,
         screen: *const Screen,
+        /// Hint-mode labels, in reading order. Passed rather than read off the
+        /// Screen because the storage belongs to the caller — unlike `selection`
+        /// and `hover`, which are plain values the Screen can own outright.
+        hints: []const Hint,
         cache: *GlyphCache,
         font: *const Font,
         viewport_w: u32,
@@ -249,7 +254,7 @@ pub const Renderer = struct {
     ) void {
         self.bg_list.clearRetainingCapacity();
         self.fg_list.clearRetainingCapacity();
-        self.build(screen, cache, font, pad);
+        self.build(screen, hints, cache, font, pad);
 
         const bg = cellmod.default_bg;
         c.glClearColor(
@@ -328,6 +333,7 @@ pub const Renderer = struct {
     fn build(
         self: *Renderer,
         screen: *const Screen,
+        hints: []const Hint,
         cache: *GlyphCache,
         font: *const Font,
         pad: Padding,
@@ -337,6 +343,10 @@ pub const Renderer = struct {
         const view_top = screen.grid.viewTop();
         const scrolled = screen.grid.view != 0;
 
+        // Hints arrive in reading order, the same order this loop walks, so one
+        // moving index finds the label for a cell without searching.
+        var hint_i: usize = 0;
+
         var y: u32 = 0;
         while (y < screen.grid.rows) : (y += 1) {
             const row = screen.grid.viewRow(y);
@@ -345,6 +355,34 @@ pub const Renderer = struct {
             while (x < screen.grid.cols) : (x += 1) {
                 const cell = row[x];
                 const style = screen.styles.get(cell.style);
+
+                while (hint_i < hints.len and hintEndsBefore(hints[hint_i], line, x)) {
+                    hint_i += 1;
+                }
+                if (hint_i < hints.len) {
+                    if (labelChar(hints[hint_i], line, x)) |ch| {
+                        // A label replaces the cell entirely. Drawing both would
+                        // overprint two glyphs in one cell.
+                        self.bg_list.append(self.gpa, .{
+                            .cell = .{ @intCast(x), @intCast(y) },
+                            .color = .{
+                                cellmod.hint_bg.r,
+                                cellmod.hint_bg.g,
+                                cellmod.hint_bg.b,
+                                cellmod.hint_bg.a,
+                            },
+                        }) catch {};
+                        self.emitGlyph(
+                            cache,
+                            font,
+                            pad.x + x * font.cell_w,
+                            pad.y + y * font.cell_h,
+                            ch,
+                            cellmod.hint_fg,
+                        );
+                        continue;
+                    }
+                }
 
                 var fg = style.fg;
                 var bg = style.bg;
@@ -527,4 +565,17 @@ fn compile(kind: c.GLenum, src: []const u8) Error!c.GLuint {
         return Error.ShaderCompile;
     }
     return shader;
+}
+
+/// Is this hint entirely behind the cell being drawn? Used to advance the moving
+/// index in `build`, which relies on hints arriving in reading order.
+fn hintEndsBefore(h: Hint, line: usize, x: u32) bool {
+    if (h.at.line != line) return h.at.line < line;
+    return x >= h.at.x + h.label_len;
+}
+
+fn labelChar(h: Hint, line: usize, x: u32) ?u21 {
+    if (h.at.line != line) return null;
+    if (x < h.at.x or x >= h.at.x + h.label_len) return null;
+    return h.label[x - h.at.x];
 }

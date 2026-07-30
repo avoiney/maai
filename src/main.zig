@@ -19,6 +19,7 @@ const vt = @import("vt/parser.zig");
 const sel = @import("term/selection.zig");
 const mouse = @import("term/mouse.zig");
 const urlmod = @import("term/url.zig");
+const hintsmod = @import("term/hints.zig");
 const launch = @import("launch.zig");
 const ptr = @import("wl/pointer.zig");
 const clip = @import("wl/clipboard.zig");
@@ -79,6 +80,14 @@ const App = struct {
 
     /// Launched URL handlers awaiting reaping.
     reaper: launch.Reaper = .{},
+
+    /// Hint mode: every visible link labelled, waiting for a label to be typed.
+    /// While active, every key belongs to us — none reach the child.
+    hint_on: bool = false,
+    hints: [hintsmod.max_hints]hintsmod.Hint = undefined,
+    hint_n: usize = 0,
+    hint_typed: [2]u8 = undefined,
+    hint_typed_len: u8 = 0,
 
     fn writeToPty(ctx: *anyopaque, bytes: []const u8) void {
         const self: *App = @ptrCast(@alignCast(ctx));
@@ -191,33 +200,115 @@ const App = struct {
     /// Open whatever is under the pointer, if it is a link. Returns true if it was.
     fn openLinkAt(self: *App, at: sel.Point) bool {
         const hit = self.linkUnder(at) orelse return false;
+        self.openLink(hit);
+        return true;
+    }
 
+    // ── hint mode ──────────────────────────────────────────────────────────
+
+    fn hintsEnter(self: *App) void {
+        self.hint_n = hintsmod.collect(self.screen, &self.hints);
+        self.hint_typed_len = 0;
+        self.hint_on = self.hint_n > 0;
+        if (self.debug) std.debug.print("hints: {d} labelled\n", .{self.hint_n});
+        self.needs_render = true;
+    }
+
+    fn hintsExit(self: *App) void {
+        self.hint_on = false;
+        self.hint_n = 0;
+        self.hint_typed_len = 0;
+        self.needs_render = true;
+    }
+
+    /// Handle one key while hint mode is up. Always consumes it: a stray keystroke
+    /// reaching the shell from here would be typed into a command line the user
+    /// cannot see behind the labels.
+    fn hintsKey(self: *App, sym: u32, shift: bool) void {
+        const ch: ?u8 = switch (sym) {
+            'a'...'z' => @intCast(sym),
+            // Shift is the copy modifier, so labels have to match case-insensitively.
+            'A'...'Z' => @intCast(sym + 32),
+            else => null,
+        };
+        // A modifier going down is not a keystroke to act on. Without this, holding
+        // Shift to copy would cancel the mode before the label was even typed.
+        switch (sym) {
+            c.XKB_KEY_Shift_L,
+            c.XKB_KEY_Shift_R,
+            c.XKB_KEY_Control_L,
+            c.XKB_KEY_Control_R,
+            c.XKB_KEY_Alt_L,
+            c.XKB_KEY_Alt_R,
+            c.XKB_KEY_Super_L,
+            c.XKB_KEY_Super_R,
+            c.XKB_KEY_Meta_L,
+            c.XKB_KEY_Meta_R,
+            c.XKB_KEY_ISO_Level3_Shift,
+            c.XKB_KEY_Caps_Lock,
+            c.XKB_KEY_Num_Lock,
+            => return,
+            else => {},
+        }
+
+        const letter = ch orelse {
+            // Escape, Enter, an arrow — anything that is not a label ends the mode.
+            self.hintsExit();
+            return;
+        };
+
+        self.hint_typed[self.hint_typed_len] = letter;
+        self.hint_typed_len += 1;
+        const typed = self.hint_typed[0..self.hint_typed_len];
+
+        switch (hintsmod.match(self.hints[0..self.hint_n], typed)) {
+            .partial => self.needs_render = true,
+            .miss => self.hintsExit(),
+            .hit => |i| {
+                const hint = self.hints[i];
+                // Copy the target out of the hint before leaving the mode, since
+                // exiting clears the array it lives in.
+                const link = Link{ .span = hint.span, .id = hint.id };
+                self.hintsExit();
+                if (shift) self.copyLink(link) else self.openLink(link);
+            },
+        }
+    }
+
+    /// The target of a link as UTF-8. Caller frees.
+    fn linkTarget(self: *App, link: Link) ?[]u8 {
         // An OSC 8 target lives in the link table, not in the cells: what is on
         // screen is the *label*, which is frequently not a URL at all.
-        var owned: ?[]u8 = null;
-        defer if (owned) |o| self.gpa.free(o);
-        const text = if (hit.id != 0)
-            self.screen.links.get(hit.id)
-        else blk: {
-            const t = urlmod.text(
-                self.gpa,
-                &self.screen.grid,
-                &self.screen.graphemes,
-                hit.span,
-            ) catch return false;
-            owned = t;
-            break :blk t;
-        };
+        if (link.id != 0) {
+            return self.gpa.dupe(u8, self.screen.links.get(link.id)) catch null;
+        }
+        return urlmod.text(
+            self.gpa,
+            &self.screen.grid,
+            &self.screen.graphemes,
+            link.span,
+        ) catch null;
+    }
+
+    fn openLink(self: *App, link: Link) void {
+        const text = self.linkTarget(link) orelse return;
+        defer self.gpa.free(text);
 
         if (self.debug) std.debug.print("link: opening '{s}'\n", .{text});
         if (launch.open(text)) |pid| {
             self.reaper.track(pid);
-            return true;
+            return;
         }
         // Rejected by the allowlist or the spawn failed. Say so rather than looking
         // like a click that did nothing.
         std.debug.print("myterm: refused to open '{s}'\n", .{text});
-        return true;
+    }
+
+    fn copyLink(self: *App, link: Link) void {
+        const text = self.linkTarget(link) orelse return;
+        defer self.gpa.free(text);
+        if (self.debug) std.debug.print("link: copying '{s}'\n", .{text});
+        self.win.clipboard.offer(.clipboard, text, self.win.keyboard.last_serial);
     }
 
     fn reportMouse(self: *App, ev: mouse.Event) void {
@@ -484,6 +575,12 @@ const App = struct {
         const self: *App = @ptrCast(@alignCast(ctx));
         const grid = &self.screen.grid;
 
+        // Hint mode swallows everything while it is up — see `hintsKey`.
+        if (self.hint_on) {
+            self.hintsKey(sym, shift);
+            return true;
+        }
+
         if (ctrl and shift) {
             switch (sym) {
                 c.XKB_KEY_C, c.XKB_KEY_c => {
@@ -492,6 +589,13 @@ const App = struct {
                 },
                 c.XKB_KEY_V, c.XKB_KEY_v => {
                     self.pasteFrom(.clipboard);
+                    return true;
+                },
+                // Label every link on screen; type a label to open it, or hold
+                // Shift while typing it to copy the target instead. This is the
+                // keyboard route to a URL — no pointer involved.
+                c.XKB_KEY_U, c.XKB_KEY_u => {
+                    self.hintsEnter();
                     return true;
                 },
                 else => {},
@@ -593,6 +697,7 @@ test {
     _ = @import("pty/pty.zig");
     _ = @import("term/cell.zig");
     _ = @import("term/grid.zig");
+    _ = @import("term/hints.zig");
     _ = @import("term/mouse.zig");
     _ = @import("term/screen.zig");
     _ = @import("term/selection.zig");
@@ -809,6 +914,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
 
         if (win.resized) {
+            // Reflow renumbers lines, so every hint span would point at unrelated
+            // text. The same reason `Screen.resize` drops the hover span.
+            app.hintsExit();
             gl.resize(win.width, win.height);
             dims = gridSize(win.width, win.height, &font, pad);
             try screen.resize(dims.cols, dims.rows);
@@ -838,7 +946,15 @@ fn render(
 ) void {
     const win = app.win;
 
-    renderer.draw(app.screen, cache, font, win.width, win.height, pad);
+    renderer.draw(
+        app.screen,
+        app.hints[0..app.hint_n],
+        cache,
+        font,
+        win.width,
+        win.height,
+        pad,
+    );
     app.needs_render = false;
 
     if (cache.exhausted) {
