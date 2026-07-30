@@ -38,6 +38,38 @@ comptées par un allocateur enveloppant.
 | parse CJK + combinantes (2 MiB) | — | 8,7 ms — 231 MiB/s |
 | 50k défilements de ligne | — | 2,7 ms |
 
+### Reprise du 2026-07-30, après la phase 6
+
+| Cas | Valeur | Remarque |
+|---|---|---|
+| parse ASCII (4 MiB) | 26,1–27,4 ms — ~150 MiB/s | inchangé |
+| truecolor SGR par cellule | 11,0–11,5 ms — ~176 MiB/s | voir ci-dessous |
+| parse CJK + combinantes | 8,4 ms — 237 MiB/s | inchangé |
+| reflow, largeur −1 | 11,5 ms · 19,2 MiB | inchangé, toujours ouvert |
+| reflow, hauteur −1 | 0,010 ms · 0,1 MiB | inchangé |
+| 50k défilements | 2,7 ms | inchangé |
+| 150k styles avec ramassage | 13,9 ms | inchangé |
+| **résolution des couleurs, 240×68** | **0,020 ms par trame** | nouveau cas |
+
+Le cas truecolor est passé de 10,1 à ~11,3 ms, ce qui ressemble à une régression de
+10 % introduite par l'indirection des couleurs. **Ce n'en est pas une.** Un A/B
+entrelacé — worktree git sur le commit précédant le changement, six exécutions en
+alternance sur la même machine au même moment — donne 11,2–11,7 ms *avant* contre
+11,2–11,5 ms *après*. C'est la ligne de base de référence qui avait été mesurée sur une
+machine au repos ; la machine est maintenant en usage réel. Le mécanisme allait de toute
+façon dans l'autre sens : le changement retire du travail du chemin SGR.
+
+Enseignement de méthode : un chiffre isolé comparé à un chiffre historique ne dit rien
+sur une machine dont l'état a changé. Seul l'A/B entrelacé tranche, et il coûte cinq
+minutes.
+
+Le nouveau cas `render:` existe parce que le changement de la phase 6 a déplacé du
+travail du temps d'analyse vers le temps de dessin, et que le dessin lie GL — donc il
+échappe à ce harnais. Ce qui est mesurable, c'est l'arithmétique : trois emplacements de
+couleur par cellule sur un écran de 16 320 cellules coûtent **0,020 ms par trame**, soit
+0,15 % du budget de 13 ms à 75 Hz. Le coût *ajouté* est une fraction de cela, la
+recherche dans la table de styles étant déjà là avant.
+
 Deux enseignements de la mesure :
 
 1. **Mon propre ramassage était quadratique.** Avec du truecolor par cellule chaque

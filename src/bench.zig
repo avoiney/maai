@@ -21,6 +21,8 @@ const Screen = @import("term/screen.zig").Screen;
 const gridmod = @import("term/grid.zig");
 const Grid = gridmod.Grid;
 const vt = @import("vt/parser.zig");
+const cellmod = @import("term/cell.zig");
+const thememod = @import("term/theme.zig");
 
 /// Runs per case. Small on purpose: the whole suite must stay quick enough to run
 /// after a change, or it stops being run at all.
@@ -120,6 +122,85 @@ pub fn main() !void {
     try benchReflowHeightOnly(gpa);
     try benchScroll(gpa);
     try benchStyleChurn(gpa);
+    try benchResolveColors(gpa);
+}
+
+// ── rendering ───────────────────────────────────────────────────────────────
+
+/// The per-cell work the renderer added when colour resolution moved from parse time
+/// to draw time.
+///
+/// This exists because the change is invisible to every other case here: it took work
+/// *out* of SGR handling and put it into the draw loop, which links GL and so cannot
+/// be measured in this harness. What can be measured is the arithmetic itself, over a
+/// screen's worth of cells at the resolution the renderer performs — three slots per
+/// cell, fg, bg and underline.
+///
+/// The comparison that matters is against reading a stored `Rgb` directly, which is
+/// what the old code did. If the difference were anywhere near a frame budget the
+/// indirection would not be worth having.
+fn benchResolveColors(gpa: std.mem.Allocator) !void {
+    const cols = 240;
+    const rows = 68;
+
+    var screen = try Screen.init(gpa, cols, rows);
+    defer screen.deinit();
+    var parser = vt.Parser(Screen).init(&screen);
+
+    // A mix of the three slot kinds, since they cost different amounts: default is a
+    // branch, indexed adds a table read, rgb unpacks in place.
+    var i: usize = 0;
+    while (i < cols * rows) : (i += 1) {
+        var tmp: [48]u8 = undefined;
+        const seq = switch (i % 3) {
+            0 => try std.fmt.bufPrint(&tmp, "\x1b[3{d}mX", .{i % 8}),
+            1 => try std.fmt.bufPrint(&tmp, "\x1b[38;2;{d};{d};{d}mX", .{
+                i % 256,
+                (i / 256) % 256,
+                7,
+            }),
+            else => try std.fmt.bufPrint(&tmp, "\x1b[0mX", .{}),
+        };
+        parser.feed(seq);
+    }
+
+    const frames = 100;
+    var min: u64 = std.math.maxInt(u64);
+    var max: u64 = 0;
+    var run: usize = 0;
+    while (run <= runs) : (run += 1) {
+        const t0 = nowNs();
+        var sink: u64 = 0;
+        for (0..frames) |_| {
+            var y: u32 = 0;
+            while (y < screen.grid.rows) : (y += 1) {
+                for (screen.grid.viewRow(y)) |cell| {
+                    const st = screen.styles.get(cell.style);
+                    const fg = screen.theme.resolve(st.fg, .fg);
+                    const bg = screen.theme.resolve(st.bg, .bg);
+                    const ul = screen.theme.resolve(st.ul, .ul);
+                    // Consumed so the loop cannot be optimised away.
+                    sink +%= fg.r +% bg.g +% ul.b;
+                }
+            }
+        }
+        std.mem.doNotOptimizeAway(sink);
+        const dt: u64 = @intCast(nowNs() - t0);
+        if (run == 0) continue;
+        min = @min(min, dt);
+        max = @max(max, dt);
+    }
+
+    const per_frame_us = @as(f64, @floatFromInt(min)) / 1000.0 / frames;
+    (Result{
+        .name = "render: resolve 240x68 colours x100",
+        .min_ns = min,
+        .max_ns = max,
+    }).report();
+    std.debug.print(
+        "{s:<38} {d:>9.3} ms  per frame ({d} cells, 3 slots each)\n",
+        .{ "  -> per frame", per_frame_us / 1000.0, cols * rows },
+    );
 }
 
 // ── parsing ─────────────────────────────────────────────────────────────────
