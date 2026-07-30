@@ -647,6 +647,20 @@ unlike `selection` and `hover`. Those are plain values the Screen can own; hint 
 belongs to the caller, and parking a slice into `App` inside `Screen` would be a cycle
 waiting to dangle.
 
+**Verified interactively (2026-07-30)**, since none of it could be scripted — all 13 cases
+on a purpose-built screen: trailing punctuation and surrounding parens trimmed, *internal*
+parens kept (`…/Zig_(langage)`), two URLs on one line labelled separately, an OSC 8 label
+that is not a URL resolving to its declared target, a URL soft-wrapped across the right
+edge coming back whole, `https://x/$(id>/tmp/pwn)` arriving as one argv element with no
+file created, and `javascript:`/`data:`/`vscode://` producing no link at all — as plain
+text *and* as an OSC 8 payload. Hint labels, open, and Shift-to-copy all behave.
+
+Method that worked, worth reusing: a fake `xdg-open` prepended to `PATH` that logs its
+argv, with helper commands dropped in the same directory so they land on the child's PATH.
+Clicking twelve links then costs no browser tabs. A harness bug to remember: the first
+screen printed *before* the compositor's resize, so `stty size` still reported the
+pre-configure width and the wrapped-URL case did not wrap.
+
 **Phase 4 is complete.** → **Switch to myterm as daily driver.**
 
 **Acceptance:** click and hint-open both launch the desktop handler for `https://`,
