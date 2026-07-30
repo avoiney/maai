@@ -67,13 +67,25 @@ pub const Cell = packed struct(u64) {
     /// set. `empty` means nothing has been written here.
     content: u32 = empty,
     style: u16 = 0,
-    /// 0 = narrow, 1 = leading half of a wide glyph, 2 = trailing spacer.
+    /// 0 = narrow, 1 = leading half of a wide glyph, 2 = trailing spacer,
+    /// 3 = blank left behind because a wide glyph could not finish the row.
+    ///
+    /// The distinction between 0 and 3 exists for reflow. A wide pair that will not fit
+    /// at the end of a row moves whole to the next one, and the column it vacates is
+    /// *padding*, not a space the user typed. Stored as an ordinary blank it becomes
+    /// content on the next reflow, so narrowing and widening again inserted a space
+    /// that was never there — cumulatively, once per resize.
     wide: u2 = 0,
     grapheme: bool = false,
     dirty: bool = false,
     _pad: u12 = 0,
 
     pub const empty: u32 = 0;
+
+    /// Blank inserted to keep a wide pair whole. Never content.
+    pub fn isWrapPadding(self: Cell) bool {
+        return self.wide == 3;
+    }
 
     pub fn isBlank(self: Cell) bool {
         // When `grapheme` is set, `content` is an index into the cluster table, not

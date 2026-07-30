@@ -370,6 +370,13 @@ pub const Screen = struct {
         // leaving the final column blank.
         if (w == 2 and self.cursor_x + 2 > self.grid.cols) {
             if (!self.autowrap) return;
+            // Mark the column being vacated, for the same reason reflow does: it is
+            // padding, not a space, and a later reflow must not promote it to content.
+            var px = self.cursor_x;
+            while (px < self.grid.cols) : (px += 1) {
+                self.grid.at(px, self.cursor_y).* = .{ .content = ' ', .wide = 3 };
+            }
+            self.grid.markWide(self.cursor_y);
             self.grid.rowMeta(self.cursor_y).wrapped = true;
             self.cursor_x = 0;
             self.lineFeed();

@@ -360,19 +360,33 @@ pub const Grid = struct {
         x: u32 = 0,
 
         /// The cell travels *with* the step, so the caller never looks it up again.
-        const Step = struct { row: usize, x: u32, off: usize, w: u8, cell: Cell };
+        ///
+        /// `pad` is how many columns at the end of the *previous* destination row this
+        /// step's row break left empty. They have to be written as padding rather than
+        /// left as blanks, or the next reflow reads them as content.
+        const Step = struct {
+            row: usize,
+            x: u32,
+            off: usize,
+            w: u8,
+            cell: Cell,
+            pad: u32 = 0,
+        };
 
         fn next(self: *Wrap) ?Step {
             while (self.off < self.len) {
                 const src = self.take();
 
-                // Spacers carry no content; the lead reproduces them.
-                if (src.wide == 2) continue;
+                // Spacers carry no content; the lead reproduces them. Padding is not
+                // content at all — skipping it here is what stops it accumulating.
+                if (src.wide == 2 or src.wide == 3) continue;
 
                 const w: u8 = if (src.wide == 1) 2 else 1;
+                var pad: u32 = 0;
                 // The `x > 0` guard keeps a width-1 grid from looping forever on a
                 // wide character that can never fit.
                 if (self.x > 0 and self.x + w > self.cols) {
+                    pad = self.cols - self.x;
                     self.row += 1;
                     self.x = 0;
                 }
@@ -382,6 +396,7 @@ pub const Grid = struct {
                     .off = self.off - 1,
                     .w = w,
                     .cell = src,
+                    .pad = pad,
                 };
                 self.x += w;
                 return step;
@@ -656,6 +671,18 @@ pub const Grid = struct {
                 if (grow < drop) continue;
                 const di = grow - drop;
                 if (di >= new_cap) break;
+
+                // Fill what the row break vacated, on the row we just left.
+                if (st.pad > 0 and di > 0) {
+                    const prev = &buf[di - 1];
+                    var px = cols - st.pad;
+                    while (px < cols) : (px += 1) {
+                        prev.cells[px] = .{ .content = ' ', .wide = 3 };
+                    }
+                    // That row now needs the walker on the next reflow, even though the
+                    // wide character itself went to the row after it.
+                    prev.has_wide = true;
+                }
 
                 const src = st.cell;
                 buf[di].cells[st.x] = src;

@@ -162,11 +162,17 @@ propriété d'**équivalence des deux chemins** (même contenu, une fois avec le
 marquées `has_wide` pour forcer le walker — les deux dispositions doivent être
 identiques).
 
-## Le reflow n'est pas propre en aller-retour avec du double largeur
+## Le reflow n'est pas propre en aller-retour avec du double largeur — **corrigé**
 
 **Sévérité : moyenne — insertion silencieuse de caractères, cumulative.**
 **Trouvé le 2026-07-30 par la propriété d'aller-retour ci-dessus. Antérieur au travail
-de la phase 6 : vérifié en remisant le changement, l'échec persiste.**
+de la phase 6 : vérifié en remisant le changement, l'échec persistait.**
+**Corrigé le 2026-07-30 : `Cell.wide == 3` marque le remplissage d'enroulement. Le
+walker le saute à la lecture comme il saute déjà les cellules d'espacement, donc il ne
+redevient jamais du contenu ; l'émission l'écrit à la place du blanc qu'elle laissait, et
+l'autowrap du terminal fait de même quand c'est lui qui casse la ligne. La sélection ne le
+copie pas. La propriété d'aller-retour inclut désormais trois cas à caractères larges,
+dont un qui alterne étroit et large à chaque colonne.**
 
 Quand une paire double largeur ne peut pas finir une rangée, le walker la déplace
 entière sur la suivante et laisse la dernière colonne blanche. **Cette colonne est

@@ -1071,7 +1071,8 @@ fn snapshot(gpa: std.mem.Allocator, s: *const Screen) ![]u8 {
     while (line < s.grid.count) : (line += 1) {
         const row = s.grid.line(line);
         for (row.cells) |cell| {
-            if (cell.wide == 2) continue;
+            // Spacers and wrap padding are not content.
+            if (cell.wide == 2 or cell.wide == 3) continue;
             if (cell.grapheme) {
                 for (s.graphemes.get(cell.content)) |cp| {
                     var b: [4]u8 = undefined;
@@ -1103,11 +1104,14 @@ test "reflow round-trips through a range of widths" {
         "a line of exactly twenty",
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "mixed 123 !@# and more text to push past a row",
-        // Wide characters are deliberately absent: reflow is *not* round-trip clean
-        // for them, and that predates the bulk-copy path — see BUGS.md. When a wide
-        // pair cannot finish a row it moves whole to the next one, and the blank
-        // column it leaves behind is stored as ordinary content, so widening again
-        // inserts a space that was never in the text.
+        // Wide characters included: they take the walker rather than the bulk copy, and
+        // they are the case that used to fail. A pair that cannot finish a row moves
+        // whole to the next one, and the column it vacates is now marked as *padding*
+        // rather than stored as a space — otherwise each resize inserted one more
+        // character that was never typed.
+        "cjk 日本語 mixed with latin text here",
+        "日本語日本語日本語日本語日本語日本語日本語",
+        "a日b日c日d日e日f日g日h日i日j日k日l日m",
     }) |text| {
         var s = try Screen.initScrollback(gpa, 20, 4, 64);
         defer s.deinit();

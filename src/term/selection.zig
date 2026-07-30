@@ -154,8 +154,8 @@ pub const Selection = struct {
             const keep = if (block or !row.wrapped) trimmedLen(slice) else slice.len;
 
             for (slice[0..keep]) |cell| {
-                // A spacer carries no content of its own.
-                if (cell.wide == 2) continue;
+                // A spacer carries no content of its own, and padding is not content.
+                if (cell.wide == 2 or cell.wide == 3) continue;
                 if (cell.grapheme) {
                     for (graphemes.get(cell.content)) |cp| try appendCp(&out, gpa, cp);
                 } else if (cell.content == Cell.empty) {
