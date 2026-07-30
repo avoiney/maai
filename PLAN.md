@@ -522,11 +522,57 @@ a wheel — sway maps those to `BTN_SIDE`/`BTN_EXTRA`, and they arrive as button
 The compositor cannot synthesize axis events at all, so the wheel path was confirmed from
 real device input in the same capture rather than driven deliberately.
 
-**Still outstanding in this phase:** the Kitty keyboard protocol and legacy
-modifyOtherKeys (the sequences are currently recognised and ignored); xkbcommon-compose for
-dead keys; focus reporting (1004 is tracked but `CSI I`/`CSI O` are never sent); a
-keyboard-driven visual select mode; configurable bindings; and a confirmation prompt for
-multi-line pastes, which needs UI that does not exist yet.
+**Dead keys (2026-07-30).** `^` was unusable, and this was a correctness bug rather than a
+missing feature: the layout here is French AZERTY, where `AD11` emits `dead_circumflex`.
+A dead keysym has no UTF-8 of its own, so `xkb_state_key_get_utf8` returned zero bytes,
+`encode` returned null, and the key silently produced nothing *while holding no state* —
+so the following letter arrived bare. `être` came out as `etre`, with no error anywhere.
+`xkbcommon-compose` now intercepts before the function-key tables and before xkb's own
+translation. An invalid sequence is dropped rather than emitting the raw key, following
+xkbcommon's documented handling. A missing Compose table is not fatal.
+
+Fixed alongside: a key producing nothing left a running repeat armed, so holding `a` and
+then tapping `^` kept streaming `a`.
+
+**Kitty keyboard protocol — flag 1 only (2026-07-30).** Negotiation is complete: push
+(`CSI > flags u`), pop (`CSI < n u`), set (`CSI = flags ; mode u`) and query (`CSI ? u`).
+Unsupported bits are masked off and the query reports what actually took effect — that is
+the protocol working, not a shortcut. Claiming a flag we do not implement is what breaks
+applications; an application that queries and is told `1` knows exactly what it gets.
+
+Flag 1, "disambiguate escape codes", is the one that carries the value:
+
+  - `Esc` reports as `CSI 27u`, so an application no longer has to wait and see whether
+    more bytes follow. nvim's `ttimeoutlen` exists solely to work around not having this.
+  - `Ctrl+I` reports as `CSI 105;5u`, distinct from `Tab` — both are 0x09 in legacy, which
+    is why `<C-i>` cannot be mapped in nvim without losing the tab key.
+  - `Shift+Enter` reports as `CSI 13;2u`, a combination legacy cannot express at all.
+    This is what lets Claude Code take a newline instead of sending the message.
+
+**`Ctrl+C` deliberately keeps its control byte.** 0x03 is unambiguous, and reporting it as
+an escape sequence would mean the line discipline never sees it — a program that enabled
+the mode and then died would leave a shell that cannot be interrupted. Only keys legacy
+cannot express *unambiguously* are reported: `Esc`, the colliding `Ctrl+I/M/H/J/[/@/Space`,
+anything with `Ctrl+Shift` (legacy collapses those onto the same C0 byte), modified
+`Enter`/`Tab`/`Backspace`, and combinations where xkb yields no bytes at all — detected by
+asking xkb rather than enumerating a table, since which keys those are is entirely
+layout-dependent. This is a documented subset of flag 1, not the whole of it.
+
+**The flags stack lives per screen buffer**, swapped with the grids on 1049, as kitty does.
+That is a safety property: a full-screen application that enables the protocol and dies
+without popping cannot leave the shell with an encoding it never asked for.
+
+Both are tested without a keyboard, which nothing here can drive. `compose` takes a keysym,
+so `dead_circumflex, e` feeds directly; and an xkb keymap can be built from layout *names*,
+so the encoder can be asked what it would send for `Ctrl+I` on a real `fr` keymap with
+Control held. That covers the disambiguation table, the base codepoint ignoring shift, and
+the property that matters most — with no modifier held, every key falls through to exactly
+the bytes it produced before the protocol existed.
+
+**Still outstanding in this phase:** legacy modifyOtherKeys; kitty flags 2/4/8/16; focus
+reporting (1004 is tracked but `CSI I`/`CSI O` are never sent); a keyboard-driven visual
+select mode; configurable bindings; and a confirmation prompt for multi-line pastes, which
+needs UI that does not exist yet.
 
 Original phase 3 scope, for reference:
 

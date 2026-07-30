@@ -80,6 +80,10 @@ const Gc = struct {
     }
 };
 
+fn maskKittyFlags(raw: u16) u5 {
+    return @intCast(raw & kitty_supported);
+}
+
 const SavedCursor = struct {
     x: u32 = 0,
     y: u32 = 0,
@@ -104,7 +108,39 @@ pub const Modes = struct {
     /// Defaults on, as in xterm: without it the wheel does nothing at all in `less`
     /// or `man`, which is the single most common wheel use in a terminal.
     alternate_scroll: bool = true,
+    /// Kitty keyboard protocol flags currently in effect. Zero means the legacy
+    /// encoding, which is the default and must stay byte-identical to what it was
+    /// before this protocol existed.
+    kitty_flags: u5 = 0,
 };
+
+/// Kitty keyboard protocol: what we implement.
+///
+/// **Only flag 1, "disambiguate escape codes".** That is the flag that carries the
+/// value: it makes `Esc` unambiguous, separates `Ctrl+I` from `Tab` and `Ctrl+M` from
+/// `Enter`, and gives combinations legacy cannot express at all — `Shift+Enter`,
+/// `Ctrl+Enter` — an encoding.
+///
+/// The others are deliberately not claimed:
+///
+///   - 2 (event types) would need a release report for *every* key, which only makes
+///     sense together with flag 8.
+///   - 4 (alternate keys) needs the shifted and base-layout keysym per key; useful for
+///     layout-independent shortcuts, not for anything asked for here.
+///   - 8 (report all keys as escape codes) takes over `Enter`, `Tab` and `Backspace`
+///     wholesale.
+///   - 16 (associated text) is near-vacuous without 8, since the keys we report have
+///     no text.
+///
+/// Masking unsupported bits off is not a shortcut, it is the protocol working: an
+/// application queries with `CSI ? u`, is told exactly which flags took effect, and
+/// falls back for the rest. Claiming a flag we do not implement is what would break
+/// applications.
+pub const kitty_supported: u5 = 1;
+
+/// Depth of the flags stack. Applications push on entry and pop on exit; a bounded
+/// stack means a program that pushes in a loop cannot grow our memory.
+pub const kitty_stack_max = 16;
 
 pub const Screen = struct {
     gpa: std.mem.Allocator,
@@ -165,6 +201,19 @@ pub const Screen = struct {
 
     saved: SavedCursor = .{},
     other_saved: SavedCursor = .{},
+
+    /// Saved keyboard flags, and the same for the inactive screen.
+    ///
+    /// Per screen buffer, as kitty does, and it is a safety property rather than
+    /// tidiness: a full-screen application that enables the protocol and then dies
+    /// without popping would otherwise leave the *shell* with a keyboard encoding it
+    /// does not understand. Swapping the stack on 1049 means leaving the alternate
+    /// screen restores whatever the shell had.
+    kitty_stack: [kitty_stack_max]u5 = @splat(0),
+    kitty_depth: usize = 0,
+    other_kitty_flags: u5 = 0,
+    other_kitty_stack: [kitty_stack_max]u5 = @splat(0),
+    other_kitty_depth: usize = 0,
 
     /// One entry per column; true where a tab stop sits.
     tab_stops: []bool,
@@ -517,11 +566,11 @@ pub const Screen = struct {
                 'h' => if (private == '?') self.decPrivateMode(params, true),
                 'l' => if (private == '?') self.decPrivateMode(params, false),
                 'c' => if (private == '>') self.deviceAttributes('>'),
+                'u' => self.kittyKeyboard(private, params),
                 // Recognised and deliberately inert: DECDSR (`CSI ? Ps n`),
-                // XTMODKEYS (`CSI > Ps m`), XTVERSION (`CSI > Ps q`), and the kitty
-                // keyboard protocol's push/pop (`CSI > Ps u`, `CSI < u`). The
-                // keyboard protocols are phase 3; until then, silently ignoring
-                // them leaves applications on their legacy encodings, which works.
+                // XTMODKEYS (`CSI > Ps m`) and XTVERSION (`CSI > Ps q`). Legacy
+                // modifyOtherKeys is not implemented; applications that ask for it
+                // and get no reply stay on their legacy encodings, which works.
                 else => {},
             }
             self.dirty = true;
@@ -1046,6 +1095,58 @@ pub const Screen = struct {
         }
     }
 
+    /// The kitty keyboard protocol's mode negotiation, all four of its forms.
+    fn kittyKeyboard(self: *Screen, private: u8, params: *const parser.Params) void {
+        switch (private) {
+            // `CSI > flags u` — push the current flags, then set.
+            '>' => {
+                if (self.kitty_depth < kitty_stack_max) {
+                    self.kitty_stack[self.kitty_depth] = self.modes.kitty_flags;
+                    self.kitty_depth += 1;
+                }
+                // Saturate rather than drop the request: an application that pushed
+                // too deep still gets the mode it asked for, it just cannot restore
+                // as far back. Dropping it would leave it encoding for a mode that
+                // is not active.
+                self.modes.kitty_flags = maskKittyFlags(params.get(0, 0));
+            },
+            // `CSI < n u` — pop n entries, default 1.
+            '<' => {
+                var n = params.get(0, 1);
+                if (n == 0) n = 1;
+                while (n > 0 and self.kitty_depth > 0) : (n -= 1) {
+                    self.kitty_depth -= 1;
+                    self.modes.kitty_flags = self.kitty_stack[self.kitty_depth];
+                }
+            },
+            // `CSI = flags ; mode u` — 1 replaces, 2 sets bits, 3 clears bits.
+            '=' => {
+                const want = maskKittyFlags(params.get(0, 0));
+                switch (params.get(1, 1)) {
+                    1 => self.modes.kitty_flags = want,
+                    2 => self.modes.kitty_flags |= want,
+                    3 => self.modes.kitty_flags &= ~want,
+                    else => {},
+                }
+            },
+            // `CSI ? u` — report what actually took effect.
+            //
+            // Answered, unlike the title and colour queries, because this reply *is*
+            // the negotiation: without it an application cannot know the protocol
+            // exists and stays on legacy forever. It is also safe in a way those are
+            // not — the value is a small integer this terminal chose, not text the
+            // remote side supplied.
+            '?' => {
+                var buf: [16]u8 = undefined;
+                const out = std.fmt.bufPrint(&buf, "\x1b[?{d}u", .{
+                    self.modes.kitty_flags,
+                }) catch return;
+                self.respond(out);
+            },
+            else => {},
+        }
+    }
+
     /// Switch between the primary and alternate screen.
     ///
     /// The two grids are swapped by value rather than behind a pointer, so `Screen`
@@ -1069,6 +1170,11 @@ pub const Screen = struct {
         }
 
         std.mem.swap(Grid, &self.grid, &self.other);
+        // The keyboard mode belongs to the buffer, so an application that dies on the
+        // alternate screen cannot leave the shell with an encoding it never asked for.
+        std.mem.swap(u5, &self.modes.kitty_flags, &self.other_kitty_flags);
+        std.mem.swap([kitty_stack_max]u5, &self.kitty_stack, &self.other_kitty_stack);
+        std.mem.swap(usize, &self.kitty_depth, &self.other_kitty_depth);
         self.in_alt = enable;
 
         // Margins belong to the buffer being left behind.
@@ -1107,6 +1213,9 @@ pub const Screen = struct {
         self.margin_bottom = self.grid.rows - 1;
         self.modes = .{};
         self.mouse = .{};
+        self.kitty_depth = 0;
+        self.other_kitty_flags = 0;
+        self.other_kitty_depth = 0;
         self.sync_output = false;
         self.resetTabs();
         self.grid.clearVisible(0);
@@ -2050,6 +2159,88 @@ test "hyperlinks referenced only from scrollback survive collection" {
     // And the surviving cells still resolve to the right URI.
     const hit = s.hyperlinkAt(.{ .line = 0, .x = 0 }) orelse return error.NoHyperlink;
     try std.testing.expectEqualStrings("https://kept/", s.links.get(hit.id));
+}
+
+test "kitty keyboard flags push, pop, set and report" {
+    var s = try Screen.init(std.testing.allocator, 10, 3);
+    defer s.deinit();
+
+    var sink = Sink{};
+    s.reply = .{ .ctx = &sink, .write = Sink.write };
+
+    // Nothing asked for: legacy, and the query says so. An application reads this and
+    // knows to stay on its legacy encodings.
+    feed(&s, "\x1b[?u");
+    try std.testing.expectEqualStrings("\x1b[?0u", sink.got());
+
+    // Push, as an application does on entry.
+    sink.len = 0;
+    feed(&s, "\x1b[>1u\x1b[?u");
+    try std.testing.expectEqualStrings("\x1b[?1u", sink.got());
+
+    // Unsupported bits are masked off, and the query reports what actually took
+    // effect — claiming a flag we do not implement is what would break applications.
+    sink.len = 0;
+    feed(&s, "\x1b[>31u\x1b[?u");
+    try std.testing.expectEqualStrings("\x1b[?1u", sink.got());
+
+    // Pop twice, back to legacy.
+    sink.len = 0;
+    feed(&s, "\x1b[<2u\x1b[?u");
+    try std.testing.expectEqualStrings("\x1b[?0u", sink.got());
+    try std.testing.expectEqual(@as(usize, 0), s.kitty_depth);
+
+    // `CSI = flags ; mode u`: 1 replaces, 2 sets bits, 3 clears them.
+    feed(&s, "\x1b[=1;1u");
+    try std.testing.expectEqual(@as(u5, 1), s.modes.kitty_flags);
+    feed(&s, "\x1b[=1;3u");
+    try std.testing.expectEqual(@as(u5, 0), s.modes.kitty_flags);
+    feed(&s, "\x1b[=1;2u");
+    try std.testing.expectEqual(@as(u5, 1), s.modes.kitty_flags);
+}
+
+test "popping an empty stack and pushing past the limit stay bounded" {
+    var s = try Screen.init(std.testing.allocator, 10, 3);
+    defer s.deinit();
+
+    // A pop with nothing pushed must not underflow.
+    feed(&s, "\x1b[<u\x1b[<9u");
+    try std.testing.expectEqual(@as(usize, 0), s.kitty_depth);
+
+    // Pushing in a loop must not grow anything. The mode still takes effect at the
+    // ceiling — dropping the request would leave the application encoding for a mode
+    // that is not active.
+    for (0..kitty_stack_max + 8) |_| feed(&s, "\x1b[>1u");
+    try std.testing.expectEqual(kitty_stack_max, s.kitty_depth);
+    try std.testing.expectEqual(@as(u5, 1), s.modes.kitty_flags);
+}
+
+test "the keyboard mode belongs to its screen buffer" {
+    var s = try Screen.init(std.testing.allocator, 10, 3);
+    defer s.deinit();
+
+    // A full-screen application enables the protocol on the alternate screen...
+    feed(&s, "\x1b[?1049h\x1b[>1u");
+    try std.testing.expectEqual(@as(u5, 1), s.modes.kitty_flags);
+
+    // ...and dies without popping. Leaving the alternate screen must restore what the
+    // shell had, or the shell would be left with an encoding it never asked for — and
+    // in particular one where its keys arrive as escape sequences.
+    feed(&s, "\x1b[?1049l");
+    try std.testing.expectEqual(@as(u5, 0), s.modes.kitty_flags);
+
+    // And going back finds the application's mode again.
+    feed(&s, "\x1b[?1049h");
+    try std.testing.expectEqual(@as(u5, 1), s.modes.kitty_flags);
+}
+
+test "RIS clears the keyboard mode" {
+    var s = try Screen.init(std.testing.allocator, 10, 3);
+    defer s.deinit();
+    feed(&s, "\x1b[>1u");
+    feed(&s, "\x1bc");
+    try std.testing.expectEqual(@as(u5, 0), s.modes.kitty_flags);
+    try std.testing.expectEqual(@as(usize, 0), s.kitty_depth);
 }
 
 test "mouse tracking modes are independent bits" {

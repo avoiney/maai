@@ -201,6 +201,94 @@ pub const Keyboard = struct {
         }
     }
 
+    // ── kitty keyboard protocol ─────────────────────────────────────────────
+
+    /// Base codepoint of a key: what it produces with no modifiers, in the current
+    /// layout.
+    ///
+    /// Level 0 rather than `xkb_state_key_get_one_sym`, which applies the modifiers —
+    /// the protocol wants the key's identity, so `Shift+A` and `a` report the same 97.
+    fn baseCodepoint(self: *Keyboard, keycode: u32) u32 {
+        const km = self.keymap orelse return 0;
+        const st = self.state orelse return 0;
+        const layout = c.xkb_state_key_get_layout(st, keycode);
+
+        var syms: [*c]const c.xkb_keysym_t = undefined;
+        const n = c.xkb_keymap_key_get_syms_by_level(km, keycode, layout, 0, &syms);
+        if (n < 1) return 0;
+        return c.xkb_keysym_to_utf32(syms[0]);
+    }
+
+    /// C0 bytes that two different keys can both produce, which is the ambiguity the
+    /// protocol exists to remove.
+    ///
+    /// `Ctrl+I` and `Tab` are both 0x09; `Ctrl+M` and `Enter` both 0x0D; `Ctrl+[` and
+    /// `Esc` both 0x1B; `Ctrl+H` collides with Backspace's other convention; `Ctrl+J`
+    /// with the newline a pasted line carries; `Ctrl+Space` and `Ctrl+@` are both NUL.
+    fn collidesAsControl(cp: u32) bool {
+        return switch (cp) {
+            'i', 'm', '[', 'h', 'j', ' ', '@' => true,
+            else => false,
+        };
+    }
+
+    /// Encode a key under the protocol, or null when the legacy form is correct.
+    ///
+    /// Only flag 1 is implemented (see `Screen.kitty_supported`), so this reports the
+    /// keys legacy cannot express *unambiguously* and leaves everything else alone.
+    /// That conservatism is deliberate: sending `Ctrl+C` as an escape sequence would
+    /// mean the line discipline never sees 0x03, and a program that enabled the mode
+    /// and died would leave a shell that cannot be interrupted. The per-screen flags
+    /// stack guards against that too, but not sending it is a stronger guarantee.
+    fn encodeKitty(self: *Keyboard, keycode: u32, sym: u32, buf: []u8) ?[]const u8 {
+        const m = self.activeMods();
+        const mods: u8 = 1 +
+            (if (m.shift) @as(u8, 1) else 0) +
+            (if (m.alt) @as(u8, 2) else 0) +
+            (if (m.ctrl) @as(u8, 4) else 0);
+
+        const code: u32 = switch (sym) {
+            // Escape always reports. This is the headline of flag 1: an application
+            // can tell Esc from the start of an escape sequence *immediately*, instead
+            // of waiting to see whether more bytes arrive. nvim's `ttimeoutlen` exists
+            // solely to work around not having this.
+            c.XKB_KEY_Escape => 27,
+            // Modified only: plain Enter/Tab/Backspace have unambiguous legacy bytes,
+            // and taking them over is flag 8's job, which we do not claim.
+            c.XKB_KEY_Return, c.XKB_KEY_KP_Enter => if (m.ctrl or m.shift) 13 else return null,
+            // Shift+Tab already has `CSI Z`; Ctrl+Tab has nothing.
+            c.XKB_KEY_Tab => if (m.ctrl) 9 else return null,
+            c.XKB_KEY_BackSpace => if (m.ctrl or m.shift) 127 else return null,
+            else => blk: {
+                if (!m.ctrl) return null;
+                const cp = self.baseCodepoint(keycode);
+                if (cp == 0) return null;
+                // Ctrl+Shift+letter collapses onto the same C0 byte as Ctrl+letter, so
+                // legacy cannot tell them apart either.
+                if (m.shift or collidesAsControl(cp)) break :blk cp;
+                // Nothing at all in legacy: Ctrl+digit, Ctrl+punctuation. Detected by
+                // asking xkb rather than by enumerating a table, since which keys those
+                // are depends entirely on the layout — on this AZERTY the digits sit
+                // where a US layout has punctuation.
+                var probe: [8]u8 = undefined;
+                const n = c.xkb_state_key_get_utf8(
+                    self.state.?,
+                    keycode,
+                    @ptrCast(&probe),
+                    probe.len,
+                );
+                if (n <= 0) break :blk cp;
+                return null;
+            },
+        };
+
+        // Modifiers are omitted when there are none, per the protocol's defaults.
+        if (mods == 1) {
+            return std.fmt.bufPrint(buf, "\x1b[{d}u", .{code}) catch null;
+        }
+        return std.fmt.bufPrint(buf, "\x1b[{d};{d}u", .{ code, mods }) catch null;
+    }
+
     /// Encode one key press into terminal input bytes. Returns a slice of `buf`,
     /// or null if the key produces nothing.
     fn encode(self: *Keyboard, keycode: u32, buf: []u8) ?[]const u8 {
@@ -213,6 +301,14 @@ pub const Keyboard = struct {
             .passthrough => {},
             .swallowed => return null,
             .text => |t| return t,
+        }
+
+        // The kitty keyboard protocol, when the application asked for it. Returns null
+        // to mean "legacy is right for this key", so everything not disambiguated
+        // stays byte-identical to what it was before the protocol existed.
+        const kitty_flags = if (self.modes) |m| m.kitty_flags else 0;
+        if (kitty_flags & 1 != 0) {
+            if (self.encodeKitty(keycode, sym, buf)) |bytes| return bytes;
         }
 
         const mods = self.activeMods();
@@ -575,4 +671,165 @@ test "with no compose table, keys pass through unchanged" {
     defer kbd.deinit();
     var buf: [64]u8 = undefined;
     try testing.expect(kbd.compose(c.XKB_KEY_dead_circumflex, &buf) == .passthrough);
+}
+
+// ── kitty protocol tests ────────────────────────────────────────────────────
+//
+// Also driven without a keyboard: an xkb keymap can be built from layout *names*, so
+// the encoder can be asked what it would send for a given key with given modifiers —
+// the one thing no script on this machine can produce.
+
+/// A keyboard with a real French AZERTY keymap and no Wayland.
+fn azerty() ?Keyboard {
+    var kbd = Keyboard{};
+    kbd.xkb = c.xkb_context_new(c.XKB_CONTEXT_NO_FLAGS) orelse return null;
+
+    var names = c.struct_xkb_rule_names{
+        .rules = null,
+        .model = null,
+        .layout = "fr",
+        .variant = null,
+        .options = null,
+    };
+    kbd.keymap = c.xkb_keymap_new_from_names(
+        kbd.xkb,
+        &names,
+        c.XKB_KEYMAP_COMPILE_NO_FLAGS,
+    ) orelse {
+        kbd.deinit();
+        return null;
+    };
+    kbd.state = c.xkb_state_new(kbd.keymap) orelse {
+        kbd.deinit();
+        return null;
+    };
+    return kbd;
+}
+
+/// The keycode that produces `want` at level 0, found by asking the keymap rather than
+/// hardcoding evdev numbers — which differ per layout.
+fn keycodeFor(kbd: *Keyboard, want: c.xkb_keysym_t) ?u32 {
+    const km = kbd.keymap.?;
+    var code = c.xkb_keymap_min_keycode(km);
+    const max = c.xkb_keymap_max_keycode(km);
+    while (code <= max) : (code += 1) {
+        var syms: [*c]const c.xkb_keysym_t = undefined;
+        const n = c.xkb_keymap_key_get_syms_by_level(km, code, 0, 0, &syms);
+        if (n >= 1 and syms[0] == want) return code;
+    }
+    return null;
+}
+
+fn hold(kbd: *Keyboard, ctrl: bool, shift: bool) void {
+    const km = kbd.keymap.?;
+    var mask: c.xkb_mod_mask_t = 0;
+    if (ctrl) mask |= @as(c.xkb_mod_mask_t, 1) <<
+        @intCast(c.xkb_keymap_mod_get_index(km, c.XKB_MOD_NAME_CTRL));
+    if (shift) mask |= @as(c.xkb_mod_mask_t, 1) <<
+        @intCast(c.xkb_keymap_mod_get_index(km, c.XKB_MOD_NAME_SHIFT));
+    _ = c.xkb_state_update_mask(kbd.state.?, mask, 0, 0, 0, 0, 0);
+}
+
+fn kittyFor(kbd: *Keyboard, sym: c.xkb_keysym_t, buf: []u8) ?[]const u8 {
+    const code = keycodeFor(kbd, sym) orelse return null;
+    return kbd.encodeKitty(code, sym, buf);
+}
+
+test "escape always disambiguates" {
+    var kbd = azerty() orelse return error.SkipZigTest;
+    defer kbd.deinit();
+    var buf: [32]u8 = undefined;
+
+    // The headline of flag 1. Without it an application has to wait and see whether
+    // more bytes follow, which is exactly what nvim's ttimeoutlen works around.
+    try testing.expectEqualStrings("\x1b[27u", kittyFor(&kbd, c.XKB_KEY_Escape, &buf).?);
+}
+
+test "Ctrl+I is distinguishable from Tab" {
+    var kbd = azerty() orelse return error.SkipZigTest;
+    defer kbd.deinit();
+    var buf: [32]u8 = undefined;
+
+    // Both are 0x09 in the legacy encoding, which is why `<C-i>` cannot be mapped in
+    // nvim without losing the tab key.
+    hold(&kbd, true, false);
+    try testing.expectEqualStrings("\x1b[105;5u", kittyFor(&kbd, c.XKB_KEY_i, &buf).?);
+
+    // Tab itself keeps its legacy byte: unmodified, it is not ambiguous.
+    hold(&kbd, false, false);
+    try testing.expect(kittyFor(&kbd, c.XKB_KEY_Tab, &buf) == null);
+    // Ctrl+Tab has no legacy encoding at all.
+    hold(&kbd, true, false);
+    try testing.expectEqualStrings("\x1b[9;5u", kittyFor(&kbd, c.XKB_KEY_Tab, &buf).?);
+}
+
+test "Shift+Enter gets an encoding it never had" {
+    var kbd = azerty() orelse return error.SkipZigTest;
+    defer kbd.deinit();
+    var buf: [32]u8 = undefined;
+
+    // This is what lets Claude Code take a newline without sending the message.
+    hold(&kbd, false, true);
+    try testing.expectEqualStrings("\x1b[13;2u", kittyFor(&kbd, c.XKB_KEY_Return, &buf).?);
+    hold(&kbd, true, false);
+    try testing.expectEqualStrings("\x1b[13;5u", kittyFor(&kbd, c.XKB_KEY_Return, &buf).?);
+
+    // Plain Enter still sends CR, so nothing changes for anything else.
+    hold(&kbd, false, false);
+    try testing.expect(kittyFor(&kbd, c.XKB_KEY_Return, &buf) == null);
+}
+
+test "Ctrl+C keeps its control byte" {
+    var kbd = azerty() orelse return error.SkipZigTest;
+    defer kbd.deinit();
+    var buf: [32]u8 = undefined;
+
+    // Deliberately *not* reported. 0x03 is unambiguous, and sending an escape sequence
+    // instead would mean the line discipline never sees it — a program that enabled the
+    // mode and then died would leave a shell that cannot be interrupted.
+    hold(&kbd, true, false);
+    try testing.expect(kittyFor(&kbd, c.XKB_KEY_c, &buf) == null);
+    try testing.expect(kittyFor(&kbd, c.XKB_KEY_d, &buf) == null);
+
+    // Ctrl+Shift+C *is* reported: legacy collapses it onto the same 0x03.
+    hold(&kbd, true, true);
+    try testing.expectEqualStrings("\x1b[99;6u", kittyFor(&kbd, c.XKB_KEY_c, &buf).?);
+}
+
+test "the colliding control keys report, and the base codepoint ignores shift" {
+    var kbd = azerty() orelse return error.SkipZigTest;
+    defer kbd.deinit();
+    var buf: [32]u8 = undefined;
+
+    hold(&kbd, true, false);
+    // Ctrl+M collides with Enter, Ctrl+[ with Escape, Ctrl+H with Backspace.
+    try testing.expectEqualStrings("\x1b[109;5u", kittyFor(&kbd, c.XKB_KEY_m, &buf).?);
+    try testing.expectEqualStrings("\x1b[104;5u", kittyFor(&kbd, c.XKB_KEY_h, &buf).?);
+    try testing.expectEqualStrings("\x1b[106;5u", kittyFor(&kbd, c.XKB_KEY_j, &buf).?);
+
+    // Shift must not change the key's identity: the code is the unshifted codepoint.
+    hold(&kbd, true, true);
+    try testing.expectEqualStrings("\x1b[109;6u", kittyFor(&kbd, c.XKB_KEY_m, &buf).?);
+}
+
+test "nothing is reported without the modifier that makes it ambiguous" {
+    var kbd = azerty() orelse return error.SkipZigTest;
+    defer kbd.deinit();
+    var buf: [32]u8 = undefined;
+
+    // The safety property of the whole feature: with no modifier held, every key falls
+    // through to the encoding it had before this protocol existed.
+    hold(&kbd, false, false);
+    for ([_]c.xkb_keysym_t{
+        c.XKB_KEY_a,
+        c.XKB_KEY_i,
+        c.XKB_KEY_Return,
+        c.XKB_KEY_Tab,
+        c.XKB_KEY_BackSpace,
+    }) |sym| {
+        try testing.expect(kittyFor(&kbd, sym, &buf) == null);
+    }
+    // Shift alone likewise: `A` is not ambiguous.
+    hold(&kbd, false, true);
+    try testing.expect(kittyFor(&kbd, c.XKB_KEY_a, &buf) == null);
 }
