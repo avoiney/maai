@@ -750,9 +750,30 @@ child, as for the URL launcher.
 event loop and the renderer at once — the same class of risk as the reflow emit path, and
 worth beginning with a full context window rather than the tail of one.
 
-*Bindings, as chosen:* `Ctrl+Tab` next, `Ctrl+Shift+Tab` previous — the convention every
-other application uses. `Ctrl+Shift+T` opens one, inheriting the directory the same way
-`Alt`+`%` does. A tab closes when its child exits; the window closes with the last tab.
+*Bindings, as chosen:*
+
+| Gesture | Action |
+|---|---|
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | next / previous — the convention every other application uses |
+| `Alt` + Nth key of the number row | jump to tab N |
+| `Ctrl+Shift+T` | new tab, inheriting the directory as `Alt`+`%` does |
+| (shell exits) | closes the tab; the last one closes the window |
+
+**The jump binding is by physical key position, not by character.** On this AZERTY the
+number row unshifted is `& é " ' ( - è _ ç à`, so `Alt`+`&` is two keys where `Alt`+`1`
+would be three — the digit itself needs Shift here. But matching those *characters* would
+freeze the French layout into the code. The number row has fixed evdev codes
+(`KEY_1 = 2` … `KEY_0 = 11`), so binding on position means "the Nth key of the number
+row" on any layout — which is exactly the semantics of "jump to tab N", and it is what
+browsers do: `Ctrl+1..9` works on AZERTY without Shift precisely because it is positional.
+
+Checked rather than assumed: `Alt` is free at the compositor (sway's `$mod` here is
+`Mod4`, and no `bindsym` uses `Mod1`), and **zsh does not bind `ESC`+digit** by default —
+the `digit-argument` conflict that would rule `Alt`+digit out is a bash/readline
+behaviour, and the shell here is zsh.
+
+*Prerequisite:* the bindings hook receives only the keysym today, so it needs the keycode
+too. Three lines, landing with the feature rather than as dead code.
 
 **`Ctrl+Tab` collides with the Kitty keyboard protocol**, and it is worth writing down:
 `Ctrl+Tab` has no legacy encoding, so flag 1 gives it one (`CSI 9;5u`) — meaning we have
