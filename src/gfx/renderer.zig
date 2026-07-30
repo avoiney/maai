@@ -271,7 +271,7 @@ pub const Renderer = struct {
         self.bg_list.clearRetainingCapacity();
         self.fg_list.clearRetainingCapacity();
         self.build(screen, hints, cache, font, pad);
-        self.buildBar(screen, bar, cache, font, pad);
+        self.buildBar(screen, bar, cache, font, pad, viewport_w, viewport_h);
 
         const bg = screen.theme.bg;
         c.glClearColor(
@@ -349,6 +349,13 @@ pub const Renderer = struct {
 
     /// The bar sits on the row after the last grid row — a row the grid never had, which
     /// is why `gridSize` reserves it.
+    ///
+    /// Drawn as solid rects in *pixels* rather than as background cells, so it can absorb
+    /// what integer division leaves over. A window is rarely an exact multiple of the
+    /// cell height: 1134 px of 20 px cells is 56 rows with 14 px spare. Those 14 px used
+    /// to be invisible terminal background at the bottom; with a coloured bar above them
+    /// they read as the bar failing to reach the edge of the window. The same applies
+    /// horizontally, hence the last column reaching the right edge.
     fn buildBar(
         self: *Renderer,
         screen: *const Screen,
@@ -356,28 +363,24 @@ pub const Renderer = struct {
         cache: *GlyphCache,
         font: *const Font,
         pad: Padding,
+        viewport_w: u32,
+        viewport_h: u32,
     ) void {
         if (bar.len == 0) return;
-        const y = screen.grid.rows;
+
+        const top = pad.y + screen.grid.rows * font.cell_h;
+        const height = if (viewport_h > top) viewport_h - top else font.cell_h;
 
         for (bar, 0..) |cell, i| {
-            const x: u32 = @intCast(i);
-            const bg = cell.bg;
-            const fg = cell.fg;
+            const x = pad.x + @as(u32, @intCast(i)) * font.cell_w;
+            const last = i + 1 == bar.len;
+            const w = if (last and viewport_w > x) viewport_w - x else font.cell_w;
 
-            self.bg_list.append(self.gpa, .{
-                .cell = .{ @intCast(x), @intCast(y) },
-                .color = .{ bg.r, bg.g, bg.b, bg.a },
-            }) catch {};
+            // Before the glyph, since both live in the foreground list and the later
+            // instance wins.
+            self.solid(x, @intCast(top), w, height, cell.bg);
             if (cell.cp != ' ') {
-                self.emitGlyph(
-                    cache,
-                    font,
-                    pad.x + x * font.cell_w,
-                    pad.y + y * font.cell_h,
-                    cell.cp,
-                    fg,
-                );
+                self.emitGlyph(cache, font, x, top, cell.cp, cell.fg);
             }
         }
     }
