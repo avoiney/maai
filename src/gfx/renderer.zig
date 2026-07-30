@@ -350,12 +350,23 @@ pub const Renderer = struct {
     /// The bar sits on the row after the last grid row — a row the grid never had, which
     /// is why `gridSize` reserves it.
     ///
-    /// Drawn as solid rects in *pixels* rather than as background cells, so it can absorb
-    /// what integer division leaves over. A window is rarely an exact multiple of the
-    /// cell height: 1134 px of 20 px cells is 56 rows with 14 px spare. Those 14 px used
-    /// to be invisible terminal background at the bottom; with a coloured bar above them
-    /// they read as the bar failing to reach the edge of the window. The same applies
-    /// horizontally, hence the last column reaching the right edge.
+    /// Drawn as solid rects in *pixels* rather than as background cells, and **pinned to
+    /// the bottom of the window**.
+    ///
+    /// A window is rarely an exact multiple of the cell height: 1134 px of 20 px cells is
+    /// 56 rows with 14 px spare. Those pixels have to go somewhere, and the choice
+    /// matters more than it looks:
+    ///
+    ///   - Below the bar, they read as the bar failing to reach the edge of the window.
+    ///   - *Into* the bar, making it 34 px tall, and the separator glyph breaks: it is
+    ///     rasterized at one cell height, so its slant covers the top 20 px and the rest
+    ///     ends in a blunt vertical edge. The bevel stops being a bevel.
+    ///   - Above the bar, where they read as bottom padding of the text area — which is
+    ///     what every terminal has anyway, and nobody notices.
+    ///
+    /// So: exactly one cell tall, flush with the bottom. The remainder sits above it.
+    /// Horizontally the last column does reach the right edge, since stretching a
+    /// background costs nothing there — no glyph's geometry depends on it.
     fn buildBar(
         self: *Renderer,
         screen: *const Screen,
@@ -368,8 +379,11 @@ pub const Renderer = struct {
     ) void {
         if (bar.len == 0) return;
 
-        const top = pad.y + screen.grid.rows * font.cell_h;
-        const height = if (viewport_h > top) viewport_h - top else font.cell_h;
+        const height = font.cell_h;
+        const top = if (viewport_h > height)
+            viewport_h - height
+        else
+            pad.y + screen.grid.rows * font.cell_h;
 
         for (bar, 0..) |cell, i| {
             const x = pad.x + @as(u32, @intCast(i)) * font.cell_w;
