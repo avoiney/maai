@@ -47,12 +47,59 @@ const max_wheel_notches = 16;
 /// lines the local scrollback moves.
 const arrows_per_notch = 3;
 
+/// Ceiling on tabs. A bound rather than a growable list because the whole point of the
+/// fixed array is that tab addresses never move: the parser holds a `*Screen`, so a
+/// reallocation would leave it pointing at freed memory.
+const max_tabs = 32;
+
+/// One terminal session: its screen, its child, and the parser between them.
+///
+/// Heap-allocated and never moved. `parser` holds a pointer to `screen` *in the same
+/// struct*, so copying a Tab by value would leave the copy's parser feeding the
+/// original's screen — a bug that would look like output landing in the wrong tab.
+const Tab = struct {
+    screen: Screen,
+    pty: Pty,
+    parser: vt.Parser(Screen),
+
+    fn create(
+        gpa: std.mem.Allocator,
+        cols: u32,
+        rows: u32,
+        cfg: *const cfgmod.Config,
+        argv: [*:null]const ?[*:0]const u8,
+    ) !*Tab {
+        const tab = try gpa.create(Tab);
+        errdefer gpa.destroy(tab);
+
+        tab.screen = try Screen.initScrollback(gpa, cols, rows, cfg.scrollback_lines);
+        errdefer tab.screen.deinit();
+        applyConfig(&tab.screen, cfg);
+
+        tab.pty = try Pty.spawn(cols, rows, argv);
+        // Only now, once `screen` sits at its final address.
+        tab.parser = vt.Parser(Screen).init(&tab.screen);
+        return tab;
+    }
+
+    fn destroy(self: *Tab, gpa: std.mem.Allocator) void {
+        self.pty.deinit();
+        self.screen.deinit();
+        gpa.destroy(self);
+    }
+};
+
 const App = struct {
     gpa: std.mem.Allocator,
     win: *Window,
     gl: *Gl,
+    /// The active tab's screen and child. Held as pointers so every method below reads
+    /// the same way whether there is one tab or ten.
     screen: *Screen,
     pty: *Pty,
+    tabs: [max_tabs]*Tab = undefined,
+    tab_count: usize = 0,
+    active: usize = 0,
     font: *const Font,
     pad: Padding,
     cfg: *const cfgmod.Config,
@@ -91,6 +138,25 @@ const App = struct {
     hint_n: usize = 0,
     hint_typed: [2]u8 = undefined,
     hint_typed_len: u8 = 0,
+
+    fn tab(self: *App) *Tab {
+        return self.tabs[self.active];
+    }
+
+    /// Point everything that follows the focus at tab `i`.
+    fn focus(self: *App, i: usize) void {
+        if (i >= self.tab_count) return;
+        self.active = i;
+        const t = self.tabs[i];
+        self.screen = &t.screen;
+        self.pty = &t.pty;
+        // The key encoder reads the *active* screen's modes: DECCKM and the keyboard
+        // protocol are per-session, so a background tab's must not encode our keys.
+        self.win.keyboard.modes = &t.screen.modes;
+        t.screen.reply = .{ .ctx = self, .write = App.writeToPty };
+        self.hintsExit();
+        self.needs_render = true;
+    }
 
     fn writeToPty(ctx: *anyopaque, bytes: []const u8) void {
         const self: *App = @ptrCast(@alignCast(ctx));
@@ -818,39 +884,33 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var pad = Padding{ .x = cfg.padding_x, .y = cfg.padding_y };
     var dims = gridSize(win.width, win.height, &font, pad);
 
-    var screen = try Screen.initScrollback(
-        gpa,
-        dims.cols,
-        dims.rows,
-        cfg.scrollback_lines,
-    );
-    defer screen.deinit();
-    applyConfig(&screen, &cfg);
-
-    var pty = Pty.spawn(dims.cols, dims.rows, argv.ptr) catch |err| {
-        std.debug.print("myterm: could not spawn {s}: {s}\n", .{
+    const first = Tab.create(gpa, dims.cols, dims.rows, &cfg, argv.ptr) catch |err| {
+        std.debug.print("myterm: could not start {s}: {s}\n", .{
             std.mem.span(argv[0].?),
             @errorName(err),
         });
         return err;
     };
-    defer pty.deinit();
 
     var app = App{
         .gpa = gpa,
         .win = &win,
         .gl = &gl,
-        .screen = &screen,
-        .pty = &pty,
+        .screen = &first.screen,
+        .pty = &first.pty,
         .font = &font,
         .pad = pad,
         .cfg = &cfg,
         .debug = std.c.getenv("MYTERM_DEBUG") != null,
     };
+    app.tabs[0] = first;
+    app.tab_count = 1;
+    defer for (app.tabs[0..app.tab_count]) |t| t.destroy(gpa);
+
     win.keyboard.sink = .{ .ctx = &app, .write = App.writeToPty };
     win.keyboard.bindings = .{ .ctx = &app, .handle = App.onBinding };
     // DECCKM and friends change how keys encode, so the encoder needs to see them.
-    win.keyboard.modes = &screen.modes;
+    win.keyboard.modes = &first.screen.modes;
     win.keyboard.on_mods = .{ .ctx = &app, .changed = App.onModsChanged };
     win.pointer.handler = .{
         .ctx = &app,
@@ -859,15 +919,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .axis = App.onAxis,
     };
     // Device queries (DA, DSR) answer back down the PTY.
-    screen.reply = .{ .ctx = &app, .write = App.writeToPty };
+    first.screen.reply = .{ .ctx = &app, .write = App.writeToPty };
 
     // Live reload. A missing inotify fd is not fatal — the terminal simply stops
     // noticing edits, which is what it did before this existed.
     var watcher = watchmod.Watcher.init();
     if (watcher) |*w| armWatches(w, args.config_path, &cfg);
     defer if (watcher) |*w| w.deinit();
-
-    var parser = vt.Parser(Screen).init(&screen);
 
     const gi = gl.info();
     const caps = Font.capabilities();
@@ -899,7 +957,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         win.clipboard.primary_device != null,
         win.pointer.shape_device != null,
         std.mem.span(argv[0].?),
-        pty.child,
+        first.pty.child,
     });
 
     // ── event loop ─────────────────────────────────────────────────────────
@@ -908,7 +966,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // panes (phase 5), and foot demonstrates a single-threaded loop is entirely
     // competitive. Revisit with measurements rather than on principle.
     var read_buf: [read_chunk]u8 = undefined;
-    var fds: [3]std.posix.pollfd = undefined;
+    // Wayland, inotify, then one per tab. Every tab is polled, not just the visible
+    // one: a hidden tab that stops draining its PTY blocks its child the moment the
+    // pipe fills, so a build running in another tab would silently stall.
+    var fds: [2 + max_tabs]std.posix.pollfd = undefined;
     var sync_started_ms: i64 = 0;
 
     while (!win.closed) {
@@ -917,6 +978,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // The deadline is a safety valve — an app that sets the mode and then dies
         // must not freeze the terminal forever.
         const now_ms = monotonicMs();
+        const screen = app.screen;
         if (screen.sync_output) {
             if (sync_started_ms == 0) sync_started_ms = now_ms;
         } else {
@@ -944,13 +1006,20 @@ pub fn main(init: std.process.Init.Minimal) !void {
         _ = c.wl_display_flush(win.display);
 
         fds[0] = .{ .fd = win.fd(), .events = std.posix.POLL.IN, .revents = 0 };
-        fds[1] = .{ .fd = pty.master, .events = std.posix.POLL.IN, .revents = 0 };
         // A negative fd is ignored by poll, which is how "no inotify" costs nothing.
-        fds[2] = .{
+        fds[1] = .{
             .fd = if (watcher) |*w| w.fd else -1,
             .events = std.posix.POLL.IN,
             .revents = 0,
         };
+        for (app.tabs[0..app.tab_count], 0..) |t, i| {
+            fds[2 + i] = .{
+                .fd = t.pty.master,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            };
+        }
+        const n_fds = 2 + app.tab_count;
 
         // Block indefinitely unless a deadline needs us back sooner. Two can be
         // outstanding — the synchronized-output safety valve and the next key
@@ -969,7 +1038,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             }
         }
 
-        _ = std.posix.poll(&fds, timeout) catch |err| {
+        _ = std.posix.poll(fds[0..n_fds], timeout) catch |err| {
             c.wl_display_cancel_read(win.display);
             std.debug.print("myterm: poll failed: {s}\n", .{@errorName(err)});
             break;
@@ -996,28 +1065,29 @@ pub fn main(init: std.process.Init.Minimal) !void {
             break;
         }
 
-        if (fds[1].revents & (std.posix.POLL.IN | std.posix.POLL.HUP) != 0) {
+        // Drain every tab, with the budget applied per tab so one flooding session
+        // cannot starve the others — or the input handling.
+        for (app.tabs[0..app.tab_count], 0..) |t, i| {
+            if (fds[2 + i].revents & (std.posix.POLL.IN | std.posix.POLL.HUP) == 0) continue;
             var drained: usize = 0;
             while (drained < drain_budget) {
-                const n = pty.read(&read_buf);
+                const n = t.pty.read(&read_buf);
                 if (n == 0) break;
-                parser.feed(read_buf[0..n]);
+                t.parser.feed(read_buf[0..n]);
                 drained += n;
             }
         }
 
         if (watcher) |*w| {
-            if (fds[2].revents & std.posix.POLL.IN != 0) _ = w.drain(monotonicMs());
+            if (fds[1].revents & std.posix.POLL.IN != 0) _ = w.drain(monotonicMs());
             if (w.ready(monotonicMs())) {
                 reloadConfig(.{
                     .gpa = gpa,
                     .cfg = &cfg,
                     .config_path = args.config_path,
-                    .screen = &screen,
                     .font = &font,
                     .cache = &cache,
                     .pad = &pad,
-                    .pty = &pty,
                     .app = &app,
                     .win = &win,
                     .watcher = w,
@@ -1031,8 +1101,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
             app.hintsExit();
             gl.resize(win.width, win.height);
             dims = gridSize(win.width, win.height, &font, pad);
-            try screen.resize(dims.cols, dims.rows);
-            pty.resize(dims.cols, dims.rows);
+            for (app.tabs[0..app.tab_count]) |t| {
+                // Every tab, not only the visible one: a background tab left at the old
+                // width writes at the wrong size and reflows wrongly when shown.
+                try t.screen.resize(dims.cols, dims.rows);
+                t.pty.resize(dims.cols, dims.rows);
+            }
             win.resized = false;
         }
 
@@ -1045,7 +1119,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // that hold a live pid.
         app.reaper.poll();
 
-        if (pty.hung_up or pty.childExited()) break;
+        // With one tab this is the whole window's lifetime, as before. Closing
+        // individual tabs arrives with tab switching.
+        if (app.pty.hung_up or app.pty.childExited()) break;
     }
 }
 
@@ -1248,11 +1324,9 @@ const Live = struct {
     gpa: std.mem.Allocator,
     cfg: *cfgmod.Config,
     config_path: []const u8,
-    screen: *Screen,
     font: *Font,
     cache: *GlyphCache,
     pad: *Padding,
-    pty: *Pty,
     app: *App,
     win: *Window,
     watcher: *watchmod.Watcher,
@@ -1275,8 +1349,16 @@ fn reloadConfig(l: Live) void {
         std.debug.print("myterm: scrollback_lines applies at the next start\n", .{});
     }
 
+    if (l.app.debug) {
+        std.debug.print("reload: theme '{s}', font '{s}' {d}\n", .{
+            fresh.theme_path.slice(),
+            fresh.font_family.slice(),
+            fresh.font_size,
+        });
+    }
+
     l.cfg.* = fresh;
-    applyConfig(l.screen, l.cfg);
+    for (l.app.tabs[0..l.app.tab_count]) |t| applyConfig(&t.screen, l.cfg);
 
     if (font_changed) {
         // Load the new font *before* dropping the old one: a bad font_family in the
@@ -1300,10 +1382,14 @@ fn reloadConfig(l: Live) void {
         l.pad.* = .{ .x = l.cfg.padding_x, .y = l.cfg.padding_y };
         l.app.pad = l.pad.*;
         const dims = gridSize(l.win.width, l.win.height, l.font, l.pad.*);
-        l.screen.resize(dims.cols, dims.rows) catch |err| {
-            std.debug.print("myterm: resize after reload failed: {s}\n", .{@errorName(err)});
-        };
-        l.pty.resize(dims.cols, dims.rows);
+        for (l.app.tabs[0..l.app.tab_count]) |t| {
+            t.screen.resize(dims.cols, dims.rows) catch |err| {
+                std.debug.print("myterm: resize after reload failed: {s}\n", .{
+                    @errorName(err),
+                });
+            };
+            t.pty.resize(dims.cols, dims.rows);
+        }
         // Hint spans and the hover span are in absolute line coordinates, which the
         // reflow just renumbered.
         l.app.hintsExit();
