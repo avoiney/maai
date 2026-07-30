@@ -712,7 +712,9 @@ test {
     _ = @import("term/grid.zig");
     _ = @import("term/hints.zig");
     _ = @import("term/mouse.zig");
+    _ = @import("term/reclaim.zig");
     _ = @import("term/screen.zig");
+    _ = @import("term/screen_test.zig");
     _ = @import("term/selection.zig");
     _ = @import("term/theme.zig");
     _ = @import("term/url.zig");
