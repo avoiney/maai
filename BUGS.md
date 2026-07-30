@@ -134,11 +134,59 @@ A/B entrelacé, sept manches, machine en usage réel :
 
 Sous le budget de trame de 13 ms à 75 Hz, mais sans marge confortable.
 
-**Reste ouvert.** L'ablation situe la passe d'émission à ~9 ms : 2,4 M de cellules
-écrites une par une. La suite est d'émettre par `@memcpy` pour les lignes sans double
-largeur — le drapeau `has_wide` qui vient d'être ajouté est exactement ce qui le rend
-possible. L'autre piste, ne reflower que l'historique atteignable, reste un changement
-architectural à ne pas entamer sans besoin.
+### §R1 — émission par `@memcpy`, le 2026-07-30
+
+L'ablation situait la passe d'émission à ~9 ms : 2,4 M de cellules écrites une par une,
+avec une branche et un stockage par cellule. Une ligne logique sans caractère double
+largeur n'est qu'un **réagencement d'une suite de cellules**, donc elle se copie par
+blocs : chaque copie s'arrête à la première limite atteinte — bord de la rangée source,
+bord de la rangée destination, ou fin du contenu. L'index de l'anneau est calculé une
+fois par bloc au lieu d'une fois par cellule. Le walker reste le chemin des lignes
+contenant du double largeur, où une paire à cheval sur une limite déplace tout.
+
+A/B entrelacé, machine calme, contre l'état d'avant tout le travail de reflow
+(`1b69a71`) :
+
+| | min |
+|---|---|
+| avant | 11,17 ms |
+| après | **5,25 ms** |
+
+**−53 %.** Confortablement sous le budget de trame de 13 ms à 75 Hz : un glisser de bord
+latéral à 75 Hz coûte désormais 0,39 s de travail par seconde au lieu de 0,84.
+
+Gardes ajoutées, parce qu'un chemin d'émission faux perd des données : une propriété
+d'**aller-retour** (rétrécir puis réélargir doit reproduire exactement la disposition
+d'origine, sur six largeurs qui coupent les blocs à des endroits différents) et une
+propriété d'**équivalence des deux chemins** (même contenu, une fois avec les rangées
+marquées `has_wide` pour forcer le walker — les deux dispositions doivent être
+identiques).
+
+## Le reflow n'est pas propre en aller-retour avec du double largeur
+
+**Sévérité : moyenne — insertion silencieuse de caractères, cumulative.**
+**Trouvé le 2026-07-30 par la propriété d'aller-retour ci-dessus. Antérieur au travail
+de la phase 6 : vérifié en remisant le changement, l'échec persiste.**
+
+Quand une paire double largeur ne peut pas finir une rangée, le walker la déplace
+entière sur la suivante et laisse la dernière colonne blanche. **Cette colonne est
+stockée comme du contenu ordinaire.** En réélargissant, elle n'est donc pas retirée :
+
+```
+"cjk 日本語 mixed…"  →  largeurs 19,13,7,3,11,20  →  "cjk 日 本語 mixed…"
+```
+
+Une espace qui n'a jamais été tapée apparaît, et l'effet s'accumule à chaque
+redimensionnement.
+
+**Correctif proposé :** distinguer le remplissage du contenu. `Cell.wide` est un `u2`
+dont la valeur **3 est libre** — elle signifierait « blanc inséré pour garder une paire
+entière ». `Wrap` la sauterait comme il saute déjà les cellules d'espacement, donc elle
+ne redeviendrait jamais du contenu. À traiter à froid : c'est le chemin de données de
+l'historique.
+
+L'autre piste, ne reflower que l'historique atteignable, reste un changement
+architectural à ne pas entamer sans besoin constaté.
 
 Bug supplémentaire trouvé hors relevé, signalé à l'usage : **coller dans myterm ce
 qu'on venait d'y copier ne faisait rien.** Interblocage sur soi-même — on demandait

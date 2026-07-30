@@ -1062,3 +1062,98 @@ test "resize keeps the alternate screen in step with the primary" {
     try std.testing.expectEqual(@as(u32, 6), s.other.rows);
     try std.testing.expectEqual(@as(u32, 5), s.margin_bottom);
 }
+
+/// Every cell of the ring as UTF-8, one line per row, wrap flags marked.
+fn snapshot(gpa: std.mem.Allocator, s: *const Screen) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var line: usize = 0;
+    while (line < s.grid.count) : (line += 1) {
+        const row = s.grid.line(line);
+        for (row.cells) |cell| {
+            if (cell.wide == 2) continue;
+            if (cell.grapheme) {
+                for (s.graphemes.get(cell.content)) |cp| {
+                    var b: [4]u8 = undefined;
+                    const n = std.unicode.utf8Encode(cp, &b) catch continue;
+                    try out.appendSlice(gpa, b[0..n]);
+                }
+            } else if (cell.content != Cell.empty) {
+                var b: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(@intCast(cell.content), &b) catch continue;
+                try out.appendSlice(gpa, b[0..n]);
+            } else {
+                try out.append(gpa, ' ');
+            }
+        }
+        try out.append(gpa, if (row.wrapped) '|' else '\n');
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+test "reflow round-trips through a range of widths" {
+    // The property that matters for the bulk-copy emit path: narrowing and widening
+    // back must reproduce the original layout exactly. A per-cell loop and a run copy
+    // can disagree on the last run of a row, on a run that spans two source rows, or
+    // on the row a line ends on — none of which a single fixed-width test would show.
+    const gpa = std.testing.allocator;
+
+    for ([_][]const u8{
+        "short",
+        "a line of exactly twenty",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "mixed 123 !@# and more text to push past a row",
+        // Wide characters are deliberately absent: reflow is *not* round-trip clean
+        // for them, and that predates the bulk-copy path — see BUGS.md. When a wide
+        // pair cannot finish a row it moves whole to the next one, and the blank
+        // column it leaves behind is stored as ordinary content, so widening again
+        // inserts a space that was never in the text.
+    }) |text| {
+        var s = try Screen.initScrollback(gpa, 20, 4, 64);
+        defer s.deinit();
+        feed(&s, text);
+
+        const before = try snapshot(gpa, &s);
+        defer gpa.free(before);
+
+        // Down and back up, through widths that split runs in different places.
+        for ([_]u32{ 19, 13, 7, 3, 11, 20 }) |w| try s.resize(w, 4);
+
+        const after = try snapshot(gpa, &s);
+        defer gpa.free(after);
+        try std.testing.expectEqualStrings(before, after);
+    }
+}
+
+test "the bulk-copy path agrees with the walker" {
+    // Same content, once as-is and once with a wide character forced into an unrelated
+    // row so the whole line takes the walker. Both must lay it out identically.
+    const gpa = std.testing.allocator;
+
+    var fast = try Screen.initScrollback(gpa, 16, 3, 32);
+    defer fast.deinit();
+    var slow = try Screen.initScrollback(gpa, 16, 3, 32);
+    defer slow.deinit();
+
+    const text = "abcdefghijklmnopqrstuvwxyz0123456789";
+    feed(&fast, text);
+    feed(&slow, text);
+    // Mark the rows so `slow` cannot take the arithmetic count or the run copy, while
+    // its *content* stays identical.
+    var line: usize = 0;
+    while (line < slow.grid.count) : (line += 1) slow.grid.line(line).has_wide = true;
+
+    for ([_]u32{ 9, 5, 21, 16 }) |w| {
+        try fast.resize(w, 3);
+        try slow.resize(w, 3);
+        // resize() clears the marker on rebuilt rows, so re-arm it every round.
+        var l: usize = 0;
+        while (l < slow.grid.count) : (l += 1) slow.grid.line(l).has_wide = true;
+
+        const a = try snapshot(gpa, &fast);
+        defer gpa.free(a);
+        const b = try snapshot(gpa, &slow);
+        defer gpa.free(b);
+        try std.testing.expectEqualStrings(b, a);
+    }
+}

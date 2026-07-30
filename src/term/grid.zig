@@ -439,6 +439,23 @@ pub const Grid = struct {
         return @max(rows, 1);
     }
 
+    /// Mark soft-wrap continuations for every row of one logical line.
+    fn markWrapped(
+        buf: []Row,
+        global_row: usize,
+        drop: usize,
+        new_cap: usize,
+        new_rows: usize,
+    ) void {
+        var k: usize = 0;
+        while (k < new_rows) : (k += 1) {
+            const grow = global_row + k;
+            if (grow < drop) continue;
+            const di = grow - drop;
+            if (di < new_cap) buf[di].wrapped = k + 1 < new_rows;
+        }
+    }
+
     /// Resize, rewrapping soft-wrapped lines to the new width.
     ///
     /// Logical lines are recovered by joining rows across the `wrapped` flag, then
@@ -549,6 +566,83 @@ pub const Grid = struct {
 
         for (logical.items, 0..) |l, li| {
             const on_cursor_line = li == cur_logical;
+
+            // Fast path: a line with no double-width character is a pure reshaping of
+            // a run of cells, so it copies in bulk instead of one cell at a time.
+            //
+            // This is where reflow's remaining time was. The walker below is correct
+            // for everything, but it is inherently scalar — a branch and a store per
+            // cell, 2.4M of them with a full scrollback. Copying whole runs hands the
+            // work to `@memcpy`, and the ring index is computed once per run rather
+            // than once per cell.
+            if (!l.has_wide) {
+                var remaining = l.len;
+                var src_line: usize = 0;
+                var src_x: u32 = 0;
+                var dst_row: usize = 0;
+                var dst_x: u32 = 0;
+
+                while (remaining > 0) {
+                    const src_cells = self.line(l.start + src_line).cells;
+                    // A run ends at whichever edge comes first: the source row's, the
+                    // destination row's, or the line's content.
+                    const n: u32 = @intCast(@min(
+                        @min(self.cols - src_x, cols - dst_x),
+                        remaining,
+                    ));
+
+                    const grow = global_row + dst_row;
+                    if (grow >= drop) {
+                        const di = grow - drop;
+                        if (di >= new_cap) break;
+                        @memcpy(
+                            buf[di].cells[dst_x..][0..n],
+                            src_cells[src_x..][0..n],
+                        );
+                    }
+
+                    remaining -= n;
+                    src_x += n;
+                    if (src_x == self.cols) {
+                        src_x = 0;
+                        src_line += 1;
+                    }
+                    dst_x += n;
+                    if (dst_x == cols) {
+                        dst_x = 0;
+                        dst_row += 1;
+                    }
+                }
+
+                if (on_cursor_line) {
+                    // Every offset holds exactly one cell here, so the placement the
+                    // walker would find is arithmetic.
+                    if (l.len == 0) {
+                        cur_new_x = 0;
+                        if (global_row >= drop) cur_new_abs = global_row - drop;
+                    } else {
+                        const off = @min(cur_offset, l.len - 1);
+                        var x = off % cols;
+                        var r = off / cols;
+                        // Past the last character: the cursor sits just after it.
+                        if (cur_offset >= l.len) {
+                            x += 1;
+                            if (x >= cols) {
+                                x = 0;
+                                r += 1;
+                            }
+                        }
+                        cur_new_x = @intCast(x);
+                        const grow = global_row + r;
+                        if (grow >= drop) cur_new_abs = grow - drop;
+                    }
+                }
+
+                markWrapped(buf, global_row, drop, new_cap, l.new_rows);
+                global_row += l.new_rows;
+                continue;
+            }
+
             // Best placement seen so far for the cursor: the last character at or
             // before its offset. The offset can land on a spacer, or past the end of
             // the line entirely when the cursor trails the text.
@@ -575,14 +669,7 @@ pub const Grid = struct {
                 }
             }
 
-            // Mark soft-wrap continuations for every row of this logical line.
-            var k: usize = 0;
-            while (k < l.new_rows) : (k += 1) {
-                const grow = global_row + k;
-                if (grow < drop) continue;
-                const di = grow - drop;
-                if (di < new_cap) buf[di].wrapped = k + 1 < l.new_rows;
-            }
+            markWrapped(buf, global_row, drop, new_cap, l.new_rows);
 
             if (on_cursor_line) {
                 if (best) |st| {
