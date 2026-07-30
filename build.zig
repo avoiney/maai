@@ -42,6 +42,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    disableFortify(mod);
 
     // ── Wayland protocol code generation ────────────────────────────────────
     // wayland-scanner turns each protocol XML into a client header (interface
@@ -107,6 +108,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    disableFortify(pure_mod);
     pure_mod.linkSystemLibrary("utf8proc", .{});
     const pure = b.addTest(.{ .root_module = pure_mod });
     const pure_step = b.step("test-pure", "Run the fast terminal-logic unit tests");
@@ -121,6 +123,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    disableFortify(bench_mod);
     bench_mod.linkSystemLibrary("utf8proc", .{});
     const bench = b.addExecutable(.{ .name = "bench", .root_module = bench_mod });
     b.installArtifact(bench);
@@ -136,6 +139,22 @@ pub fn build(b: *std.Build) void {
     // the comment above suggests doing — measured the wrong build entirely. Cost me a
     // round of callgrind output that meant nothing.
     bench_step.dependOn(&b.addInstallArtifact(bench, .{}).step);
+}
+
+/// Turn glibc's `_FORTIFY_SOURCE` wrappers off for a module's C translation.
+///
+/// Zig defines `-D_FORTIFY_SOURCE=2` in **ReleaseSafe only**. glibc's fortified
+/// `open`/`openat` (bits/fcntl2.h) count their varargs with `__va_arg_pack_len`,
+/// which translate-c cannot evaluate, so it takes the "too many arguments" branch
+/// and the `@cImport` in src/c.zig fails with a wall of `__open_too_many_args`
+/// errors. Debug and ReleaseFast build fine, which is why `--optimize ReleaseSafe`
+/// was the only thing broken.
+///
+/// Nothing meaningful is given up: `_FORTIFY_SOURCE` only ever covered the
+/// generated Wayland protocol .c files, and Zig code is not affected by it —
+/// ReleaseSafe's own runtime safety checks are untouched.
+fn disableFortify(mod: *std.Build.Module) void {
+    mod.addCMacro("_FORTIFY_SOURCE", "0");
 }
 
 /// Ask pkg-config where a package keeps its data files. Runs at configure time,
