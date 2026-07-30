@@ -89,7 +89,7 @@ fn spawn(program: [*:0]const u8, argv: [:null]const ?[*:0]const u8) ?std.c.pid_t
     return pid;
 }
 
-/// Start another myterm, beginning in `dir`.
+/// Start another maai, beginning in `dir`.
 ///
 /// `/proc/self/exe` rather than argv[0]: it is the actual binary regardless of how this
 /// process was invoked, so a window opened from a window opened from a shell alias
@@ -107,7 +107,7 @@ pub fn newWindow(dir: []const u8) ?std.c.pid_t {
     @memcpy(buf[0..dir.len], dir);
     buf[dir.len] = 0;
 
-    var argv = [_:null]?[*:0]const u8{ "myterm", "--cwd", @ptrCast(&buf) };
+    var argv = [_:null]?[*:0]const u8{ "maai", "--cwd", @ptrCast(&buf) };
     return spawn("/proc/self/exe", &argv);
 }
 

@@ -1,4 +1,4 @@
-# myterm — implementation plan
+# maai (間合い) — implementation plan
 
 A fast, keyboard-driven, Wayland-native terminal emulator for this machine.
 
@@ -99,7 +99,7 @@ window-spawn cost that a daemon would amortize mostly disappears anyway.
 ## 3. Module layout
 
 ```
-myterm/
+maai/
 ├── build.zig                  # incl. wayland-scanner codegen step
 ├── build.zig.zon
 ├── .mise.toml                 # pins zig 0.16.0
@@ -152,7 +152,7 @@ myterm/
 │   │   └── open.zig           # safe URL launch (see §7)
 │   └── config/
 │       ├── parse.zig  theme.zig  watch.zig  defaults.zig
-├── terminfo/myterm.ti
+├── terminfo/maai.ti
 └── tests/
 ```
 
@@ -214,7 +214,7 @@ no protocol errors on `WAYLAND_DEBUG=1`.
 
 **Result:** `GL_RENDERER = AMD Radeon 890M (radeonsi, strix1, ACO)`, GLES 3.2 / Mesa
 26.0.3. Frame pacing measured at a steady **75.0 fps** on the MSI, i.e. frame callbacks
-track the output refresh exactly. sway reports `app_id=myterm`, `shell=xdg_shell` —
+track the output refresh exactly. sway reports `app_id=maai`, `shell=xdg_shell` —
 native Wayland, no XWayland. Server-side decorations negotiated.
 
 Findings worth keeping, each of which cost a build cycle:
@@ -267,7 +267,7 @@ Known gaps carried into phase 2, all visible in the verification screenshots:
   row flag that arrives with scrollback.
 - No scrollback, no alt screen, no scroll regions, so nvim/htop are not usable yet.
 - Style ids are never reclaimed (append-only until reset).
-- `TERM=xterm-256color`, pending the myterm terminfo entry.
+- `TERM=xterm-256color`, pending the maai terminfo entry.
 
 Zig 0.16 API findings, in addition to phase 0's:
 - `std.posix.write`/`close` were removed (the `Io` interface supersedes them); with libc
@@ -392,7 +392,7 @@ fix could be verified against the real byte stream instead of a hand-written app
 — and the first hand-written repro had in fact been misleading, because its padding was
 hand-counted and so could never have aligned.
 
-**Still outstanding in this phase:** the myterm terminfo entry plus `--print-terminfo`;
+**Still outstanding in this phase:** the maai terminfo entry plus `--print-terminfo`;
 scrollback *viewing* (the data is there, the view offset and keybinding are not); style-id
 and grapheme-id reclamation; and the `38:2::r:g:b` colon form with a colour-space id.
 
@@ -408,7 +408,7 @@ The bulk of correctness work.
 - Scrollback ring buffer, configurable (default 10000, matching your current configs).
 - **Resize with reflow**: rewrap soft-wrapped lines, keep the cursor anchored, preserve
   selection where possible.
-- Ship `terminfo/myterm.ti`. Provide `myterm --print-terminfo` for remote hosts, and
+- Ship `terminfo/maai.ti`. Provide `maai --print-terminfo` for remote hosts, and
   document `TERM=xterm-256color` fallback — missing terminfo over SSH is the single most
   common papercut of new terminals.
 
@@ -480,7 +480,7 @@ Method note: `swaymsg seat - cursor …` can synthesise clicks, which is how the
 verified without a human at the mouse. It is *not* reliable for drags — sway coalesced three
 `cursor move` commands into one motion event and delivered it after the button release, so
 every synthetic drag selected a single character. Double-click word selection is the usable
-substitute, since it needs no motion at all. `MYTERM_DEBUG=1` traces input and selection
+substitute, since it needs no motion at all. `MAAI_DEBUG=1` traces input and selection
 handling, which is otherwise invisible.
 
 **Mouse reporting to applications (2026-07-30).** `term/mouse.zig` encodes events;
@@ -724,11 +724,11 @@ Clicking twelve links then costs no browser tabs. A harness bug to remember: the
 screen printed *before* the compositor's resize, so `stty size` still reported the
 pre-configure width and the wrapped-URL case did not wrap.
 
-**Phase 4 is complete.** → **Switch to myterm as daily driver.**
+**Phase 4 is complete.** → **Switch to maai as daily driver.**
 
 **Acceptance:** click and hint-open both launch the desktop handler for `https://`,
 `file://`, `mailto:`. A line containing `https://x/$(id>/tmp/pwn)` opens harmlessly and
-creates no file. → **Switch to myterm as daily driver here.**
+creates no file. → **Switch to maai as daily driver here.**
 
 ### Phase 5 — new windows and tabs (≈1 week) — *rescoped 2026-07-30, in progress*
 
@@ -755,7 +755,7 @@ buffer and bailed out partway, splicing the head of a rejected path onto the tai
 previous one (`/plain/path` became `/badin/path`). It decodes into scratch now and commits
 only on success.
 
-**New window (done).** `Alt`+`%` opens another myterm in the same directory — the binding
+**New window (done).** `Alt`+`%` opens another maai in the same directory — the binding
 carried over from wezterm. The *character* is matched rather than the physical key plus
 Shift, since `%` needs Shift on this AZERTY layout but not on every layout. Spawned via
 `/proc/self/exe` so a window opened from a window still finds the right binary, with the
@@ -901,7 +901,7 @@ the change recoloured with it**, which is the whole point of the indirection; a
 a bogus `font_family` leaving the old font in place with `keeping the old font …
 (NotMonospace)` on stderr.
 
-`myterm.conf.example` documents every setting at its default.
+`maai.conf.example` documents every setting at its default.
 
 **Acceptance met:** editing config or flipping the flavour file re-themes without restart.
 
@@ -950,7 +950,7 @@ and `kitty` (fastest GPU renderer) — both already installed, so A/B is easy.
 
 | Metric | Target | Measurement |
 |---|---|---|
-| Cold start → first frame | < 40 ms | `hyperfine 'myterm -e true'` |
+| Cold start → first frame | < 40 ms | `hyperfine 'maai -e true'` |
 | Keypress → pixels | < 1 frame (13 ms @75 Hz) | internal timestamps: `wl_keyboard` event → `eglSwapBuffers`, plus `wp_presentation_feedback` for actual scan-out |
 | `cat` 100 MB ASCII | ≥ kitty | `vtebench`, `hyperfine` |
 | Frame time, full 1440p redraw | < 1 ms GPU | `GL_EXT_disjoint_timer_query` |
@@ -1078,5 +1078,5 @@ Sway binding to add once phase 1 runs, alongside your existing WezTerm bindings 
 switch back instantly:
 
 ```
-bindsym $mod+Shift+Return exec /home/avoiney/w/myterm/zig-out/bin/myterm
+bindsym $mod+Shift+Return exec /home/avoiney/w/myterm/zig-out/bin/maai
 ```

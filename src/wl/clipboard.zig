@@ -169,8 +169,8 @@ pub const Clipboard = struct {
         // dispatch while waiting: `paste` runs inside a pointer/keyboard listener,
         // itself inside wl_display_dispatch_pending, and libwayland does not allow
         // re-entrant dispatch. So the paste would deadlock until the timeout fired
-        // and then yield nothing — copying inside myterm and pasting back into
-        // myterm silently did nothing.
+        // and then yield nothing — copying inside maai and pasting back into
+        // maai silently did nothing.
         //
         // `*_source != null` is a reliable ownership test: the compositor sends
         // `cancelled` when another client takes the selection, and that clears it.

@@ -1,4 +1,4 @@
-# myterm — bugs et réserves connus
+# maai — bugs et réserves connus
 
 Relevé issu d'une relecture complète (~5 300 lignes) le 2026-07-29, à l'état
 `5b49fd9` + arbre de travail. Suite de tests : 62/62 OK — aucun des points
@@ -95,7 +95,7 @@ Deux enseignements de la mesure :
   défaut, donc `zig build bench -Doptimize=ReleaseFast` exécutait le binaire optimisé
   depuis le cache en laissant un binaire **Debug** dans `zig-out/bin`. Mon premier
   profil ne mesurait donc rien de pertinent. Corrigé : l'étape `bench` installe
-  maintenant, et `MYTERM_BENCH=<motif>` filtre les cas — un profileur braqué sur toute
+  maintenant, et `MAAI_BENCH=<motif>` filtre les cas — un profileur braqué sur toute
   la suite ne rapporte que les cas d'analyse, qui noient le reste.
 
 Profil de `resizeReflow` seul, en instructions :
@@ -194,7 +194,7 @@ l'historique.
 L'autre piste, ne reflower que l'historique atteignable, reste un changement
 architectural à ne pas entamer sans besoin constaté.
 
-Bug supplémentaire trouvé hors relevé, signalé à l'usage : **coller dans myterm ce
+Bug supplémentaire trouvé hors relevé, signalé à l'usage : **coller dans maai ce
 qu'on venait d'y copier ne faisait rien.** Interblocage sur soi-même — on demandait
 la sélection au compositeur, qui nous la redemandait par un événement `send` alors
 qu'on était déjà bloqué en `poll` sur le tube, sans dépiler les événements. Le

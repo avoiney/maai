@@ -86,7 +86,7 @@ pub const Color = packed struct(u32) {
 
 // ── defaults ────────────────────────────────────────────────────────────────
 // nightfox, matching ~/.config/kitty/themes/nightfox.conf exactly — the machine
-// already has a theme switcher writing those files, and myterm reading the same
+// already has a theme switcher writing those files, and maai reading the same
 // values means it looks right before any config exists.
 
 pub const default_fg = Rgb.rgb(0xcd, 0xce, 0xcf);

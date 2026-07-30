@@ -88,9 +88,9 @@ pub const Window = struct {
             return Error.RoleFailed;
         _ = c.xdg_toplevel_add_listener(w.toplevel, &toplevel_listener, w);
 
-        c.xdg_toplevel_set_title(w.toplevel, "myterm");
+        c.xdg_toplevel_set_title(w.toplevel, "maai");
         // sway matches rules on app_id; keep this stable, it is effectively API.
-        c.xdg_toplevel_set_app_id(w.toplevel, "myterm");
+        c.xdg_toplevel_set_app_id(w.toplevel, "maai");
 
         // Ask for server-side decorations so sway draws its own 1px border rather
         // than us reimplementing titlebars. If the compositor lacks the protocol we

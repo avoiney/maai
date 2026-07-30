@@ -320,14 +320,14 @@ pub const Diagnostics = struct {
 
     pub fn report(self: *const Diagnostics) void {
         for (self.items[0..self.len]) |d| {
-            std.debug.print("myterm: {s}:{d}: {s}\n", .{
+            std.debug.print("maai: {s}:{d}: {s}\n", .{
                 d.file.slice(),
                 d.line,
                 d.message.slice(),
             });
         }
         if (self.dropped > 0) {
-            std.debug.print("myterm: ...and {d} more\n", .{self.dropped});
+            std.debug.print("maai: ...and {d} more\n", .{self.dropped});
         }
     }
 };
@@ -471,7 +471,7 @@ pub fn parseTheme(
             };
         }
         // Every other kitty theme key — tab bar, borders, bell — describes chrome
-        // myterm does not have yet. Silently ignored rather than reported, or loading
+        // maai does not have yet. Silently ignored rather than reported, or loading
         // an unmodified kitty theme would print a dozen complaints.
     }
 }
@@ -948,12 +948,12 @@ test "tilde expansion only touches a leading ~/" {
 test "relative includes resolve against the including file" {
     var out: [256]u8 = undefined;
     try testing.expectEqualStrings(
-        "/etc/myterm/theme.conf",
-        resolveRelative("/etc/myterm/myterm.conf", "theme.conf", &out).?,
+        "/etc/maai/theme.conf",
+        resolveRelative("/etc/maai/maai.conf", "theme.conf", &out).?,
     );
     try testing.expectEqualStrings(
         "/abs.conf",
-        resolveRelative("/etc/myterm/myterm.conf", "/abs.conf", &out).?,
+        resolveRelative("/etc/maai/maai.conf", "/abs.conf", &out).?,
     );
 }
 

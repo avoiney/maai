@@ -108,18 +108,18 @@ pub fn main() !void {
     const gpa = std.heap.c_allocator;
 
     std.debug.print(
-        \\myterm benchmarks
+        \\maai benchmarks
         \\  build: {s}   (use -Doptimize=ReleaseFast for meaningful numbers)
         \\  {d} runs per case, reporting the minimum with spread above it
         \\
         \\
     , .{ @tagName(@import("builtin").mode), runs });
 
-    // `MYTERM_BENCH=<substring>` runs only the matching cases. Added for profiling:
+    // `MAAI_BENCH=<substring>` runs only the matching cases. Added for profiling:
     // a profiler pointed at the whole suite reports the parse cases, which drown out
     // whatever is being investigated, and callgrind's --toggle-collect cannot latch
     // onto a function the optimiser inlined.
-    const filter: ?[]const u8 = if (std.c.getenv("MYTERM_BENCH")) |f|
+    const filter: ?[]const u8 = if (std.c.getenv("MAAI_BENCH")) |f|
         std.mem.span(f)
     else
         null;

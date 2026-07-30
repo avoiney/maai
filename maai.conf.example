@@ -1,4 +1,4 @@
-# myterm configuration — copy to ~/.config/myterm/myterm.conf
+# maai configuration — copy to ~/.config/maai/maai.conf
 #
 # One setting per line. `#` starts a comment. The separator may be a space or a
 # colon, so both of these are the same line:
@@ -22,7 +22,7 @@
 
 # Must be monospace. A name fontconfig cannot find is *substituted*, not refused, so
 # a typo here would otherwise silently give you a proportional font and overlapping
-# text; myterm measures the advances and refuses instead.
+# text; maai measures the advances and refuses instead.
 # font_family FiraCode Nerd Font Ret
 # font_size 12
 
@@ -129,7 +129,7 @@
 # theme_dir ~/.config/kitty/themes
 
 # A file holding nothing but a theme name. Used only when `theme` is unset. The
-# switcher rewrites it, and myterm watches it — so flipping the flavour re-themes
+# switcher rewrites it, and maai watches it — so flipping the flavour re-themes
 # every open window instantly, including text already on screen.
 # theme_flavour_file ~/.config/.app-theme-flavour
 
@@ -140,7 +140,7 @@
 #
 # Theme files use kitty's key names, because that is what this machine's themes are
 # written in. Colours accept #rgb, #rrggbb, #rrrgggbbb, #rrrrggggbbbb and
-# rgb:r/g/b. Keys myterm has no chrome for (tab bar, borders, bell) are ignored
+# rgb:r/g/b. Keys maai has no chrome for (tab bar, borders, bell) are ignored
 # quietly rather than reported.
 #
 #     background            #192330
@@ -149,7 +149,7 @@
 #     cursor_text_color     #192330
 #     selection_background  #2b3b51
 #     selection_foreground  #cdcecf
-#     hint_background       #dbc074      (myterm-specific: hint-mode labels)
+#     hint_background       #dbc074      (maai-specific: hint-mode labels)
 #     hint_foreground       #192330
 #     tab_bar_background      #192330    (the strip behind the tabs)
 #     inactive_tab_background #2b3b51

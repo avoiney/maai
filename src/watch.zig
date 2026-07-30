@@ -57,7 +57,7 @@ pub const Watcher = struct {
     /// Watch the directory holding `path`, for changes to that name.
     ///
     /// Watching a file that does not exist yet is fine and useful — creating
-    /// `~/.config/myterm/myterm.conf` for the first time should take effect without a
+    /// `~/.config/maai/maai.conf` for the first time should take effect without a
     /// restart.
     pub fn add(self: *Watcher, path: []const u8) void {
         if (self.fd < 0 or self.n == max_paths) return;
@@ -161,7 +161,7 @@ test "a rename over the target is seen, because the directory is watched" {
     // A real directory and a real replace, since that is exactly the case a watch on
     // the file itself would miss.
     var tmp_buf: [64]u8 = undefined;
-    const dir = try std.fmt.bufPrint(&tmp_buf, "/tmp/myterm-watch-{d}", .{std.c.getpid()});
+    const dir = try std.fmt.bufPrint(&tmp_buf, "/tmp/maai-watch-{d}", .{std.c.getpid()});
     var dirz: [80]u8 = undefined;
     @memcpy(dirz[0..dir.len], dir);
     dirz[dir.len] = 0;
@@ -196,7 +196,7 @@ test "an unrelated file in the same directory is ignored" {
     defer w.deinit();
 
     var tmp_buf: [64]u8 = undefined;
-    const dir = try std.fmt.bufPrint(&tmp_buf, "/tmp/myterm-watch2-{d}", .{std.c.getpid()});
+    const dir = try std.fmt.bufPrint(&tmp_buf, "/tmp/maai-watch2-{d}", .{std.c.getpid()});
     var dirz: [80]u8 = undefined;
     @memcpy(dirz[0..dir.len], dir);
     dirz[dir.len] = 0;

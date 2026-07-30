@@ -80,13 +80,13 @@ pub fn build(b: *std.Build) void {
         "utf8proc",
     }) |lib| mod.linkSystemLibrary(lib, .{});
 
-    const exe = b.addExecutable(.{ .name = "myterm", .root_module = mod });
+    const exe = b.addExecutable(.{ .name = "maai", .root_module = mod });
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
-    const run_step = b.step("run", "Build and run myterm");
+    const run_step = b.step("run", "Build and run maai");
     run_step.dependOn(&run_cmd.step);
 
     // Full suite: links everything, so it can cover font and renderer code.

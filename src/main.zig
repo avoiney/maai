@@ -1,8 +1,8 @@
-//! myterm — phase 1: a PTY, a VT parser, and text on the screen.
+//! maai — phase 1: a PTY, a VT parser, and text on the screen.
 //!
 //! Usage:
-//!   myterm              run $SHELL
-//!   myterm -e cmd args  run a specific command (handy for scripted checks)
+//!   maai              run $SHELL
+//!   maai -e cmd args  run a specific command (handy for scripted checks)
 
 const std = @import("std");
 const c = @import("c.zig").c;
@@ -110,7 +110,7 @@ const App = struct {
     font: *const Font,
     pad: Padding,
     cfg: *const cfgmod.Config,
-    /// Set by MYTERM_DEBUG. Traces input and selection handling, which is
+    /// Set by MAAI_DEBUG. Traces input and selection handling, which is
     /// otherwise invisible: these paths are driven by hardware events that cannot
     /// be reproduced from a script.
     debug: bool = false,
@@ -227,7 +227,7 @@ const App = struct {
     /// Open a tab, starting where the current one is.
     fn tabNew(self: *App) void {
         if (self.tab_count == max_tabs) {
-            std.debug.print("myterm: {d} tabs is the limit\n", .{max_tabs});
+            std.debug.print("maai: {d} tabs is the limit\n", .{max_tabs});
             return;
         }
 
@@ -243,7 +243,7 @@ const App = struct {
             self.child_argv,
             dir,
         ) catch |err| {
-            std.debug.print("myterm: could not open a tab: {s}\n", .{@errorName(err)});
+            std.debug.print("maai: could not open a tab: {s}\n", .{@errorName(err)});
             return;
         };
         self.tabs[self.tab_count] = t;
@@ -384,7 +384,7 @@ const App = struct {
         if (launch.newWindow(dir)) |pid| {
             self.reaper.track(pid);
         } else {
-            std.debug.print("myterm: could not open a window in '{s}'\n", .{dir});
+            std.debug.print("maai: could not open a window in '{s}'\n", .{dir});
         }
     }
 
@@ -503,7 +503,7 @@ const App = struct {
         }
         // Rejected by the allowlist or the spawn failed. Say so rather than looking
         // like a click that did nothing.
-        std.debug.print("myterm: refused to open '{s}'\n", .{text});
+        std.debug.print("maai: refused to open '{s}'\n", .{text});
     }
 
     fn copyLink(self: *App, link: Link) void {
@@ -942,7 +942,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             @memcpy(dirz[0..args.cwd.len], args.cwd);
             dirz[args.cwd.len] = 0;
             if (std.c.chdir(@ptrCast(&dirz)) != 0) {
-                std.debug.print("myterm: could not enter '{s}'\n", .{args.cwd});
+                std.debug.print("maai: could not enter '{s}'\n", .{args.cwd});
             }
         }
     }
@@ -954,7 +954,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     // ── font: cell geometry determines the initial window size ──────────────
     var font = loadFont(&cfg) catch |err| {
-        std.debug.print("myterm: could not load '{s}' ({s})\n", .{
+        std.debug.print("maai: could not load '{s}' ({s})\n", .{
             cfg.font_family.slice(),
             @errorName(err),
         });
@@ -980,7 +980,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var dims = gridSize(win.width, win.height, &font, pad);
 
     const first = Tab.create(gpa, dims.cols, dims.rows, &cfg, argv.ptr, "") catch |err| {
-        std.debug.print("myterm: could not start {s}: {s}\n", .{
+        std.debug.print("maai: could not start {s}: {s}\n", .{
             std.mem.span(argv[0].?),
             @errorName(err),
         });
@@ -997,7 +997,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .pad = pad,
         .cfg = &cfg,
         .child_argv = argv.ptr,
-        .debug = std.c.getenv("MYTERM_DEBUG") != null,
+        .debug = std.c.getenv("MAAI_DEBUG") != null,
     };
     app.tabs[0] = first;
     app.tab_count = 1;
@@ -1026,7 +1026,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const gi = gl.info();
     const caps = Font.capabilities();
     std.debug.print(
-        \\myterm
+        \\maai
         \\  GL_RENDERER : {s}
         \\  cell        : {d}x{d} px  (baseline {d})
         \\  grid        : {d}x{d} cells in {d}x{d} px
@@ -1136,7 +1136,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
         _ = std.posix.poll(fds[0..n_fds], timeout) catch |err| {
             c.wl_display_cancel_read(win.display);
-            std.debug.print("myterm: poll failed: {s}\n", .{@errorName(err)});
+            std.debug.print("maai: poll failed: {s}\n", .{@errorName(err)});
             break;
         };
 
@@ -1152,7 +1152,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // the same revents, forever.
             const dead = std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL;
             if (fds[0].revents & dead != 0) {
-                std.debug.print("myterm: compositor connection closed\n", .{});
+                std.debug.print("maai: compositor connection closed\n", .{});
                 break;
             }
         }
@@ -1256,7 +1256,7 @@ fn render(
 
     if (cache.exhausted) {
         // Not fatal: affected glyphs render blank. Phase 7 adds LRU eviction.
-        std.debug.print("myterm: glyph atlas full\n", .{});
+        std.debug.print("maai: glyph atlas full\n", .{});
         cache.exhausted = false;
     }
 
@@ -1317,11 +1317,11 @@ fn reportWaylandError(win: *Window) void {
 
     if (iface) |i| {
         std.debug.print(
-            "myterm: wayland protocol error: {s} raised code {d} on object {d}\n",
+            "maai: wayland protocol error: {s} raised code {d} on object {d}\n",
             .{ std.mem.span(i.*.name), code, id },
         );
     } else {
-        std.debug.print("myterm: wayland connection lost (errno {d})\n", .{err});
+        std.debug.print("maai: wayland connection lost (errno {d})\n", .{err});
     }
 }
 
@@ -1390,11 +1390,11 @@ fn defaultConfigPath(out: []u8) []const u8 {
     if (std.c.getenv("XDG_CONFIG_HOME")) |xdg| {
         const dir = std.mem.span(xdg);
         if (dir.len > 0) {
-            return std.fmt.bufPrint(out, "{s}/myterm/myterm.conf", .{dir}) catch
-                "~/.config/myterm/myterm.conf";
+            return std.fmt.bufPrint(out, "{s}/maai/maai.conf", .{dir}) catch
+                "~/.config/maai/maai.conf";
         }
     }
-    return "~/.config/myterm/myterm.conf";
+    return "~/.config/maai/maai.conf";
 }
 
 /// Load the config, then the theme.
@@ -1463,7 +1463,7 @@ fn reloadConfig(l: Live) void {
     // and deciding what to do with the history that no longer fits. It applies at the
     // next start, which is what every other terminal does too.
     if (l.cfg.scrollback_lines != fresh.scrollback_lines) {
-        std.debug.print("myterm: scrollback_lines applies at the next start\n", .{});
+        std.debug.print("maai: scrollback_lines applies at the next start\n", .{});
     }
 
     if (l.app.debug) {
@@ -1488,7 +1488,7 @@ fn reloadConfig(l: Live) void {
             l.cache.deinit();
             l.cache.* = GlyphCache.init(l.gpa, l.font, atlas_size);
         } else |err| {
-            std.debug.print("myterm: keeping the old font, '{s}' failed ({s})\n", .{
+            std.debug.print("maai: keeping the old font, '{s}' failed ({s})\n", .{
                 l.cfg.font_family.slice(),
                 @errorName(err),
             });
@@ -1501,7 +1501,7 @@ fn reloadConfig(l: Live) void {
         const dims = gridSize(l.win.width, l.win.height, l.font, l.pad.*);
         for (l.app.tabs[0..l.app.tab_count]) |t| {
             t.screen.resize(dims.cols, dims.rows) catch |err| {
-                std.debug.print("myterm: resize after reload failed: {s}\n", .{
+                std.debug.print("maai: resize after reload failed: {s}\n", .{
                     @errorName(err),
                 });
             };

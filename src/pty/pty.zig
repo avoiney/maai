@@ -42,7 +42,7 @@ pub const Pty = struct {
 
         if (pid == 0) {
             // ── child ──
-            // TERM is xterm-256color until phase 2 ships a myterm terminfo entry.
+            // TERM is xterm-256color until phase 2 ships a maai terminfo entry.
             // Claiming a TERM whose terminfo is not installed breaks everything
             // that uses curses, so this stays conservative until we can also
             // answer `--print-terminfo` for remote hosts.
