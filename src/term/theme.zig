@@ -32,6 +32,12 @@ pub const Theme = struct {
     hint_bg: Rgb = default_hint_bg,
     hint_fg: Rgb = default_bg,
 
+    /// Tab bar: the strip, and the active tab standing out of it.
+    bar_bg: Rgb = default_bar_bg,
+    bar_fg: Rgb = default_bar_fg,
+    bar_active_bg: Rgb = default_bar_active_bg,
+    bar_active_fg: Rgb = default_bar_active_fg,
+
     /// The 256-colour palette. 0-15 come from the theme; 16-255 are the fixed xterm
     /// cube and greyscale ramp, which no theme redefines but OSC 4 may.
     palette: [256]Rgb = default_palette,
@@ -86,6 +92,11 @@ pub const default_cursor = Rgb.rgb(0xcd, 0xce, 0xcf);
 pub const default_selection_bg = Rgb.rgb(0x2b, 0x3b, 0x51);
 pub const default_selection_fg = Rgb.rgb(0xcd, 0xce, 0xcf);
 pub const default_hint_bg = Rgb.rgb(0xdb, 0xc0, 0x74);
+// nightfox's own tab-bar colours, so the bar matches the themes already on this machine.
+pub const default_bar_bg = Rgb.rgb(0x2b, 0x3b, 0x51);
+pub const default_bar_fg = Rgb.rgb(0x73, 0x80, 0x91);
+pub const default_bar_active_bg = Rgb.rgb(0x71, 0x9c, 0xd6);
+pub const default_bar_active_fg = Rgb.rgb(0x13, 0x1a, 0x24);
 
 pub const default_ansi16 = [16]Rgb{
     Rgb.rgb(0x39, 0x3b, 0x44), // 0 black

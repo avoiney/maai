@@ -45,20 +45,43 @@ pub const Action = enum {
     scroll_page_down,
     scroll_top,
     scroll_bottom,
+    tab_new,
+    tab_next,
+    tab_prev,
+    /// Jump to the tab at the pressed key's position in the number row.
+    tab_goto,
 };
+
+/// evdev codes of the number row, in order. Positional bindings match these rather
+/// than characters: on this AZERTY the row unshifted is `& é " ' ( - è _ ç à`, so
+/// matching characters would freeze one layout into the code, while "the Nth key of the
+/// number row" means the same thing everywhere. Browsers do exactly this, which is why
+/// their Ctrl+1..9 works on AZERTY without Shift.
+pub const num_row = [10]u32{ 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
+
+/// Position of `keycode` in the number row, 0-based.
+pub fn numRowIndex(keycode: u32) ?usize {
+    for (num_row, 0..) |code, i| {
+        if (code == keycode) return i;
+    }
+    return null;
+}
 
 pub const Binding = struct {
     /// Keysym, normalised to lower case — with Shift held xkb reports `C`, not `c`, and
-    /// a config that had to know that would be a trap.
+    /// a config that had to know that would be a trap. Ignored when `numrow` is set.
     sym: u32,
     ctrl: bool = false,
     shift: bool = false,
     alt: bool = false,
+    /// Matches any key of the number row, by position. Written `numrow` in a config.
+    numrow: bool = false,
     action: Action,
 
     fn sameCombo(a: Binding, b: Binding) bool {
-        return a.sym == b.sym and a.ctrl == b.ctrl and a.shift == b.shift and
-            a.alt == b.alt;
+        if (a.numrow != b.numrow) return false;
+        if (!a.numrow and a.sym != b.sym) return false;
+        return a.ctrl == b.ctrl and a.shift == b.shift and a.alt == b.alt;
     }
 };
 
@@ -83,6 +106,13 @@ pub const Bindings = struct {
         b.add(.{ .sym = c.XKB_KEY_Page_Down, .shift = true, .action = .scroll_page_down });
         b.add(.{ .sym = c.XKB_KEY_Home, .shift = true, .action = .scroll_top });
         b.add(.{ .sym = c.XKB_KEY_End, .shift = true, .action = .scroll_bottom });
+        // Tabs. Ctrl+Tab is the convention every other application uses; note it is a
+        // combination the keyboard protocol would otherwise offer applications, so
+        // `key ctrl+tab none` is the way to give it back.
+        b.add(.{ .sym = 't', .ctrl = true, .shift = true, .action = .tab_new });
+        b.add(.{ .sym = c.XKB_KEY_Tab, .ctrl = true, .action = .tab_next });
+        b.add(.{ .sym = c.XKB_KEY_Tab, .ctrl = true, .shift = true, .action = .tab_prev });
+        b.add(.{ .sym = 0, .alt = true, .numrow = true, .action = .tab_goto });
         return b;
     }
 
@@ -100,12 +130,23 @@ pub const Bindings = struct {
         self.len += 1;
     }
 
-    pub fn lookup(self: *const Bindings, sym: u32, ctrl: bool, shift: bool, alt: bool) ?Action {
+    /// `keycode` is the raw evdev code, needed only by positional bindings.
+    pub fn lookup(
+        self: *const Bindings,
+        sym: u32,
+        keycode: u32,
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+    ) ?Action {
         const key = normalizeSym(sym);
         for (self.items[0..self.len]) |b| {
-            if (b.sym == key and b.ctrl == ctrl and b.shift == shift and b.alt == alt) {
-                return if (b.action == .none) null else b.action;
-            }
+            if (b.ctrl != ctrl or b.shift != shift or b.alt != alt) continue;
+            const hit = if (b.numrow)
+                numRowIndex(keycode) != null
+            else
+                b.sym == key;
+            if (hit) return if (b.action == .none) null else b.action;
         }
         return null;
     }
@@ -358,7 +399,7 @@ pub fn parseTheme(
         }
 
         const slot: ?*Rgb =
-            if (std.mem.eql(u8, key, "background")) &theme.bg else if (std.mem.eql(u8, key, "foreground")) &theme.fg else if (std.mem.eql(u8, key, "cursor")) &theme.cursor else if (std.mem.eql(u8, key, "cursor_text_color")) &theme.cursor_text else if (std.mem.eql(u8, key, "selection_background")) &theme.selection_bg else if (std.mem.eql(u8, key, "selection_foreground")) &theme.selection_fg else if (std.mem.eql(u8, key, "hint_background")) &theme.hint_bg else if (std.mem.eql(u8, key, "hint_foreground")) &theme.hint_fg else null;
+            if (std.mem.eql(u8, key, "background")) &theme.bg else if (std.mem.eql(u8, key, "foreground")) &theme.fg else if (std.mem.eql(u8, key, "cursor")) &theme.cursor else if (std.mem.eql(u8, key, "cursor_text_color")) &theme.cursor_text else if (std.mem.eql(u8, key, "selection_background")) &theme.selection_bg else if (std.mem.eql(u8, key, "selection_foreground")) &theme.selection_fg else if (std.mem.eql(u8, key, "hint_background")) &theme.hint_bg else if (std.mem.eql(u8, key, "hint_foreground")) &theme.hint_fg else if (std.mem.eql(u8, key, "tab_bar_background")) &theme.bar_bg else if (std.mem.eql(u8, key, "inactive_tab_foreground")) &theme.bar_fg else if (std.mem.eql(u8, key, "active_tab_background")) &theme.bar_active_bg else if (std.mem.eql(u8, key, "active_tab_foreground")) &theme.bar_active_fg else null;
 
         if (slot) |s| {
             s.* = thememod.parseColor(value) orelse {
@@ -519,6 +560,8 @@ fn parseBinding(
             binding.shift = true;
         } else if (std.ascii.eqlIgnoreCase(part, "alt")) {
             binding.alt = true;
+        } else if (std.ascii.eqlIgnoreCase(part, "numrow")) {
+            binding.numrow = true;
         } else {
             // Anything not a modifier is the key, and there can only be one.
             if (key_name != null) {
@@ -527,6 +570,15 @@ fn parseBinding(
             }
             key_name = part;
         }
+    }
+
+    if (binding.numrow) {
+        if (key_name != null) {
+            diags.add(path, line, "numrow is the key; it takes no other");
+            return;
+        }
+        cfg.bindings.add(binding);
+        return;
     }
 
     const name = key_name orelse {
@@ -851,24 +903,24 @@ test "bindings parse a combination and an action" {
     , &cfg, &diags);
     try testing.expectEqual(@as(usize, 0), diags.len);
 
-    try testing.expectEqual(Action.copy, cfg.bindings.lookup('f', true, true, false).?);
-    try testing.expectEqual(Action.new_window, cfg.bindings.lookup('%', false, false, true).?);
+    try testing.expectEqual(Action.copy, cfg.bindings.lookup('f', 0, true, true, false).?);
+    try testing.expectEqual(Action.new_window, cfg.bindings.lookup('%', 0, false, false, true).?);
     // Names come from xkbcommon, so the xkb spelling works as written.
     try testing.expectEqual(
         Action.scroll_top,
-        cfg.bindings.lookup(c.XKB_KEY_Page_Up, false, true, false).?,
+        cfg.bindings.lookup(c.XKB_KEY_Page_Up, 0, false, true, false).?,
     );
 
     // The modifiers are part of the match: the same key without them is not bound.
-    try testing.expect(cfg.bindings.lookup('f', false, false, false) == null);
+    try testing.expect(cfg.bindings.lookup('f', 0, false, false, false) == null);
 }
 
 test "Shift does not have to be spelled into the keysym" {
     // xkb reports `C` when Shift is held, so a config writing `ctrl+shift+c` would
     // never match unless lookups normalise. This is the trap that normalisation avoids.
     const b = Bindings.defaults();
-    try testing.expectEqual(Action.copy, b.lookup('C', true, true, false).?);
-    try testing.expectEqual(Action.copy, b.lookup('c', true, true, false).?);
+    try testing.expectEqual(Action.copy, b.lookup('C', 0, true, true, false).?);
+    try testing.expectEqual(Action.copy, b.lookup('c', 0, true, true, false).?);
 }
 
 test "a later line overrides an earlier one, and `none` frees a combination" {
@@ -877,12 +929,12 @@ test "a later line overrides an earlier one, and `none` frees a combination" {
 
     // Ctrl+Shift+C is a default; rebinding it must replace rather than shadow.
     parseInto("key ctrl+shift+c hints", &cfg, &diags);
-    try testing.expectEqual(Action.hints, cfg.bindings.lookup('c', true, true, false).?);
+    try testing.expectEqual(Action.hints, cfg.bindings.lookup('c', 0, true, true, false).?);
 
     // ...and handing it back to applications is what `none` is for. This is the escape
     // hatch for combinations the keyboard protocol would otherwise expose.
     parseInto("key ctrl+shift+c none", &cfg, &diags);
-    try testing.expect(cfg.bindings.lookup('c', true, true, false) == null);
+    try testing.expect(cfg.bindings.lookup('c', 0, true, true, false) == null);
     try testing.expectEqual(@as(usize, 0), diags.len);
 }
 
@@ -899,7 +951,7 @@ test "a malformed binding is reported and the defaults survive" {
 
     try testing.expectEqual(@as(usize, 5), diags.len);
     // Every line was refused, so copy is still where it was.
-    try testing.expectEqual(Action.copy, cfg.bindings.lookup('c', true, true, false).?);
+    try testing.expectEqual(Action.copy, cfg.bindings.lookup('c', 0, true, true, false).?);
 }
 
 test "the binding table saturates rather than overflowing" {
@@ -908,4 +960,50 @@ test "the binding table saturates rather than overflowing" {
         b.add(.{ .sym = @intCast('a' + i), .action = .copy });
     }
     try testing.expectEqual(Bindings.capacity, b.len);
+}
+
+test "a positional binding matches the number row by key, not by character" {
+    const b = Bindings.defaults();
+
+    // On this AZERTY the unshifted row is `& é " ' ( - è _ ç à`, so the *keysym* differs
+    // per position and per layout. The keycode does not.
+    for (num_row, 0..) |code, i| {
+        _ = i;
+        try testing.expectEqual(Action.tab_goto, b.lookup(0, code, false, false, true).?);
+    }
+    // Outside the row, nothing.
+    try testing.expect(b.lookup(0, 30, false, false, true) == null);
+    // And the modifier still counts.
+    try testing.expect(b.lookup(0, num_row[0], false, false, false) == null);
+}
+
+test "numRowIndex gives the position, which is the action's argument" {
+    try testing.expectEqual(@as(usize, 0), numRowIndex(2).?);
+    try testing.expectEqual(@as(usize, 8), numRowIndex(10).?);
+    // KEY_0 sits last, as it does on the keyboard.
+    try testing.expectEqual(@as(usize, 9), numRowIndex(11).?);
+    try testing.expect(numRowIndex(1) == null);
+}
+
+test "numrow is configurable, and takes no other key" {
+    var cfg = Config{};
+    var diags = Diagnostics{};
+    parseInto("key ctrl+numrow tab_goto", &cfg, &diags);
+    try testing.expectEqual(@as(usize, 0), diags.len);
+    try testing.expectEqual(
+        Action.tab_goto,
+        cfg.bindings.lookup(0, num_row[3], true, false, false).?,
+    );
+
+    parseInto("key alt+numrow+f tab_goto", &cfg, &diags);
+    try testing.expectEqual(@as(usize, 1), diags.len);
+}
+
+test "the tab defaults are what was agreed" {
+    const b = Bindings.defaults();
+    try testing.expectEqual(Action.tab_new, b.lookup('t', 0, true, true, false).?);
+    try testing.expectEqual(Action.tab_next, b.lookup(c.XKB_KEY_Tab, 0, true, false, false).?);
+    try testing.expectEqual(Action.tab_prev, b.lookup(c.XKB_KEY_Tab, 0, true, true, false).?);
+    // Plain Tab is untouched, which is the whole point of putting ours behind Ctrl.
+    try testing.expect(b.lookup(c.XKB_KEY_Tab, 0, false, false, false) == null);
 }

@@ -70,8 +70,14 @@
 # express, so this is the escape hatch when the terminal and an application want the
 # same key.
 #
+# `numrow` is a key name meaning "any key of the number row, by position". On AZERTY
+# the unshifted row is & é " ' ( - è _ ç à, so `alt+numrow` is Alt plus one key where
+# Alt+1 would need Shift too — and matching by position keeps working on a layout
+# where those characters live elsewhere. Browsers bind their tab keys the same way.
+#
 # Actions: copy, paste, paste_primary, hints, new_window, scroll_page_up,
-#          scroll_page_down, scroll_top, scroll_bottom, none
+#          scroll_page_down, scroll_top, scroll_bottom, tab_new, tab_next, tab_prev,
+#          tab_goto, none
 #
 # The defaults:
 # key ctrl+shift+c copy
@@ -82,6 +88,10 @@
 # key shift+Page_Down scroll_page_down
 # key shift+Home scroll_top
 # key shift+End scroll_bottom
+# key ctrl+shift+t tab_new
+# key ctrl+tab tab_next
+# key ctrl+shift+tab tab_prev
+# key alt+numrow tab_goto
 
 # ── theme ────────────────────────────────────────────────────────────────────
 
@@ -122,4 +132,8 @@
 #     selection_foreground  #cdcecf
 #     hint_background       #dbc074      (myterm-specific: hint-mode labels)
 #     hint_foreground       #192330
+#     tab_bar_background    #192330
+#     inactive_tab_foreground #738091
+#     active_tab_background #719cd6
+#     active_tab_foreground #131a24
 #     color0 ... color255   #rrggbb

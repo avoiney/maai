@@ -22,6 +22,16 @@ const Font = @import("../font/font.zig").Font;
 const GlyphCache = @import("glyph_cache.zig").GlyphCache;
 const Hint = @import("../term/hints.zig").Hint;
 
+/// One column of the tab bar, prepared by the caller.
+///
+/// A flat list of columns rather than a list of tabs: the bar is drawn like any other
+/// row of cells, and deciding what goes in each column — truncation, separators, which
+/// tab is active — is layout, which belongs with the application, not the renderer.
+pub const BarCell = struct {
+    cp: u21 = ' ',
+    active: bool = false,
+};
+
 const Rgb = cellmod.Rgb;
 
 pub const Error = error{
@@ -246,6 +256,8 @@ pub const Renderer = struct {
         /// Screen because the storage belongs to the caller — unlike `selection`
         /// and `hover`, which are plain values the Screen can own outright.
         hints: []const Hint,
+        /// Tab bar, drawn on the row below the grid. Empty draws nothing.
+        bar: []const BarCell,
         cache: *GlyphCache,
         font: *const Font,
         viewport_w: u32,
@@ -255,6 +267,7 @@ pub const Renderer = struct {
         self.bg_list.clearRetainingCapacity();
         self.fg_list.clearRetainingCapacity();
         self.build(screen, hints, cache, font, pad);
+        self.buildBar(screen, bar, cache, font, pad);
 
         const bg = screen.theme.bg;
         c.glClearColor(
@@ -328,6 +341,42 @@ pub const Renderer = struct {
         }
 
         c.glBindVertexArray(0);
+    }
+
+    /// The bar sits on the row after the last grid row — a row the grid never had, which
+    /// is why `gridSize` reserves it.
+    fn buildBar(
+        self: *Renderer,
+        screen: *const Screen,
+        bar: []const BarCell,
+        cache: *GlyphCache,
+        font: *const Font,
+        pad: Padding,
+    ) void {
+        if (bar.len == 0) return;
+        const theme = &screen.theme;
+        const y = screen.grid.rows;
+
+        for (bar, 0..) |cell, i| {
+            const x: u32 = @intCast(i);
+            const bg = if (cell.active) theme.bar_active_bg else theme.bar_bg;
+            const fg = if (cell.active) theme.bar_active_fg else theme.bar_fg;
+
+            self.bg_list.append(self.gpa, .{
+                .cell = .{ @intCast(x), @intCast(y) },
+                .color = .{ bg.r, bg.g, bg.b, bg.a },
+            }) catch {};
+            if (cell.cp != ' ') {
+                self.emitGlyph(
+                    cache,
+                    font,
+                    pad.x + x * font.cell_w,
+                    pad.y + y * font.cell_h,
+                    cell.cp,
+                    fg,
+                );
+            }
+        }
     }
 
     fn build(

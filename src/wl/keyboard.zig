@@ -27,7 +27,9 @@ pub const Sink = struct {
 /// copies instead of sending a control byte to the child.
 pub const Bindings = struct {
     ctx: *anyopaque,
-    handle: *const fn (*anyopaque, sym: u32, ctrl: bool, shift: bool, alt: bool) bool,
+    /// `keycode` is the raw evdev code, for bindings that mean "the Nth key of a row"
+    /// rather than "this character" — see config.num_row.
+    handle: *const fn (*anyopaque, sym: u32, keycode: u32, ctrl: bool, shift: bool, alt: bool) bool,
 };
 
 pub const Keyboard = struct {
@@ -501,6 +503,7 @@ fn handleKey(
         if (b.handle(
             b.ctx,
             sym,
+            key,
             self.modActive("Control"),
             self.modActive("Shift"),
             self.modActive("Mod1"),

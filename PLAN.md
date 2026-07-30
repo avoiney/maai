@@ -802,13 +802,28 @@ outstanding from phase 3) are the way out.
 so tabs must live at stable addresses — heap-allocated, held as `[]*Tab`, never as a
 `[]Tab` that reallocation would move under the parser.
 
-*Order of work, refactor before feature:*
+*Order of work, refactor before feature — both done (2026-07-30):*
 
-1. Make the event loop poll a **dynamic** set of PTYs with exactly one tab, so the
-   restructuring is verifiable on its own: behaviour must be identical to today. This is
-   the risky part — background tabs have to keep draining while hidden, or a build running
-   in one tab stalls the moment you look at another.
-2. Then the feature: a second tab, switching, the bar.
+1. The event loop polls a dynamic set of PTYs. Done alone, with one tab, so "nothing
+   changes" was the criterion — and it earned itself: moving inotify from `fds[2]` to
+   `fds[1]` left the drain testing `fds[2]`, now the first tab's PTY, and live theme
+   reload silently stopped working. No test covers that path; it needs a compositor.
+2. Then the feature: creation inheriting the directory, switching, closing, the bar.
+
+*The bar row is reserved always*, even with one tab, so opening a second one does not
+resize the grid and reflow what you were reading. It also matches the existing kitty
+config, which shows the bar from the first tab.
+
+*Layout lives with the application, not the renderer.* `App.buildBar` produces one
+`BarCell` per column — codepoint plus "is this the active tab" — and the renderer draws
+that row like any other. Truncation, separators and numbering are layout decisions; the
+renderer's job is putting cells on screen. Titles are decoded as UTF-8 so an accented
+title occupies the columns it looks like it occupies.
+
+*Verified:* the bar renders with the title from OSC 2, and the grid reserves its row
+(34 rows plus the bar in a 700 px window). Creation and switching need `Ctrl+Shift+T` and
+`Ctrl+Tab` — modifiers, so a human. The positional lookup, the tab defaults and
+`numRowIndex` are unit-tested, including that plain `Tab` stays untouched.
 
 *Geometry.* The bar takes one row, so the grid shrinks by one and every tab's PTY needs
 the new size — not just the visible one, or a background tab writes at the wrong width and

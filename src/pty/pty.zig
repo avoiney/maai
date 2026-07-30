@@ -26,6 +26,9 @@ pub const Pty = struct {
         cols: u32,
         rows: u32,
         argv: [*:null]const ?[*:0]const u8,
+        /// Directory the child starts in; empty inherits ours. Applied in the child
+        /// after the fork, so this process never moves.
+        dir: []const u8,
     ) Error!Pty {
         var ws = std.mem.zeroes(c.struct_winsize);
         ws.ws_col = @intCast(cols);
@@ -43,6 +46,13 @@ pub const Pty = struct {
             // Claiming a TERM whose terminfo is not installed breaks everything
             // that uses curses, so this stays conservative until we can also
             // answer `--print-terminfo` for remote hosts.
+            if (dir.len > 0 and dir.len < 4096) {
+                var dirz: [4096]u8 = undefined;
+                @memcpy(dirz[0..dir.len], dir);
+                dirz[dir.len] = 0;
+                // Failure is not fatal: a shell in the wrong directory beats no shell.
+                _ = c.chdir(@ptrCast(&dirz));
+            }
             _ = c.setenv("TERM", "xterm-256color", 1);
             _ = c.setenv("COLORTERM", "truecolor", 1);
             // Stale values inherited from the launching terminal would mislead
@@ -188,7 +198,7 @@ test "the child's working directory is readable without its cooperation" {
     // with an unmodified shell: this machine's zsh never emits OSC 7, so a feature
     // built on the escape sequence alone would do nothing at all here.
     var argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", "sleep 5" };
-    var pty = Pty.spawn(20, 5, &argv) catch return error.SkipZigTest;
+    var pty = Pty.spawn(20, 5, &argv, "") catch return error.SkipZigTest;
     defer pty.deinit();
 
     var buf: [1024]u8 = undefined;

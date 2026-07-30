@@ -9,7 +9,8 @@ const c = @import("c.zig").c;
 
 const Window = @import("wl/window.zig").Window;
 const Gl = @import("gfx/egl.zig").Gl;
-const Renderer = @import("gfx/renderer.zig").Renderer;
+const rendermod = @import("gfx/renderer.zig");
+const Renderer = rendermod.Renderer;
 const Padding = @import("gfx/renderer.zig").Padding;
 const GlyphCache = @import("gfx/glyph_cache.zig").GlyphCache;
 const Font = @import("font/font.zig").Font;
@@ -68,6 +69,8 @@ const Tab = struct {
         rows: u32,
         cfg: *const cfgmod.Config,
         argv: [*:null]const ?[*:0]const u8,
+        /// Where the child starts; empty means inherit ours.
+        dir: []const u8,
     ) !*Tab {
         const tab = try gpa.create(Tab);
         errdefer gpa.destroy(tab);
@@ -76,7 +79,7 @@ const Tab = struct {
         errdefer tab.screen.deinit();
         applyConfig(&tab.screen, cfg);
 
-        tab.pty = try Pty.spawn(cols, rows, argv);
+        tab.pty = try Pty.spawn(cols, rows, argv, dir);
         // Only now, once `screen` sits at its final address.
         tab.parser = vt.Parser(Screen).init(&tab.screen);
         return tab;
@@ -100,6 +103,10 @@ const App = struct {
     tabs: [max_tabs]*Tab = undefined,
     tab_count: usize = 0,
     active: usize = 0,
+    /// The child command, so a new tab runs the same thing as the first.
+    child_argv: [*:null]const ?[*:0]const u8,
+    /// Scratch for the tab bar, rebuilt each frame it is drawn.
+    bar: [1024]rendermod.BarCell = undefined,
     font: *const Font,
     pad: Padding,
     cfg: *const cfgmod.Config,
@@ -156,6 +163,80 @@ const App = struct {
         t.screen.reply = .{ .ctx = self, .write = App.writeToPty };
         self.hintsExit();
         self.needs_render = true;
+    }
+
+    /// Lay the tab bar out, one column per cell.
+    ///
+    /// Built here rather than in the renderer because it is *layout* — how a title is
+    /// truncated, where the separators go, which tab is active — and the renderer's job
+    /// is to put cells on screen.
+    fn buildBar(self: *App) []const rendermod.BarCell {
+        const cols = self.screen.grid.cols;
+        var n: usize = 0;
+
+        for (self.tabs[0..self.tab_count], 0..) |t, i| {
+            const active = i == self.active;
+            var label: [64]u8 = undefined;
+            const title = t.screen.title();
+            const text = if (title.len > 0)
+                std.fmt.bufPrint(&label, " {d}: {s} ", .{ i + 1, title }) catch continue
+            else
+                std.fmt.bufPrint(&label, " {d} ", .{i + 1}) catch continue;
+
+            // Decoded as UTF-8 so a title with accents occupies the columns it looks
+            // like it occupies, rather than one per byte.
+            var it = (std.unicode.Utf8View.init(text) catch continue).iterator();
+            while (it.nextCodepoint()) |cp| {
+                if (n == cols or n == self.bar.len) break;
+                self.bar[n] = .{ .cp = cp, .active = active };
+                n += 1;
+            }
+            if (n == cols or n == self.bar.len) break;
+        }
+
+        // The strip runs the full width, so the bar reads as a bar and not as a label
+        // floating on the background.
+        while (n < cols and n < self.bar.len) : (n += 1) self.bar[n] = .{};
+        return self.bar[0..n];
+    }
+
+    /// Open a tab, starting where the current one is.
+    fn tabNew(self: *App) void {
+        if (self.tab_count == max_tabs) {
+            std.debug.print("myterm: {d} tabs is the limit\n", .{max_tabs});
+            return;
+        }
+
+        var buf: [launch.max_path_len]u8 = undefined;
+        const announced = self.screen.cwd();
+        const dir = if (announced.len > 0) announced else self.pty.cwd(&buf) orelse "";
+
+        const t = Tab.create(
+            self.gpa,
+            self.screen.grid.cols,
+            self.screen.grid.rows,
+            self.cfg,
+            self.child_argv,
+            dir,
+        ) catch |err| {
+            std.debug.print("myterm: could not open a tab: {s}\n", .{@errorName(err)});
+            return;
+        };
+        self.tabs[self.tab_count] = t;
+        self.tab_count += 1;
+        self.focus(self.tab_count - 1);
+    }
+
+    /// Drop tab `i`, whose child has gone. Returns false when that was the last one.
+    fn tabClosed(self: *App, i: usize) bool {
+        self.tabs[i].destroy(self.gpa);
+        var k = i;
+        while (k + 1 < self.tab_count) : (k += 1) self.tabs[k] = self.tabs[k + 1];
+        self.tab_count -= 1;
+        if (self.tab_count == 0) return false;
+        // Focus the neighbour, which is what closing a tab means everywhere else.
+        self.focus(@min(i, self.tab_count - 1));
+        return true;
     }
 
     fn writeToPty(ctx: *anyopaque, bytes: []const u8) void {
@@ -676,7 +757,14 @@ const App = struct {
     /// The table comes from the config, so a combination can be moved or handed back to
     /// applications with `key <combo> none` — which matters for the ones we take that
     /// the keyboard protocol would otherwise make available.
-    fn onBinding(ctx: *anyopaque, sym: u32, ctrl: bool, shift: bool, alt: bool) bool {
+    fn onBinding(
+        ctx: *anyopaque,
+        sym: u32,
+        keycode: u32,
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+    ) bool {
         const self: *App = @ptrCast(@alignCast(ctx));
 
         // Hint mode swallows everything while it is up — see `hintsKey`.
@@ -685,7 +773,8 @@ const App = struct {
             return true;
         }
 
-        const action = self.cfg.bindings.lookup(sym, ctrl, shift, alt) orelse return false;
+        const action = self.cfg.bindings.lookup(sym, keycode, ctrl, shift, alt) orelse
+            return false;
         const grid = &self.screen.grid;
         switch (action) {
             .none => return false,
@@ -709,6 +798,17 @@ const App = struct {
             .scroll_bottom => {
                 grid.resetView();
                 self.needs_render = true;
+            },
+            .tab_new => self.tabNew(),
+            .tab_next => self.focus((self.active + 1) % self.tab_count),
+            .tab_prev => self.focus(
+                (self.active + self.tab_count - 1) % self.tab_count,
+            ),
+            .tab_goto => {
+                // The key's position *is* the argument, which is what lets one binding
+                // cover all ten keys.
+                const i = cfgmod.numRowIndex(keycode) orelse return true;
+                if (i < self.tab_count) self.focus(i);
             },
         }
         return true;
@@ -855,7 +955,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var pad = Padding{ .x = cfg.padding_x, .y = cfg.padding_y };
     var dims = gridSize(win.width, win.height, &font, pad);
 
-    const first = Tab.create(gpa, dims.cols, dims.rows, &cfg, argv.ptr) catch |err| {
+    const first = Tab.create(gpa, dims.cols, dims.rows, &cfg, argv.ptr, "") catch |err| {
         std.debug.print("myterm: could not start {s}: {s}\n", .{
             std.mem.span(argv[0].?),
             @errorName(err),
@@ -872,6 +972,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .font = &font,
         .pad = pad,
         .cfg = &cfg,
+        .child_argv = argv.ptr,
         .debug = std.c.getenv("MYTERM_DEBUG") != null,
     };
     app.tabs[0] = first;
@@ -1090,9 +1191,21 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // that hold a live pid.
         app.reaper.poll();
 
-        // With one tab this is the whole window's lifetime, as before. Closing
-        // individual tabs arrives with tab switching.
-        if (app.pty.hung_up or app.pty.childExited()) break;
+        // A tab whose child is gone goes with it; the window closes with the last one.
+        // Iterated backwards so removing one does not shift an index we have yet to
+        // check.
+        var ti = app.tab_count;
+        var all_closed = false;
+        while (ti > 0) {
+            ti -= 1;
+            const t = app.tabs[ti];
+            if (!(t.pty.hung_up or t.pty.childExited())) continue;
+            if (!app.tabClosed(ti)) {
+                all_closed = true;
+                break;
+            }
+        }
+        if (all_closed) break;
     }
 }
 
@@ -1108,6 +1221,7 @@ fn render(
     renderer.draw(
         app.screen,
         app.hints[0..app.hint_n],
+        app.buildBar(),
         cache,
         font,
         win.width,
@@ -1200,14 +1314,22 @@ fn monotonicMs() i64 {
 
 const Dims = struct { cols: u32, rows: u32 };
 
+/// Rows the tab bar takes out of the grid.
+///
+/// Always reserved, even with one tab, so opening a second one does not resize the grid
+/// and reflow everything you were looking at. It also matches the existing kitty config,
+/// which shows the bar from the first tab.
+const tab_bar_rows: u32 = 1;
+
 fn gridSize(width: u32, height: u32, font: *const Font, pad: Padding) Dims {
     // Padding is left/top only, matching the user's existing kitty and wezterm
     // configs (`window_padding_width 0 0 0 4`).
     const usable_w = if (width > pad.x) width - pad.x else font.cell_w;
     const usable_h = if (height > pad.y) height - pad.y else font.cell_h;
+    const rows = usable_h / font.cell_h;
     return .{
         .cols = @max(usable_w / font.cell_w, 1),
-        .rows = @max(usable_h / font.cell_h, 1),
+        .rows = @max(rows -| tab_bar_rows, 1),
     };
 }
 
