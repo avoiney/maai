@@ -131,8 +131,8 @@ const App = struct {
 
         // Shift is the universal override, and it is not a nicety: while an
         // application holds the mouse it is the only way to select text out of
-        // nvim, tmux or lazygit. Ctrl is ours too, since it opens links — see
-        // `link_mod` for why that modifier and not another.
+        // nvim, tmux or lazygit. Ctrl is ours too, because it opens links; that is
+        // also why the planned Ctrl+drag block selection moves to Alt+drag.
         if (mods.shift or mods.ctrl) return false;
         // Scrolled into history, the application's coordinate space no longer
         // matches what is on screen — a report would make it act on unrelated text.
@@ -141,20 +141,36 @@ const App = struct {
         return true;
     }
 
+    /// What is under `at`: an OSC 8 hyperlink if the cell carries one, otherwise
+    /// whatever the plain-text scanner can make of the surrounding characters.
+    ///
+    /// OSC 8 wins because it is explicit. An application that went to the trouble of
+    /// declaring a target knows better than our heuristics — and its link text often
+    /// is not a URL at all.
+    fn linkUnder(self: *App, at: sel.Point) ?Link {
+        if (self.screen.hyperlinkAt(at)) |h| {
+            return .{ .span = h.span, .id = h.id };
+        }
+        if (urlmod.find(&self.screen.grid, at)) |span| {
+            return .{ .span = span, .id = 0 };
+        }
+        return null;
+    }
+
     /// Recompute what the pointer is hovering, and reflect it in the cursor shape.
     ///
-    /// Only while the link modifier is held: underlining every URL the pointer
-    /// crosses while you are simply reading is noise, and the underline is a promise
-    /// that a click *right now* will open it.
+    /// Only while Ctrl is held: underlining every URL the pointer crosses while you
+    /// are simply reading is noise, and the underline is a promise that a click
+    /// *right now* will open that link.
     fn updateHover(self: *App, mods: mouse.Mods) void {
         const before = self.screen.hover;
-        self.screen.hover = if (mods.ctrl)
-            urlmod.find(&self.screen.grid, self.pointAt(
+        self.screen.hover = if (mods.ctrl) blk: {
+            const hit = self.linkUnder(self.pointAt(
                 self.win.pointer.x,
                 self.win.pointer.y,
-            ))
-        else
-            null;
+            )) orelse break :blk null;
+            break :blk hit.span;
+        } else null;
 
         self.win.pointer.setShape(if (self.screen.hover != null) .pointer else .text);
 
@@ -174,14 +190,24 @@ const App = struct {
 
     /// Open whatever is under the pointer, if it is a link. Returns true if it was.
     fn openLinkAt(self: *App, at: sel.Point) bool {
-        const span = urlmod.find(&self.screen.grid, at) orelse return false;
-        const text = urlmod.text(
-            self.gpa,
-            &self.screen.grid,
-            &self.screen.graphemes,
-            span,
-        ) catch return false;
-        defer self.gpa.free(text);
+        const hit = self.linkUnder(at) orelse return false;
+
+        // An OSC 8 target lives in the link table, not in the cells: what is on
+        // screen is the *label*, which is frequently not a URL at all.
+        var owned: ?[]u8 = null;
+        defer if (owned) |o| self.gpa.free(o);
+        const text = if (hit.id != 0)
+            self.screen.links.get(hit.id)
+        else blk: {
+            const t = urlmod.text(
+                self.gpa,
+                &self.screen.grid,
+                &self.screen.graphemes,
+                hit.span,
+            ) catch return false;
+            owned = t;
+            break :blk t;
+        };
 
         if (self.debug) std.debug.print("link: opening '{s}'\n", .{text});
         if (launch.open(text)) |pid| {
@@ -506,6 +532,14 @@ const App = struct {
 
 /// A position on the visible screen, 0-based.
 const CellPos = struct { col: u32, row: u32 };
+
+/// A clickable link: the cells it covers, plus its OSC 8 id when it has one.
+const Link = struct {
+    span: urlmod.Span,
+    /// Non-zero for an OSC 8 hyperlink, whose target is in `Screen.links` rather
+    /// than in the cells themselves.
+    id: u16,
+};
 
 /// evdev button code to the wire button number.
 ///

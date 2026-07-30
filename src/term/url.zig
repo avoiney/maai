@@ -177,6 +177,11 @@ fn charAt(grid: *const Grid, p: Point) u21 {
     return @intCast(cell.content);
 }
 
+/// Public because OSC 8 hyperlink runs are walked the same way — a link, like a
+/// URL, follows soft wraps and stops at a hard break.
+pub const prevPos = prev;
+pub const nextPos = next;
+
 fn prev(grid: *const Grid, p: Point) ?Point {
     if (p.x > 0) return .{ .line = p.line, .x = p.x - 1 };
     if (p.line == 0) return null;

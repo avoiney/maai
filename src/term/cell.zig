@@ -42,7 +42,11 @@ pub const Style = struct {
     bg: Rgb,
     ul: Rgb,
     attrs: Attrs = .{},
-    /// Index into the hyperlink registry (OSC 8). 0 = none. Wired up in phase 4.
+    /// Index into `LinkTable` (OSC 8). 0 = none.
+    ///
+    /// Riding along in the style rather than in the `Cell` is what keeps a cell at 8
+    /// bytes: a hyperlink run has uniform styling in practice, so interning collapses
+    /// it to one entry instead of one per cell.
     hyperlink: u16 = 0,
 
     pub const default: Style = .{
@@ -84,6 +88,9 @@ comptime {
 /// 65535 id ceiling so there is room to keep working while the scan runs.
 pub const style_gc_threshold: usize = 32768;
 pub const grapheme_gc_threshold: usize = 16384;
+/// Links are far rarer than styles, so this collects long before the id space or the
+/// byte budget runs out.
+pub const link_gc_threshold: usize = 4096;
 
 /// Maps Style -> id, with a dense array for id -> Style.
 ///
@@ -133,6 +140,111 @@ pub const StyleTable = struct {
             self.list.appendAssumeCapacity(s);
             try self.map.put(gpa, s, @intCast(i));
         }
+    }
+};
+
+/// OSC 8 hyperlink targets, interned so a run of linked cells costs one id.
+///
+/// The URIs come from output, which is untrusted: a process can print a distinct
+/// hyperlink per cell. Hence the caps below, and `Screen.collectGarbage` reclaiming
+/// entries no surviving style references.
+pub const LinkTable = struct {
+    /// Longer than any URI worth storing, and it bounds a single OSC 8 payload.
+    pub const max_uri_len: usize = 2048;
+    /// Total budget for stored URIs. Beyond it, interning fails closed — new links
+    /// simply are not links, which degrades cosmetically instead of growing without
+    /// bound.
+    pub const max_bytes: usize = 1 << 20;
+
+    pub const Span = struct { start: u32, len: u32 };
+
+    data: std.ArrayList(u8) = .empty,
+    spans: std.ArrayList(Span) = .empty,
+    /// URI -> id. Keys are owned copies: `data` reallocates as it grows, so keys
+    /// pointing into it would dangle after any append.
+    map: std.StringHashMapUnmanaged(u16) = .empty,
+
+    pub fn init(self: *LinkTable, gpa: std.mem.Allocator) !void {
+        self.* = .{};
+        // Id 0 means "no link", so it holds an empty span and is never handed out.
+        try self.spans.append(gpa, .{ .start = 0, .len = 0 });
+    }
+
+    pub fn deinit(self: *LinkTable, gpa: std.mem.Allocator) void {
+        self.freeKeys(gpa);
+        self.data.deinit(gpa);
+        self.spans.deinit(gpa);
+        self.map.deinit(gpa);
+    }
+
+    fn freeKeys(self: *LinkTable, gpa: std.mem.Allocator) void {
+        var it = self.map.keyIterator();
+        while (it.next()) |k| gpa.free(k.*);
+    }
+
+    /// Intern a URI and return its id, or 0 if it cannot be stored.
+    pub fn intern(self: *LinkTable, gpa: std.mem.Allocator, uri: []const u8) u16 {
+        if (uri.len == 0 or uri.len > max_uri_len) return 0;
+        if (self.map.get(uri)) |id| return id;
+        if (self.data.items.len + uri.len > max_bytes) return 0;
+        if (self.spans.items.len >= std.math.maxInt(u16)) return 0;
+
+        const start: u32 = @intCast(self.data.items.len);
+        self.data.appendSlice(gpa, uri) catch return 0;
+        const id: u16 = @intCast(self.spans.items.len);
+        self.spans.append(gpa, .{ .start = start, .len = @intCast(uri.len) }) catch {
+            self.data.shrinkRetainingCapacity(start);
+            return 0;
+        };
+        const key = gpa.dupe(u8, uri) catch return id; // usable, just not deduped
+        self.map.put(gpa, key, id) catch gpa.free(key);
+        return id;
+    }
+
+    pub fn get(self: *const LinkTable, id: u16) []const u8 {
+        if (id == 0 or id >= self.spans.items.len) return "";
+        const span = self.spans.items[id];
+        return self.data.items[span.start..][0..span.len];
+    }
+
+    pub fn count(self: *const LinkTable) usize {
+        return self.spans.items.len;
+    }
+
+    /// Replace the contents wholesale. `spans` index into `data`, and ids start at 1
+    /// — slot 0 is prepended here and stays "no link".
+    ///
+    /// Takes the compacted bytes rather than a list of slices *on purpose*: the
+    /// caller's slices would otherwise point into `self.data`, and copying them back
+    /// into that same buffer is an overlapping `@memcpy`. Zig catches it in debug
+    /// mode; it would be silent corruption in release.
+    pub fn replace(
+        self: *LinkTable,
+        gpa: std.mem.Allocator,
+        data: []const u8,
+        spans: []const Span,
+    ) !void {
+        std.debug.assert(!overlaps(data, self.data.items));
+
+        self.freeKeys(gpa);
+        self.map.clearRetainingCapacity();
+        self.data.clearRetainingCapacity();
+        self.spans.clearRetainingCapacity();
+
+        try self.data.appendSlice(gpa, data);
+        try self.spans.append(gpa, .{ .start = 0, .len = 0 });
+        for (spans) |span| {
+            const id: u16 = @intCast(self.spans.items.len);
+            try self.spans.append(gpa, span);
+            const key = try gpa.dupe(u8, data[span.start..][0..span.len]);
+            self.map.put(gpa, key, id) catch gpa.free(key);
+        }
+    }
+
+    fn overlaps(a: []const u8, b: []const u8) bool {
+        if (a.len == 0 or b.len == 0) return false;
+        return @intFromPtr(a.ptr) < @intFromPtr(b.ptr) + b.len and
+            @intFromPtr(b.ptr) < @intFromPtr(a.ptr) + a.len;
     }
 };
 
@@ -258,6 +370,50 @@ test "style interning dedupes and assigns 0 to default" {
     try std.testing.expectEqual(a, b);
     try std.testing.expect(a != 0);
     try std.testing.expect(table.get(a).fg.eq(ansi16[1]));
+}
+
+test "link interning dedupes, reserves 0, and fails closed when full" {
+    const gpa = std.testing.allocator;
+    var links: LinkTable = undefined;
+    try links.init(gpa);
+    defer links.deinit(gpa);
+
+    // 0 is "no link" and never handed out.
+    try std.testing.expectEqualStrings("", links.get(0));
+    try std.testing.expectEqual(@as(u16, 0), links.intern(gpa, ""));
+
+    const a = links.intern(gpa, "https://example.com/one");
+    const b = links.intern(gpa, "https://example.com/two");
+    try std.testing.expect(a != 0 and b != 0 and a != b);
+    try std.testing.expectEqual(a, links.intern(gpa, "https://example.com/one"));
+    try std.testing.expectEqualStrings("https://example.com/one", links.get(a));
+    try std.testing.expectEqualStrings("https://example.com/two", links.get(b));
+
+    // Oversize URIs are refused rather than truncated: a truncated URI is a
+    // different URI.
+    var huge: [LinkTable.max_uri_len + 1]u8 = undefined;
+    @memset(&huge, 'a');
+    try std.testing.expectEqual(@as(u16, 0), links.intern(gpa, &huge));
+
+    // Unknown ids read as no link rather than reading out of bounds.
+    try std.testing.expectEqualStrings("", links.get(9999));
+}
+
+test "link replace renumbers from 1 and keeps dedup working" {
+    const gpa = std.testing.allocator;
+    var links: LinkTable = undefined;
+    try links.init(gpa);
+    defer links.deinit(gpa);
+
+    _ = links.intern(gpa, "https://gone/");
+    _ = links.intern(gpa, "https://kept/");
+
+    const kept = "https://kept/";
+    try links.replace(gpa, kept, &.{.{ .start = 0, .len = kept.len }});
+    try std.testing.expectEqual(@as(usize, 2), links.count()); // slot 0 plus one
+    try std.testing.expectEqualStrings(kept, links.get(1));
+    // The map was rebuilt against the new bytes, so interning finds the survivor.
+    try std.testing.expectEqual(@as(u16, 1), links.intern(gpa, kept));
 }
 
 test "palette256 cube and greyscale land on known xterm values" {

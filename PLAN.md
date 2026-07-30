@@ -597,12 +597,33 @@ root-only. So the scanner and the launcher are unit-tested (including that
 `https://x/$(id>/tmp/pwn)` stays one argument and that the hostile schemes are refused), but
 `Ctrl`+hover and `Ctrl`+click needed a human at the keyboard.
 
-**Still outstanding in this phase:**
+**OSC 8 explicit hyperlinks (2026-07-30).** `cell.LinkTable` interns the URIs; the id
+rides in `Style.hyperlink`, not in the `Cell`, which is what keeps a cell at 8 bytes — a
+link run has uniform styling in practice, so interning collapses it to one entry instead
+of one per cell.
 
-- **OSC 8** explicit hyperlinks. `Style.hyperlink` is already reserved for the id; what is
-  missing is the URI registry, its own reclamation pass, and OSC 8 parsing.
-- **Hint mode**: a keybind overlaying a letter label on every visible match. Needs the
-  renderer to draw cells that are not in the grid, which nothing else needs yet.
+- **OSC 8 wins over the plain-text scanner** where both apply. An application that
+  declared a target knows better than our heuristics, and its label frequently is not a
+  URL at all.
+- **The allowlist applies to OSC 8 too**, at intern time rather than only at launch: an
+  underlined `javascript:` link would be a promise we must not make. Control bytes in the
+  URI are refused as well, and that check is reachable — our OSC collector takes
+  everything up to BEL or ST, unlike a strict DEC parser which drops control bytes.
+- **Reclamation comes free with the style pass.** Links are reached only through styles,
+  so the surviving style set *is* the mark phase; no second sweep over cells.
+- The URI table is capped in both ids and total bytes, and fails closed — a process
+  printing a distinct hyperlink per cell degrades to "not a link" rather than growing
+  without bound. That is the §3 bug class, which has already bitten once.
+
+**A bug the tests caught: an overlapping `@memcpy`.** Compacting the link table by handing
+`replace` a list of slices *into the table being replaced* meant copying bytes onto
+themselves. Zig's `@memcpy` asserts non-overlap in debug, so it aborted; in release it
+would have been silent corruption. `replace` now takes the compacted bytes and spans, and
+asserts the buffers are disjoint.
+
+**Still outstanding in this phase:** **hint mode** — a keybind overlaying a letter label on
+every visible match. Needs the renderer to draw cells that are not in the grid, which
+nothing else needs yet.
 
 **Acceptance:** click and hint-open both launch the desktop handler for `https://`,
 `file://`, `mailto:`. A line containing `https://x/$(id>/tmp/pwn)` opens harmlessly and

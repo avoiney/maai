@@ -118,6 +118,9 @@ pub const Screen = struct {
     styles: StyleTable = .{},
     /// Multi-codepoint clusters (base plus combining marks or variation selectors).
     graphemes: cellmod.GraphemeTable = .{},
+    /// OSC 8 hyperlink targets. Cells reach them through their style's
+    /// `hyperlink` id.
+    links: cellmod.LinkTable = .{},
     /// Mouse/keyboard text selection. Lives here so the renderer can highlight it
     /// from the same place it reads cells.
     selection: sel.Selection = .{},
@@ -164,6 +167,7 @@ pub const Screen = struct {
     /// When `collectGarbage` runs, per table.
     gc_styles: Gc = .{ .trigger = cellmod.style_gc_threshold },
     gc_graphemes: Gc = .{ .trigger = cellmod.grapheme_gc_threshold },
+    gc_links: Gc = .{ .trigger = cellmod.link_gc_threshold },
 
     /// Last printed codepoint, for REP.
     last_printed: u21 = ' ',
@@ -202,6 +206,7 @@ pub const Screen = struct {
             .tab_stops = tabs,
         };
         try s.styles.init(gpa);
+        try s.links.init(gpa);
         s.resetTabs();
         return s;
     }
@@ -212,6 +217,7 @@ pub const Screen = struct {
         self.gpa.free(self.tab_stops);
         self.styles.deinit(self.gpa);
         self.graphemes.deinit(self.gpa);
+        self.links.deinit(self.gpa);
     }
 
     pub fn resize(self: *Screen, cols: u32, rows: u32) !void {
@@ -578,9 +584,71 @@ pub const Screen = struct {
             const n = @min(text.len, self.title_buf.len);
             @memcpy(self.title_buf[0..n], text[0..n]);
             self.title_len = n;
+        } else if (std.mem.eql(u8, code, "8")) {
+            self.setHyperlink(text);
         }
-        // OSC 7 (cwd), 8 (hyperlinks), 4/10/11 (palette), 52 (clipboard) land in
-        // phases 4-6. OSC 52 *reads* stay denied by default regardless.
+        // OSC 7 (cwd), 4/10/11 (palette) and 52 (clipboard) land in phases 5-6.
+        // OSC 52 *reads* stay denied by default regardless.
+    }
+
+    /// `OSC 8 ; params ; URI ST` — everything printed from now on belongs to that
+    /// URI, until an empty URI ends the run.
+    ///
+    /// The `params` field (`id=…`, used to group discontiguous runs) is parsed off
+    /// and discarded: it only matters for grouping, and highlighting the contiguous
+    /// run under the pointer needs no grouping.
+    fn setHyperlink(self: *Screen, text: []const u8) void {
+        // Split at the *first* semicolon only. A URI's query may well contain more,
+        // and cutting at the last one would corrupt exactly those links.
+        const semi = std.mem.indexOfScalar(u8, text, ';') orelse return;
+        const uri = text[semi + 1 ..];
+
+        if (uri.len == 0) {
+            self.pen.hyperlink = 0;
+            self.commitPen();
+            return;
+        }
+
+        // Only schemes the launcher will actually open become links. Otherwise the
+        // hover underline would promise a click that gets refused — and the whole
+        // point of the allowlist is that `javascript:` never reaches a handler,
+        // whether it arrived as plain text or as an OSC 8 payload.
+        if (!urlmod.allowedScheme(uri)) return;
+        // A URI is a single argument to a program later on; a control character in
+        // it has no legitimate purpose here.
+        for (uri) |ch| if (ch <= 0x20 or ch == 0x7f) return;
+
+        if (self.gc_links.due(self.links.count())) self.collectGarbage();
+        self.pen.hyperlink = self.links.intern(self.gpa, uri);
+        self.commitPen();
+    }
+
+    /// The OSC 8 hyperlink under `at`, as the contiguous run of cells sharing its
+    /// id, or null if there is none.
+    pub fn hyperlinkAt(self: *const Screen, at: sel.Point) ?struct {
+        span: urlmod.Span,
+        id: u16,
+    } {
+        if (at.line >= self.grid.count or at.x >= self.grid.cols) return null;
+        const id = self.styles.get(self.grid.line(at.line).cells[at.x].style).hyperlink;
+        if (id == 0) return null;
+
+        var start = at;
+        while (urlmod.prevPos(&self.grid, start)) |p| {
+            if (self.linkIdAt(p) != id) break;
+            start = p;
+        }
+        var end = at;
+        while (urlmod.nextPos(&self.grid, end)) |p| {
+            if (self.linkIdAt(p) != id) break;
+            end = p;
+        }
+        return .{ .span = .{ .start = start, .end = end }, .id = id };
+    }
+
+    fn linkIdAt(self: *const Screen, p: sel.Point) u16 {
+        if (p.line >= self.grid.count or p.x >= self.grid.cols) return 0;
+        return self.styles.get(self.grid.line(p.line).cells[p.x].style).hyperlink;
     }
 
     // DCS is parsed but dropped until Sixel arrives in phase 8.
@@ -1074,6 +1142,8 @@ pub const Screen = struct {
     const marked_style: u16 = 0xfffe;
     const unused_cluster: u32 = 0xffff_ffff;
     const marked_cluster: u32 = 0xffff_fffe;
+    const unused_link: u16 = 0xffff;
+    const marked_link: u16 = 0xfffe;
 
     /// Reclaim style ids and grapheme clusters no cell refers to any more.
     ///
@@ -1130,6 +1200,44 @@ pub const Screen = struct {
             new_styles.append(gpa, self.styles.list.items[old]) catch return;
         }
 
+        // Hyperlinks are reached only through styles, so the surviving styles are
+        // exactly the mark phase for the link table — no second sweep over cells.
+        const link_n = self.links.count();
+        const link_map = gpa.alloc(u16, link_n) catch return;
+        defer gpa.free(link_map);
+        @memset(link_map, unused_link);
+        for (new_styles.items) |style| {
+            if (style.hyperlink != 0 and style.hyperlink < link_n) {
+                link_map[style.hyperlink] = marked_link;
+            }
+        }
+        // Compacted into fresh buffers rather than a list of slices: slices would
+        // point into the table we are about to overwrite.
+        var new_link_data: std.ArrayList(u8) = .empty;
+        defer new_link_data.deinit(gpa);
+        var new_link_spans: std.ArrayList(cellmod.LinkTable.Span) = .empty;
+        defer new_link_spans.deinit(gpa);
+        for (link_map, 0..) |*slot, old| {
+            if (slot.* != marked_link) continue;
+            const uri = self.links.get(@intCast(old));
+            const start: u32 = @intCast(new_link_data.items.len);
+            new_link_data.appendSlice(gpa, uri) catch return;
+            // Ids restart at 1; 0 stays "no link".
+            slot.* = @intCast(new_link_spans.items.len + 1);
+            new_link_spans.append(gpa, .{
+                .start = start,
+                .len = @intCast(uri.len),
+            }) catch return;
+        }
+        for (new_styles.items) |*style| {
+            if (style.hyperlink == 0) continue;
+            style.hyperlink = if (style.hyperlink < link_n and
+                link_map[style.hyperlink] < marked_link)
+                link_map[style.hyperlink]
+            else
+                0;
+        }
+
         var new_data: std.ArrayList(u21) = .empty;
         defer new_data.deinit(gpa);
         var new_spans: std.ArrayList(cellmod.GraphemeTable.Span) = .empty;
@@ -1182,6 +1290,7 @@ pub const Screen = struct {
             0;
 
         self.styles.rebuild(gpa, new_styles.items) catch {};
+        self.links.replace(gpa, new_link_data.items, new_link_spans.items) catch {};
         self.graphemes.data.clearRetainingCapacity();
         self.graphemes.spans.clearRetainingCapacity();
         self.graphemes.data.appendSlice(gpa, new_data.items) catch {};
@@ -1192,6 +1301,11 @@ pub const Screen = struct {
             cluster_n,
             new_spans.items.len,
             std.math.maxInt(u32) - 1,
+        );
+        self.gc_links.rearm(
+            link_n,
+            new_link_spans.items.len + 1,
+            std.math.maxInt(u16) - 1,
         );
         self.dirty = true;
     }
@@ -1687,6 +1801,107 @@ test "application cursor keys and bracketed paste modes are tracked" {
     feed(&s, "\x1b[?1l\x1b[?2004l");
     try std.testing.expect(!s.modes.app_cursor);
     try std.testing.expect(!s.modes.bracketed_paste);
+}
+
+test "OSC 8 marks printed cells, and an empty URI ends the run" {
+    var s = try Screen.init(std.testing.allocator, 20, 2);
+    defer s.deinit();
+
+    feed(&s, "a\x1b]8;;https://example.com/x\x1b\\link\x1b]8;;\x1b\\b");
+
+    const row = s.grid.line(s.grid.screenTop()).cells;
+    const idOf = struct {
+        fn f(scr: *const Screen, cell: Cell) u16 {
+            return scr.styles.get(cell.style).hyperlink;
+        }
+    }.f;
+
+    try std.testing.expectEqual(@as(u16, 0), idOf(&s, row[0])); // 'a', before
+    const id = idOf(&s, row[1]);
+    try std.testing.expect(id != 0);
+    for (1..5) |x| try std.testing.expectEqual(id, idOf(&s, row[x])); // "link"
+    try std.testing.expectEqual(@as(u16, 0), idOf(&s, row[5])); // 'b', after
+
+    try std.testing.expectEqualStrings("https://example.com/x", s.links.get(id));
+}
+
+test "hyperlinkAt returns the whole run, following a soft wrap" {
+    var s = try Screen.init(std.testing.allocator, 6, 3);
+    defer s.deinit();
+
+    // "abcdefgh" wraps after 6 columns; the whole thing is one hyperlink.
+    feed(&s, "\x1b]8;;https://example.com/\x1b\\abcdefgh\x1b]8;;\x1b\\");
+
+    const top = s.grid.screenTop();
+    const hit = s.hyperlinkAt(.{ .line = top, .x = 3 }) orelse
+        return error.NoHyperlink;
+    try std.testing.expectEqual(top, hit.span.start.line);
+    try std.testing.expectEqual(@as(u32, 0), hit.span.start.x);
+    try std.testing.expectEqual(top + 1, hit.span.end.line);
+    try std.testing.expectEqual(@as(u32, 1), hit.span.end.x);
+    try std.testing.expectEqualStrings("https://example.com/", s.links.get(hit.id));
+
+    // Reachable from the continuation row too.
+    const from_second = s.hyperlinkAt(.{ .line = top + 1, .x = 0 }) orelse
+        return error.NoHyperlink;
+    try std.testing.expectEqual(hit.id, from_second.id);
+
+    // Not on a plain cell.
+    feed(&s, "\r\nplain");
+    try std.testing.expect(s.hyperlinkAt(.{ .line = top + 2, .x = 1 }) == null);
+}
+
+test "OSC 8 refuses schemes the launcher would not open" {
+    var s = try Screen.init(std.testing.allocator, 20, 2);
+    defer s.deinit();
+
+    // An underlined, clickable `javascript:` link would be a promise we must not
+    // make: the allowlist has to hold whether the URI arrived as text or as OSC 8.
+    for ([_][]const u8{
+        "\x1b]8;;javascript:alert(1)\x1b\\",
+        "\x1b]8;;data:text/html,x\x1b\\",
+        "\x1b]8;;vscode://file/etc/passwd\x1b\\",
+        // A raw control byte inside the URI. Our OSC collector is permissive —
+        // it takes everything up to BEL or ST — so this really does reach the
+        // handler, unlike an ESC, which ends the string before it gets here.
+        "\x1b]8;;https://x/\x01y\x1b\\",
+    }) |seq| {
+        feed(&s, seq);
+        feed(&s, "z");
+        try std.testing.expectEqual(@as(u16, 0), s.pen.hyperlink);
+    }
+    // Nothing was stored: only the reserved slot 0 exists.
+    try std.testing.expectEqual(@as(usize, 1), s.links.count());
+}
+
+test "hyperlinks referenced only from scrollback survive collection" {
+    var s = try Screen.initScrollback(std.testing.allocator, 8, 2, 16);
+    defer s.deinit();
+    s.gc_links.trigger = 1;
+    s.gc_styles.trigger = 1;
+
+    feed(&s, "\x1b]8;;https://kept/\x1b\\keep\x1b]8;;\x1b\\\r\n");
+    // Scroll it off the visible screen but not out of the ring.
+    feed(&s, "x\r\ny\r\n");
+
+    // A link nothing references any more.
+    feed(&s, "\x1b]8;;https://gone/\x1b\\g\x1b]8;;\x1b\\");
+    feed(&s, "\x1b[2K\r"); // erase the line holding it
+    s.collectGarbage();
+
+    var kept = false;
+    var gone = false;
+    for (1..s.links.count()) |i| {
+        const uri = s.links.get(@intCast(i));
+        if (std.mem.eql(u8, uri, "https://kept/")) kept = true;
+        if (std.mem.eql(u8, uri, "https://gone/")) gone = true;
+    }
+    try std.testing.expect(kept);
+    try std.testing.expect(!gone);
+
+    // And the surviving cells still resolve to the right URI.
+    const hit = s.hyperlinkAt(.{ .line = 0, .x = 0 }) orelse return error.NoHyperlink;
+    try std.testing.expectEqualStrings("https://kept/", s.links.get(hit.id));
 }
 
 test "mouse tracking modes are independent bits" {
