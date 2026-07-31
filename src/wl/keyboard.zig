@@ -582,12 +582,31 @@ fn handleEnter(
     _: ?*c.struct_wl_array,
 ) callconv(.c) void {}
 
+/// Focus left. Everything the keyboard was holding onto has to be dropped here,
+/// because none of it will ever be resolved by an event that follows.
+///
+/// The compositor stops delivering `key` the moment focus moves, so the release for
+/// a key held at that instant never arrives — and a repeat armed on it would stream
+/// bytes forever, which is exactly what happened when a window stole focus mid-press.
+/// The same reasoning covers the modifiers (a `Ctrl` held while switching would stay
+/// latched, turning the next click into a link click) and a half-finished compose
+/// sequence. `enter` is always followed by `modifiers`, so the real state comes back
+/// on its own; only the layout group is preserved, since nothing here invalidates it.
 fn handleLeave(
-    _: ?*anyopaque,
+    data: ?*anyopaque,
     _: ?*c.struct_wl_keyboard,
     _: u32,
     _: ?*c.struct_wl_surface,
-) callconv(.c) void {}
+) callconv(.c) void {
+    const self: *Keyboard = @ptrCast(@alignCast(data.?));
+    self.stopRepeat();
+    if (self.state) |s| {
+        const group = c.xkb_state_serialize_layout(s, c.XKB_STATE_LAYOUT_EFFECTIVE);
+        _ = c.xkb_state_update_mask(s, 0, 0, 0, 0, 0, group);
+    }
+    if (self.compose_state) |cs| c.xkb_compose_state_reset(cs);
+    if (self.on_mods) |h| h.changed(h.ctx);
+}
 
 // ── tests ───────────────────────────────────────────────────────────────────
 //
@@ -835,6 +854,27 @@ test "nothing is reported without the modifier that makes it ambiguous" {
     // Shift alone likewise: `A` is not ambiguous.
     hold(&kbd, false, true);
     try testing.expect(kittyFor(&kbd, c.XKB_KEY_a, &buf) == null);
+}
+
+test "losing focus stops a repeat and drops held modifiers" {
+    var kbd = azerty() orelse return error.SkipZigTest;
+    defer kbd.deinit();
+
+    // A key held while another window steals focus: the release never arrives, because
+    // the compositor stops delivering `key` at that moment. Whatever the repeat is
+    // holding has to be dropped here or it streams bytes until focus comes back.
+    kbd.repeat_buf[0] = 'e';
+    kbd.repeat_len = 1;
+    kbd.repeat_key = 26;
+    kbd.repeat_at = nowMs();
+    hold(&kbd, true, true);
+
+    handleLeave(&kbd, null, 0, null);
+
+    try testing.expectEqual(@as(usize, 0), kbd.repeat_len);
+    try testing.expectEqual(@as(i64, 0), kbd.repeat_at);
+    // Ctrl left latched would turn the next click into a link click.
+    try testing.expectEqual(mouse.Mods{}, kbd.activeMods());
 }
 
 test "the protocol is reachable through encode, not just through encodeKitty" {
