@@ -373,6 +373,13 @@ pub const Keyboard = struct {
 
         switch (sym) {
             c.XKB_KEY_Return, c.XKB_KEY_KP_Enter => {
+                // Ctrl+Enter is LF, as in xterm. Legacy has no way to encode the
+                // modifier, so the convention is to send the *other* newline byte —
+                // which is what a full-screen editor reads as "break the line rather
+                // than accept it", Claude Code's prompt among them. Nothing is lost
+                // in a shell: the line discipline accepts LF and CR alike, so
+                // Ctrl+Enter still submits at a prompt, exactly like Ctrl+J.
+                if (ctrl) return copy(buf, if (alt) "\x1b\n" else "\n");
                 // CR, not LF: the line discipline turns it into NL (ICRNL).
                 if (alt) return copy(buf, "\x1b\r");
                 return copy(buf, "\r");
@@ -854,6 +861,29 @@ test "nothing is reported without the modifier that makes it ambiguous" {
     // Shift alone likewise: `A` is not ambiguous.
     hold(&kbd, false, true);
     try testing.expect(kittyFor(&kbd, c.XKB_KEY_a, &buf) == null);
+}
+
+test "Ctrl+Enter is LF in the legacy encoding" {
+    var kbd = azerty() orelse return error.SkipZigTest;
+    defer kbd.deinit();
+    var buf: [32]u8 = undefined;
+
+    // Without the kitty protocol — which Claude Code enables only for a hardcoded list
+    // of terminals we are not on — LF is the *only* thing an application can read as
+    // "newline, not submit". Sending CR made Ctrl+Enter indistinguishable from Enter.
+    const code = keycodeFor(&kbd, c.XKB_KEY_Return).?;
+    hold(&kbd, true, false);
+    try testing.expectEqualStrings("\n", kbd.encode(code, &buf).?);
+
+    // Enter itself is untouched: CR, which the line discipline turns into NL.
+    hold(&kbd, false, false);
+    try testing.expectEqualStrings("\r", kbd.encode(code, &buf).?);
+
+    // And the protocol still wins when the application did ask for it.
+    var modes = Modes{ .kitty_flags = 1 };
+    kbd.modes = &modes;
+    hold(&kbd, true, false);
+    try testing.expectEqualStrings("\x1b[13;5u", kbd.encode(code, &buf).?);
 }
 
 test "losing focus stops a repeat and drops held modifiers" {
