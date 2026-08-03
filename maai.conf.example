@@ -7,8 +7,8 @@
 #     font_size: 12
 #
 # This is not YAML: no nesting, no lists, no quoting. It is a flat mapping, which is
-# all a terminal config needs, and it means the kitty theme files already on this
-# machine load unchanged.
+# all a terminal config needs, and it means existing `key value` theme files load
+# unchanged.
 #
 # Every line below shows the default. An unknown setting or an unparseable value is
 # reported on stderr and skipped — a typo never stops the terminal from opening.
@@ -26,7 +26,7 @@
 # font_family FiraCode Nerd Font Ret
 # font_size 12
 
-# Left and top only, matching the existing kitty/wezterm setup.
+# Left and top only, matching the usual terminal setup.
 # padding_x 4
 # padding_y 0
 
@@ -63,7 +63,8 @@
 # With a font that lacks them the separators come out blank; `plain` is the way out.
 # tab_bar_style powerline
 
-# angled (), slanted (), round (). Names and glyphs follow kitty.
+# angled (), slanted (), round (). Names and glyphs follow the established
+# powerline conventions.
 # tab_powerline_style slanted
 
 # ── keyboard shortcuts ───────────────────────────────────────────────────────
@@ -84,7 +85,7 @@
 #
 # A later line replaces an earlier one, so a `key` here overrides the default. The
 # action `none` *unbinds* a combination, handing it back to applications — which is
-# what you want for any shortcut a full-screen program needs. Under the Kitty
+# what you want for any shortcut a full-screen program needs. Under the CSI u
 # keyboard protocol applications can see combinations the legacy encoding could not
 # express, so this is the escape hatch when the terminal and an application want the
 # same key.
@@ -126,7 +127,7 @@
 
 # Where a *named* theme is looked up. Defaults to the directory this machine's
 # app-theme switcher already writes into, so its dayfox/nightfox files just work.
-# theme_dir ~/.config/kitty/themes
+# theme_dir ~/.config/maai/themes
 
 # A file holding nothing but a theme name. Used only when `theme` is unset. The
 # switcher rewrites it, and maai watches it — so flipping the flavour re-themes
@@ -138,7 +139,8 @@
 
 # ── theme file format ────────────────────────────────────────────────────────
 #
-# Theme files use kitty's key names, because that is what this machine's themes are
+# Theme files use the established `key value` colour names, because that is what
+# this machine's themes are
 # written in. Colours accept #rgb, #rrggbb, #rrrgggbbb, #rrrrggggbbbb and
 # rgb:r/g/b. Keys maai has no chrome for (tab bar, borders, bell) are ignored
 # quietly rather than reported.

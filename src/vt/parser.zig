@@ -50,7 +50,7 @@ const State = enum {
     dcs_ignore,
     osc_string,
     // ESC, APC and PM strings are consumed and dropped until phase 8 needs APC
-    // for the Kitty graphics protocol.
+    // for the inline-image protocol (`ESC _ G`).
     sos_pm_apc_string,
 };
 

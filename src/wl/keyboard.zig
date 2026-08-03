@@ -6,7 +6,7 @@
 //! able to type. Phase 3 replaces this wholesale and adds what is missing here:
 //!
 //!   - key repeat (repeat_info is captured below but not acted on)
-//!   - the Kitty keyboard protocol and legacy modifyOtherKeys
+//!   - the CSI u keyboard protocol and legacy modifyOtherKeys
 //!   - xkbcommon-compose for dead keys and Compose sequences
 //!   - application cursor-key mode (DECCKM), which changes CSI to SS3
 //!   - configurable bindings
@@ -203,7 +203,7 @@ pub const Keyboard = struct {
         }
     }
 
-    // ── kitty keyboard protocol ─────────────────────────────────────────────
+    // ── CSI u keyboard protocol ─────────────────────────────────────────────
 
     /// Base codepoint of a key: what it produces with no modifiers, in the current
     /// layout.
@@ -236,13 +236,13 @@ pub const Keyboard = struct {
 
     /// Encode a key under the protocol, or null when the legacy form is correct.
     ///
-    /// Only flag 1 is implemented (see `Screen.kitty_supported`), so this reports the
+    /// Only flag 1 is implemented (see `Screen.csi_u_supported`), so this reports the
     /// keys legacy cannot express *unambiguously* and leaves everything else alone.
     /// That conservatism is deliberate: sending `Ctrl+C` as an escape sequence would
     /// mean the line discipline never sees 0x03, and a program that enabled the mode
     /// and died would leave a shell that cannot be interrupted. The per-screen flags
     /// stack guards against that too, but not sending it is a stronger guarantee.
-    fn encodeKitty(self: *Keyboard, keycode: u32, sym: u32, buf: []u8) ?[]const u8 {
+    fn encodeCsiU(self: *Keyboard, keycode: u32, sym: u32, buf: []u8) ?[]const u8 {
         const m = self.activeMods();
         const mods: u8 = 1 +
             (if (m.shift) @as(u8, 1) else 0) +
@@ -305,12 +305,12 @@ pub const Keyboard = struct {
             .text => |t| return t,
         }
 
-        // The kitty keyboard protocol, when the application asked for it. Returns null
+        // The CSI u keyboard protocol, when the application asked for it. Returns null
         // to mean "legacy is right for this key", so everything not disambiguated
         // stays byte-identical to what it was before the protocol existed.
-        const kitty_flags = if (self.modes) |m| m.kitty_flags else 0;
-        if (kitty_flags & 1 != 0) {
-            if (self.encodeKitty(keycode, sym, buf)) |bytes| return bytes;
+        const csi_u_flags = if (self.modes) |m| m.csi_u_flags else 0;
+        if (csi_u_flags & 1 != 0) {
+            if (self.encodeCsiU(keycode, sym, buf)) |bytes| return bytes;
         }
 
         const mods = self.activeMods();
@@ -705,7 +705,7 @@ test "with no compose table, keys pass through unchanged" {
     try testing.expect(kbd.compose(c.XKB_KEY_dead_circumflex, &buf) == .passthrough);
 }
 
-// ── kitty protocol tests ────────────────────────────────────────────────────
+// ── CSI u protocol tests ────────────────────────────────────────────────────
 //
 // Also driven without a keyboard: an xkb keymap can be built from layout *names*, so
 // the encoder can be asked what it would send for a given key with given modifiers —
@@ -762,9 +762,9 @@ fn hold(kbd: *Keyboard, ctrl: bool, shift: bool) void {
     _ = c.xkb_state_update_mask(kbd.state.?, mask, 0, 0, 0, 0, 0);
 }
 
-fn kittyFor(kbd: *Keyboard, sym: c.xkb_keysym_t, buf: []u8) ?[]const u8 {
+fn csiUFor(kbd: *Keyboard, sym: c.xkb_keysym_t, buf: []u8) ?[]const u8 {
     const code = keycodeFor(kbd, sym) orelse return null;
-    return kbd.encodeKitty(code, sym, buf);
+    return kbd.encodeCsiU(code, sym, buf);
 }
 
 test "escape always disambiguates" {
@@ -774,7 +774,7 @@ test "escape always disambiguates" {
 
     // The headline of flag 1. Without it an application has to wait and see whether
     // more bytes follow, which is exactly what nvim's ttimeoutlen works around.
-    try testing.expectEqualStrings("\x1b[27u", kittyFor(&kbd, c.XKB_KEY_Escape, &buf).?);
+    try testing.expectEqualStrings("\x1b[27u", csiUFor(&kbd, c.XKB_KEY_Escape, &buf).?);
 }
 
 test "Ctrl+I is distinguishable from Tab" {
@@ -785,14 +785,14 @@ test "Ctrl+I is distinguishable from Tab" {
     // Both are 0x09 in the legacy encoding, which is why `<C-i>` cannot be mapped in
     // nvim without losing the tab key.
     hold(&kbd, true, false);
-    try testing.expectEqualStrings("\x1b[105;5u", kittyFor(&kbd, c.XKB_KEY_i, &buf).?);
+    try testing.expectEqualStrings("\x1b[105;5u", csiUFor(&kbd, c.XKB_KEY_i, &buf).?);
 
     // Tab itself keeps its legacy byte: unmodified, it is not ambiguous.
     hold(&kbd, false, false);
-    try testing.expect(kittyFor(&kbd, c.XKB_KEY_Tab, &buf) == null);
+    try testing.expect(csiUFor(&kbd, c.XKB_KEY_Tab, &buf) == null);
     // Ctrl+Tab has no legacy encoding at all.
     hold(&kbd, true, false);
-    try testing.expectEqualStrings("\x1b[9;5u", kittyFor(&kbd, c.XKB_KEY_Tab, &buf).?);
+    try testing.expectEqualStrings("\x1b[9;5u", csiUFor(&kbd, c.XKB_KEY_Tab, &buf).?);
 }
 
 test "Shift+Enter gets an encoding it never had" {
@@ -802,13 +802,13 @@ test "Shift+Enter gets an encoding it never had" {
 
     // This is what lets Claude Code take a newline without sending the message.
     hold(&kbd, false, true);
-    try testing.expectEqualStrings("\x1b[13;2u", kittyFor(&kbd, c.XKB_KEY_Return, &buf).?);
+    try testing.expectEqualStrings("\x1b[13;2u", csiUFor(&kbd, c.XKB_KEY_Return, &buf).?);
     hold(&kbd, true, false);
-    try testing.expectEqualStrings("\x1b[13;5u", kittyFor(&kbd, c.XKB_KEY_Return, &buf).?);
+    try testing.expectEqualStrings("\x1b[13;5u", csiUFor(&kbd, c.XKB_KEY_Return, &buf).?);
 
     // Plain Enter still sends CR, so nothing changes for anything else.
     hold(&kbd, false, false);
-    try testing.expect(kittyFor(&kbd, c.XKB_KEY_Return, &buf) == null);
+    try testing.expect(csiUFor(&kbd, c.XKB_KEY_Return, &buf) == null);
 }
 
 test "Ctrl+C keeps its control byte" {
@@ -820,12 +820,12 @@ test "Ctrl+C keeps its control byte" {
     // instead would mean the line discipline never sees it — a program that enabled the
     // mode and then died would leave a shell that cannot be interrupted.
     hold(&kbd, true, false);
-    try testing.expect(kittyFor(&kbd, c.XKB_KEY_c, &buf) == null);
-    try testing.expect(kittyFor(&kbd, c.XKB_KEY_d, &buf) == null);
+    try testing.expect(csiUFor(&kbd, c.XKB_KEY_c, &buf) == null);
+    try testing.expect(csiUFor(&kbd, c.XKB_KEY_d, &buf) == null);
 
     // Ctrl+Shift+C *is* reported: legacy collapses it onto the same 0x03.
     hold(&kbd, true, true);
-    try testing.expectEqualStrings("\x1b[99;6u", kittyFor(&kbd, c.XKB_KEY_c, &buf).?);
+    try testing.expectEqualStrings("\x1b[99;6u", csiUFor(&kbd, c.XKB_KEY_c, &buf).?);
 }
 
 test "the colliding control keys report, and the base codepoint ignores shift" {
@@ -835,13 +835,13 @@ test "the colliding control keys report, and the base codepoint ignores shift" {
 
     hold(&kbd, true, false);
     // Ctrl+M collides with Enter, Ctrl+[ with Escape, Ctrl+H with Backspace.
-    try testing.expectEqualStrings("\x1b[109;5u", kittyFor(&kbd, c.XKB_KEY_m, &buf).?);
-    try testing.expectEqualStrings("\x1b[104;5u", kittyFor(&kbd, c.XKB_KEY_h, &buf).?);
-    try testing.expectEqualStrings("\x1b[106;5u", kittyFor(&kbd, c.XKB_KEY_j, &buf).?);
+    try testing.expectEqualStrings("\x1b[109;5u", csiUFor(&kbd, c.XKB_KEY_m, &buf).?);
+    try testing.expectEqualStrings("\x1b[104;5u", csiUFor(&kbd, c.XKB_KEY_h, &buf).?);
+    try testing.expectEqualStrings("\x1b[106;5u", csiUFor(&kbd, c.XKB_KEY_j, &buf).?);
 
     // Shift must not change the key's identity: the code is the unshifted codepoint.
     hold(&kbd, true, true);
-    try testing.expectEqualStrings("\x1b[109;6u", kittyFor(&kbd, c.XKB_KEY_m, &buf).?);
+    try testing.expectEqualStrings("\x1b[109;6u", csiUFor(&kbd, c.XKB_KEY_m, &buf).?);
 }
 
 test "nothing is reported without the modifier that makes it ambiguous" {
@@ -859,11 +859,11 @@ test "nothing is reported without the modifier that makes it ambiguous" {
         c.XKB_KEY_Tab,
         c.XKB_KEY_BackSpace,
     }) |sym| {
-        try testing.expect(kittyFor(&kbd, sym, &buf) == null);
+        try testing.expect(csiUFor(&kbd, sym, &buf) == null);
     }
     // Shift alone likewise: `A` is not ambiguous.
     hold(&kbd, false, true);
-    try testing.expect(kittyFor(&kbd, c.XKB_KEY_a, &buf) == null);
+    try testing.expect(csiUFor(&kbd, c.XKB_KEY_a, &buf) == null);
 }
 
 test "Shift+Enter and Ctrl+Enter are LF in the legacy encoding" {
@@ -871,7 +871,7 @@ test "Shift+Enter and Ctrl+Enter are LF in the legacy encoding" {
     defer kbd.deinit();
     var buf: [32]u8 = undefined;
 
-    // Without the kitty protocol — which Claude Code enables only for a hardcoded list
+    // Without the CSI u protocol — which Claude Code enables only for a hardcoded list
     // of terminals we are not on — LF is the *only* thing an application can read as
     // "newline, not submit". Sending CR made both chords indistinguishable from Enter.
     const code = keycodeFor(&kbd, c.XKB_KEY_Return).?;
@@ -886,7 +886,7 @@ test "Shift+Enter and Ctrl+Enter are LF in the legacy encoding" {
 
     // And the protocol still wins when the application did ask for it, where the two
     // chords are distinct rather than sharing one byte.
-    var modes = Modes{ .kitty_flags = 1 };
+    var modes = Modes{ .csi_u_flags = 1 };
     kbd.modes = &modes;
     hold(&kbd, false, true);
     try testing.expectEqualStrings("\x1b[13;2u", kbd.encode(code, &buf).?);
@@ -915,8 +915,8 @@ test "losing focus stops a repeat and drops held modifiers" {
     try testing.expectEqual(mouse.Mods{}, kbd.activeMods());
 }
 
-test "the protocol is reachable through encode, not just through encodeKitty" {
-    // The tests above call `encodeKitty` directly, so they say nothing about whether
+test "the protocol is reachable through encode, not just through encodeCsiU" {
+    // The tests above call `encodeCsiU` directly, so they say nothing about whether
     // `encode` ever *reaches* it. That gap hid a real bug once: Tab and Ctrl+I came out
     // identical in a live terminal while every unit test passed.
     var kbd = azerty() orelse return error.SkipZigTest;
@@ -936,7 +936,7 @@ test "the protocol is reachable through encode, not just through encodeKitty" {
     try testing.expectEqualStrings("\t", kbd.encode(code_tab, &buf).?);
 
     // With the flag on, they must differ.
-    modes.kitty_flags = 1;
+    modes.csi_u_flags = 1;
     hold(&kbd, true, false);
     try testing.expectEqualStrings("\x1b[105;5u", kbd.encode(code_i, &buf).?);
     hold(&kbd, false, false);
@@ -945,6 +945,6 @@ test "the protocol is reachable through encode, not just through encodeKitty" {
     // And Escape, the other headline.
     const code_esc = keycodeFor(&kbd, c.XKB_KEY_Escape).?;
     try testing.expectEqualStrings("\x1b[27u", kbd.encode(code_esc, &buf).?);
-    modes.kitty_flags = 0;
+    modes.csi_u_flags = 0;
     try testing.expectEqualStrings("\x1b", kbd.encode(code_esc, &buf).?);
 }

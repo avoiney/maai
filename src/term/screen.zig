@@ -82,8 +82,8 @@ pub const Gc = struct {
     }
 };
 
-fn maskKittyFlags(raw: u16) u5 {
-    return @intCast(raw & kitty_supported);
+fn maskCsiUFlags(raw: u16) u5 {
+    return @intCast(raw & csi_u_supported);
 }
 
 const SavedCursor = struct {
@@ -110,13 +110,13 @@ pub const Modes = struct {
     /// Defaults on, as in xterm: without it the wheel does nothing at all in `less`
     /// or `man`, which is the single most common wheel use in a terminal.
     alternate_scroll: bool = true,
-    /// Kitty keyboard protocol flags currently in effect. Zero means the legacy
+    /// CSI u keyboard protocol flags currently in effect. Zero means the legacy
     /// encoding, which is the default and must stay byte-identical to what it was
     /// before this protocol existed.
-    kitty_flags: u5 = 0,
+    csi_u_flags: u5 = 0,
 };
 
-/// Kitty keyboard protocol: what we implement.
+/// The CSI u keyboard protocol: what we implement.
 ///
 /// **Only flag 1, "disambiguate escape codes".** That is the flag that carries the
 /// value: it makes `Esc` unambiguous, separates `Ctrl+I` from `Tab` and `Ctrl+M` from
@@ -138,11 +138,11 @@ pub const Modes = struct {
 /// application queries with `CSI ? u`, is told exactly which flags took effect, and
 /// falls back for the rest. Claiming a flag we do not implement is what would break
 /// applications.
-pub const kitty_supported: u5 = 1;
+pub const csi_u_supported: u5 = 1;
 
 /// Depth of the flags stack. Applications push on entry and pop on exit; a bounded
 /// stack means a program that pushes in a loop cannot grow our memory.
-pub const kitty_stack_max = 16;
+pub const csi_u_stack_max = 16;
 
 pub const Screen = struct {
     gpa: std.mem.Allocator,
@@ -206,16 +206,16 @@ pub const Screen = struct {
 
     /// Saved keyboard flags, and the same for the inactive screen.
     ///
-    /// Per screen buffer, as kitty does, and it is a safety property rather than
-    /// tidiness: a full-screen application that enables the protocol and then dies
+    /// Per screen buffer, which is a safety property rather than tidiness: a
+    /// full-screen application that enables the protocol and then dies
     /// without popping would otherwise leave the *shell* with a keyboard encoding it
     /// does not understand. Swapping the stack on 1049 means leaving the alternate
     /// screen restores whatever the shell had.
-    kitty_stack: [kitty_stack_max]u5 = @splat(0),
-    kitty_depth: usize = 0,
-    other_kitty_flags: u5 = 0,
-    other_kitty_stack: [kitty_stack_max]u5 = @splat(0),
-    other_kitty_depth: usize = 0,
+    csi_u_stack: [csi_u_stack_max]u5 = @splat(0),
+    csi_u_depth: usize = 0,
+    other_csi_u_flags: u5 = 0,
+    other_csi_u_stack: [csi_u_stack_max]u5 = @splat(0),
+    other_csi_u_depth: usize = 0,
 
     /// One entry per column; true where a tab stop sits.
     tab_stops: []bool,
@@ -515,7 +515,7 @@ pub const Screen = struct {
 
     pub fn execute(self: *Screen, b: u8) void {
         switch (b) {
-            0x07 => {}, // BEL: no audio bell, matching the user's kitty config.
+            0x07 => {}, // BEL: no audio bell, by design.
             0x08 => { // BS
                 self.wrap_pending = false;
                 if (self.cursor_x > 0) self.cursor_x -= 1;
@@ -577,14 +577,14 @@ pub const Screen = struct {
         //   CSI > 4 ; 2 m   xterm modifyOtherKeys, was read as SGR 4 (underline)
         //                   plus SGR 2 (dim), so everything after it rendered
         //                   underlined -- the reported Claude Code symptom
-        //   CSI > 1 u       kitty keyboard protocol push, was read as CSI u
+        //   CSI > 1 u       CSI u keyboard protocol push, was read as CSI u
         //                   (restore cursor), moving the cursor at random
         if (private != 0) {
             switch (final) {
                 'h' => if (private == '?') self.decPrivateMode(params, true),
                 'l' => if (private == '?') self.decPrivateMode(params, false),
                 'c' => if (private == '>') self.deviceAttributes('>'),
-                'u' => self.kittyKeyboard(private, params),
+                'u' => self.csiUKeyboard(private, params),
                 // Recognised and deliberately inert: DECDSR (`CSI ? Ps n`),
                 // XTMODKEYS (`CSI > Ps m`) and XTVERSION (`CSI > Ps q`). Legacy
                 // modifyOtherKeys is not implemented; applications that ask for it
@@ -1166,37 +1166,37 @@ pub const Screen = struct {
         }
     }
 
-    /// The kitty keyboard protocol's mode negotiation, all four of its forms.
-    fn kittyKeyboard(self: *Screen, private: u8, params: *const parser.Params) void {
+    /// The CSI u keyboard protocol's mode negotiation, all four of its forms.
+    fn csiUKeyboard(self: *Screen, private: u8, params: *const parser.Params) void {
         switch (private) {
             // `CSI > flags u` — push the current flags, then set.
             '>' => {
-                if (self.kitty_depth < kitty_stack_max) {
-                    self.kitty_stack[self.kitty_depth] = self.modes.kitty_flags;
-                    self.kitty_depth += 1;
+                if (self.csi_u_depth < csi_u_stack_max) {
+                    self.csi_u_stack[self.csi_u_depth] = self.modes.csi_u_flags;
+                    self.csi_u_depth += 1;
                 }
                 // Saturate rather than drop the request: an application that pushed
                 // too deep still gets the mode it asked for, it just cannot restore
                 // as far back. Dropping it would leave it encoding for a mode that
                 // is not active.
-                self.modes.kitty_flags = maskKittyFlags(params.get(0, 0));
+                self.modes.csi_u_flags = maskCsiUFlags(params.get(0, 0));
             },
             // `CSI < n u` — pop n entries, default 1.
             '<' => {
                 var n = params.get(0, 1);
                 if (n == 0) n = 1;
-                while (n > 0 and self.kitty_depth > 0) : (n -= 1) {
-                    self.kitty_depth -= 1;
-                    self.modes.kitty_flags = self.kitty_stack[self.kitty_depth];
+                while (n > 0 and self.csi_u_depth > 0) : (n -= 1) {
+                    self.csi_u_depth -= 1;
+                    self.modes.csi_u_flags = self.csi_u_stack[self.csi_u_depth];
                 }
             },
             // `CSI = flags ; mode u` — 1 replaces, 2 sets bits, 3 clears bits.
             '=' => {
-                const want = maskKittyFlags(params.get(0, 0));
+                const want = maskCsiUFlags(params.get(0, 0));
                 switch (params.get(1, 1)) {
-                    1 => self.modes.kitty_flags = want,
-                    2 => self.modes.kitty_flags |= want,
-                    3 => self.modes.kitty_flags &= ~want,
+                    1 => self.modes.csi_u_flags = want,
+                    2 => self.modes.csi_u_flags |= want,
+                    3 => self.modes.csi_u_flags &= ~want,
                     else => {},
                 }
             },
@@ -1210,7 +1210,7 @@ pub const Screen = struct {
             '?' => {
                 var buf: [16]u8 = undefined;
                 const out = std.fmt.bufPrint(&buf, "\x1b[?{d}u", .{
-                    self.modes.kitty_flags,
+                    self.modes.csi_u_flags,
                 }) catch return;
                 self.respond(out);
             },
@@ -1243,9 +1243,9 @@ pub const Screen = struct {
         std.mem.swap(Grid, &self.grid, &self.other);
         // The keyboard mode belongs to the buffer, so an application that dies on the
         // alternate screen cannot leave the shell with an encoding it never asked for.
-        std.mem.swap(u5, &self.modes.kitty_flags, &self.other_kitty_flags);
-        std.mem.swap([kitty_stack_max]u5, &self.kitty_stack, &self.other_kitty_stack);
-        std.mem.swap(usize, &self.kitty_depth, &self.other_kitty_depth);
+        std.mem.swap(u5, &self.modes.csi_u_flags, &self.other_csi_u_flags);
+        std.mem.swap([csi_u_stack_max]u5, &self.csi_u_stack, &self.other_csi_u_stack);
+        std.mem.swap(usize, &self.csi_u_depth, &self.other_csi_u_depth);
         self.in_alt = enable;
 
         // Margins belong to the buffer being left behind.
@@ -1284,9 +1284,9 @@ pub const Screen = struct {
         self.margin_bottom = self.grid.rows - 1;
         self.modes = .{};
         self.mouse = .{};
-        self.kitty_depth = 0;
-        self.other_kitty_flags = 0;
-        self.other_kitty_depth = 0;
+        self.csi_u_depth = 0;
+        self.other_csi_u_flags = 0;
+        self.other_csi_u_depth = 0;
         self.sync_output = false;
         self.resetTabs();
         self.grid.clearVisible(0);

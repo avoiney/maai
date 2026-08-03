@@ -32,9 +32,9 @@ pub const Theme = struct {
     hint_bg: Rgb = default_hint_bg,
     hint_fg: Rgb = default_bg,
 
-    /// Tab bar. Four colours plus the strip behind them, which is kitty's model —
-    /// the machine's themes are written for kitty, so reusing its vocabulary means the
-    /// existing files describe the bar without being edited.
+    /// Tab bar. Four colours plus the strip behind them, which is the model the
+    /// established `*_tab_*` theme keys already describe — reusing that vocabulary
+    /// means existing theme files colour the bar without being edited.
     bar_bg: Rgb = default_bar_bg,
     bar_inactive_bg: Rgb = default_bar_inactive_bg,
     bar_inactive_fg: Rgb = default_bar_inactive_fg,
@@ -85,9 +85,8 @@ pub const Color = packed struct(u32) {
 };
 
 // ── defaults ────────────────────────────────────────────────────────────────
-// nightfox, matching ~/.config/kitty/themes/nightfox.conf exactly — the machine
-// already has a theme switcher writing those files, and maai reading the same
-// values means it looks right before any config exists.
+// nightfox, matching the upstream nightfox.conf exactly, so maai looks right before
+// any config exists and identical to the same theme loaded from a file.
 
 pub const default_fg = Rgb.rgb(0xcd, 0xce, 0xcf);
 pub const default_bg = Rgb.rgb(0x19, 0x23, 0x30);
@@ -95,7 +94,7 @@ pub const default_cursor = Rgb.rgb(0xcd, 0xce, 0xcf);
 pub const default_selection_bg = Rgb.rgb(0x2b, 0x3b, 0x51);
 pub const default_selection_fg = Rgb.rgb(0xcd, 0xce, 0xcf);
 pub const default_hint_bg = Rgb.rgb(0xdb, 0xc0, 0x74);
-// Straight from ~/.config/kitty/themes/nightfox.conf, key for key.
+// Straight from the upstream nightfox.conf, key for key.
 pub const default_bar_bg = Rgb.rgb(0x19, 0x23, 0x30);
 pub const default_bar_inactive_bg = Rgb.rgb(0x2b, 0x3b, 0x51);
 pub const default_bar_inactive_fg = Rgb.rgb(0x73, 0x80, 0x91);

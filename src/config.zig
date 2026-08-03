@@ -1,11 +1,11 @@
 //! Configuration: a flat `key value` file, plus theme files in the same format.
 //!
 //! Syntax is deliberately tiny — one setting per line, `#` comments, and `include`.
-//! Both `key value` and `key: value` are accepted, because the two conventions the
-//! machine already uses disagree: kitty theme files write `background #192330`, and
+//! Both `key value` and `key: value` are accepted, because the two conventions in
+//! circulation disagree: terminal theme files write `background #192330`, and
 //! `theme: nord.yaml` is what reads naturally when pointing at a file. Supporting one
-//! optional colon costs a line of parsing and means the existing
-//! `~/.config/kitty/themes/*.conf` files load unchanged.
+//! optional colon costs a line of parsing and means theme files written for other
+//! terminals load unchanged.
 //!
 //! This is *not* YAML, despite the colon and despite `.yaml` being a fine name for a
 //! theme file. Nesting, lists, anchors and quoting rules are all absent. A real YAML
@@ -39,8 +39,9 @@ pub const BarStyle = enum {
     powerline,
 };
 
-/// Which separator glyph. Names and codepoints follow kitty, whose config on this
-/// machine already says `tab_powerline_style slanted`.
+/// Which separator glyph. Names and codepoints follow the established
+/// `tab_powerline_style` convention, so `slanted` means the same thing here as
+/// everywhere else.
 pub const PowerlineStyle = enum {
     angled,
     slanted,
@@ -223,8 +224,8 @@ pub const Config = struct {
     // ── font and layout ────────────────────────────────────────────────────
     font_family: Str = .init("FiraCode Nerd Font Ret"),
     font_size: f64 = 12.0,
-    /// Left/top only, matching the existing kitty and wezterm configs
-    /// (`window_padding_width 0 0 0 4`).
+    /// Left/top only (the equivalent of `window_padding_width 0 0 0 4`): a gutter
+    /// so glyphs do not touch the window edge, without padding that eats rows.
     padding_x: u32 = 4,
     padding_y: u32 = 0,
     scrollback_lines: u32 = 10_000,
@@ -249,11 +250,11 @@ pub const Config = struct {
 
     // ── theme ──────────────────────────────────────────────────────────────
     theme: Theme = .{},
-    /// Where to look for a theme named rather than pathed. Defaults to the directory
-    /// the machine's existing theme switcher already writes into.
-    theme_dir: Str = .init("~/.config/kitty/themes"),
-    /// A file holding just a theme name. The machine's app-theme switcher rewrites
-    /// this, so watching it is what makes the dayfox/nightfox flip apply live.
+    /// Where to look for a theme named rather than pathed. Point it at an existing
+    /// collection of theme files and they load as they are.
+    theme_dir: Str = .init("~/.config/maai/themes"),
+    /// A file holding just a theme name. An external theme switcher rewrites this,
+    /// so watching it is what makes a dayfox/nightfox flip apply live.
     theme_flavour_file: Str = .init("~/.config/.app-theme-flavour"),
     /// Resolved theme file, for the reloader to watch. Empty when none was loaded.
     theme_path: Str = .init(""),
@@ -432,8 +433,8 @@ fn loadTheme(
     return true;
 }
 
-/// Parse theme keys. The names are kitty's, because the machine's theme files are
-/// kitty's — reusing them means the existing switcher keeps working untouched.
+/// Parse theme keys. The names are the ones the existing corpus of terminal theme
+/// files already uses, so those files load here without being rewritten.
 pub fn parseTheme(
     text: []const u8,
     path: []const u8,
@@ -470,9 +471,9 @@ pub fn parseTheme(
                 continue;
             };
         }
-        // Every other kitty theme key — tab bar, borders, bell — describes chrome
-        // maai does not have yet. Silently ignored rather than reported, or loading
-        // an unmodified kitty theme would print a dozen complaints.
+        // Every other theme key — tab bar, borders, bell — describes chrome maai does
+        // not have yet. Silently ignored rather than reported, or loading an
+        // unmodified theme file would print a dozen complaints.
     }
 }
 
@@ -879,10 +880,10 @@ test "url_launcher refuses anything that looks like a command line" {
     try testing.expectEqual(@as(usize, 0), ok_diags.len);
 }
 
-test "kitty theme files parse, including the keys we have no chrome for" {
+test "third-party theme files parse, including the keys we have no chrome for" {
     var theme = Theme.default;
     var diags = Diagnostics{};
-    // Lifted verbatim from ~/.config/kitty/themes/nightfox.conf, tab-bar keys and all.
+    // Lifted verbatim from an unmodified nightfox.conf, tab-bar keys and all.
     parseTheme(
         \\## name: nightfox
         \\background #192330
@@ -899,7 +900,7 @@ test "kitty theme files parse, including the keys we have no chrome for" {
     try testing.expect(theme.selection_bg.eq(Rgb.rgb(0x2b, 0x3b, 0x51)));
     try testing.expect(theme.palette[1].eq(Rgb.rgb(0xc9, 0x4f, 0x6d)));
     try testing.expect(theme.palette[15].eq(Rgb.rgb(0xe4, 0xe4, 0xe5)));
-    // Chrome we do not have is ignored quietly, or an unmodified kitty theme would
+    // Chrome we do not have is ignored quietly, or an unmodified theme file would
     // print a dozen complaints.
     try testing.expectEqual(@as(usize, 0), diags.len);
 }

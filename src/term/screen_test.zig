@@ -8,7 +8,7 @@
 const std = @import("std");
 const screenmod = @import("screen.zig");
 const Screen = screenmod.Screen;
-const kitty_stack_max = screenmod.kitty_stack_max;
+const csi_u_stack_max = screenmod.csi_u_stack_max;
 const Gc = screenmod.Gc;
 const cellmod = @import("cell.zig");
 const Cell = cellmod.Cell;
@@ -441,7 +441,7 @@ test "private-marker sequences are not mistaken for their unmarked namesakes" {
     try std.testing.expectEqual(cellmod.Underline.none, st.attrs.underline);
     try std.testing.expect(!st.attrs.dim);
 
-    // Kitty keyboard protocol push/pop. Was read as CSI u, restoring the cursor.
+    // CSI u keyboard protocol push/pop. Was read as CSI u, restoring the cursor.
     feed(&s, "\x1b[3;8H");
     feed(&s, "\x1b[>1u\x1b[<u");
     try std.testing.expectEqual(@as(u32, 2), s.cursor_y);
@@ -642,7 +642,7 @@ test "hyperlinks referenced only from scrollback survive collection" {
     try std.testing.expectEqualStrings("https://kept/", s.links.get(hit.id));
 }
 
-test "kitty keyboard flags push, pop, set and report" {
+test "CSI u keyboard flags push, pop, set and report" {
     var s = try Screen.init(std.testing.allocator, 10, 3);
     defer s.deinit();
 
@@ -669,15 +669,15 @@ test "kitty keyboard flags push, pop, set and report" {
     sink.len = 0;
     feed(&s, "\x1b[<2u\x1b[?u");
     try std.testing.expectEqualStrings("\x1b[?0u", sink.got());
-    try std.testing.expectEqual(@as(usize, 0), s.kitty_depth);
+    try std.testing.expectEqual(@as(usize, 0), s.csi_u_depth);
 
     // `CSI = flags ; mode u`: 1 replaces, 2 sets bits, 3 clears them.
     feed(&s, "\x1b[=1;1u");
-    try std.testing.expectEqual(@as(u5, 1), s.modes.kitty_flags);
+    try std.testing.expectEqual(@as(u5, 1), s.modes.csi_u_flags);
     feed(&s, "\x1b[=1;3u");
-    try std.testing.expectEqual(@as(u5, 0), s.modes.kitty_flags);
+    try std.testing.expectEqual(@as(u5, 0), s.modes.csi_u_flags);
     feed(&s, "\x1b[=1;2u");
-    try std.testing.expectEqual(@as(u5, 1), s.modes.kitty_flags);
+    try std.testing.expectEqual(@as(u5, 1), s.modes.csi_u_flags);
 }
 
 test "popping an empty stack and pushing past the limit stay bounded" {
@@ -686,14 +686,14 @@ test "popping an empty stack and pushing past the limit stay bounded" {
 
     // A pop with nothing pushed must not underflow.
     feed(&s, "\x1b[<u\x1b[<9u");
-    try std.testing.expectEqual(@as(usize, 0), s.kitty_depth);
+    try std.testing.expectEqual(@as(usize, 0), s.csi_u_depth);
 
     // Pushing in a loop must not grow anything. The mode still takes effect at the
     // ceiling — dropping the request would leave the application encoding for a mode
     // that is not active.
-    for (0..kitty_stack_max + 8) |_| feed(&s, "\x1b[>1u");
-    try std.testing.expectEqual(kitty_stack_max, s.kitty_depth);
-    try std.testing.expectEqual(@as(u5, 1), s.modes.kitty_flags);
+    for (0..csi_u_stack_max + 8) |_| feed(&s, "\x1b[>1u");
+    try std.testing.expectEqual(csi_u_stack_max, s.csi_u_depth);
+    try std.testing.expectEqual(@as(u5, 1), s.modes.csi_u_flags);
 }
 
 test "the keyboard mode belongs to its screen buffer" {
@@ -702,17 +702,17 @@ test "the keyboard mode belongs to its screen buffer" {
 
     // A full-screen application enables the protocol on the alternate screen...
     feed(&s, "\x1b[?1049h\x1b[>1u");
-    try std.testing.expectEqual(@as(u5, 1), s.modes.kitty_flags);
+    try std.testing.expectEqual(@as(u5, 1), s.modes.csi_u_flags);
 
     // ...and dies without popping. Leaving the alternate screen must restore what the
     // shell had, or the shell would be left with an encoding it never asked for — and
     // in particular one where its keys arrive as escape sequences.
     feed(&s, "\x1b[?1049l");
-    try std.testing.expectEqual(@as(u5, 0), s.modes.kitty_flags);
+    try std.testing.expectEqual(@as(u5, 0), s.modes.csi_u_flags);
 
     // And going back finds the application's mode again.
     feed(&s, "\x1b[?1049h");
-    try std.testing.expectEqual(@as(u5, 1), s.modes.kitty_flags);
+    try std.testing.expectEqual(@as(u5, 1), s.modes.csi_u_flags);
 }
 
 test "RIS clears the keyboard mode" {
@@ -720,8 +720,8 @@ test "RIS clears the keyboard mode" {
     defer s.deinit();
     feed(&s, "\x1b[>1u");
     feed(&s, "\x1bc");
-    try std.testing.expectEqual(@as(u5, 0), s.modes.kitty_flags);
-    try std.testing.expectEqual(@as(usize, 0), s.kitty_depth);
+    try std.testing.expectEqual(@as(u5, 0), s.modes.csi_u_flags);
+    try std.testing.expectEqual(@as(usize, 0), s.csi_u_depth);
 }
 
 test "mouse tracking modes are independent bits" {

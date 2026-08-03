@@ -13,7 +13,7 @@ A fast, keyboard-driven, Wayland-native terminal emulator for this machine.
 | Distro | Ubuntu 26.04 LTS | All deps packaged (see §9). |
 | Font | `FiraCode Nerd Font Ret` 12pt | Ligatures (HarfBuzz run shaping) + Nerd Font icons (fallback + double-width). |
 | Shell | `/usr/bin/zsh` | — |
-| Existing | `kitty`, `wezterm`, `foot` installed | Reference implementations and A/B benchmark baselines. |
+| Existing | `wezterm`, `foot`, plus a GPU-accelerated reference terminal | Reference implementations and A/B benchmark baselines. |
 | URL handler | `google-chrome.desktop` via `xdg-open` | Click-to-open target. |
 
 ### Note on the current setup
@@ -39,13 +39,13 @@ That said, the plan below is written to be built as asked.
 | Windowing | Native `wayland-client` + protocol codegen via `wayland-scanner` | No `zig-wayland` dependency to track across Zig releases. |
 | Multiplexing | **Tabs + splits** in-process | As requested. Binary layout tree per tab, i3-style directional focus. |
 | Font stack | `libfcft` in phase 1 → direct FreeType + HarfBuzz in phase 7 | fcft gives shaping, fallback chains, and caching immediately; dropping to raw FT/HB later buys subpixel positioning control. |
-| Config | Kitty-style `key value` text + `include` | You already know the format. No scripting runtime keeps startup at a few ms. |
-| Scope extras | Ligatures, keyboard URL hints, live theme reload, inline images (Kitty + Sixel) | All four selected. |
+| Config | Flat `key value` text + `include` | You already know the format. No scripting runtime keeps startup at a few ms. |
+| Scope extras | Ligatures, keyboard URL hints, live theme reload, inline images (APC graphics + Sixel) | All four selected. |
 
 ### Honest scope estimate
 
 With tabs, splits, GPU rendering, and inline images, this is a **large** project.
-Ghostty is ~100k lines of Zig; kitty is ~90k of C and Python. A focused version
+Ghostty is ~100k lines of Zig; the comparable C/Python terminals are ~90k. A focused version
 with exactly this feature set lands around **15–25k lines**, realistically
 **3–6 months part-time**. Phases 1–4 (§5) reach daily-driver usability in a small
 fraction of that; tabs, splits, and images are the long tail. Sequence accordingly and
@@ -245,11 +245,11 @@ reports `text-run=true`, so the ligature shaping phase 7 needs is available.
 
 Delivered beyond the phase 1 line, and why:
 - **Full Williams VT500 DFA**, not just the phase 1 subset — CSI/OSC/DCS/APC states all
-  exist so phase 2 only fills in handlers, and phase 8 can hang Sixel and the Kitty
+  exist so phase 2 only fills in handlers, and phase 8 can hang Sixel and the APC
   graphics protocol off `dcsHook`/APC without restructuring.
 - **Minimal xkb keyboard** (`src/wl/keyboard.zig`). Phase 3 owns keyboard properly, but
   phase 1's acceptance criteria cannot be checked interactively without being able to
-  type. Missing on purpose: key repeat, Kitty keyboard protocol, compose/dead keys,
+  type. Missing on purpose: key repeat, the CSI u keyboard protocol, compose/dead keys,
   DECCKM application cursor keys.
 - **`test-pure` build target** — the C-free suite (27 tests) runs in well under a second,
   which is what makes the phase 2 reflow property tests practical to iterate on.
@@ -380,7 +380,7 @@ were executed as their unmarked namesakes:
 | Sequence | Actually means | Was executed as |
 |---|---|---|
 | `CSI > 4 ; 2 m` | xterm XTMODKEYS | SGR 4 + SGR 2 — underline and dim everything after |
-| `CSI > 1 u` / `CSI < u` | kitty keyboard push/pop | CSI u — restore cursor, moving it at random |
+| `CSI > 1 u` / `CSI < u` | CSI u keyboard push/pop | CSI u — restore cursor, moving it at random |
 
 Private-marked sequences are now dispatched separately, with only `?h`/`?l` and `>c`
 acted on and the rest recognised but inert until phase 3 brings the keyboard protocols.
@@ -437,7 +437,7 @@ does not justify going before the stated requirements.
   XWayland clients still ask for.
 - **Copy on select feeds both**, at the user's request: a finished selection goes to PRIMARY
   *and* CLIPBOARD, so `Ctrl+Shift+V` pastes what was just selected. This is not the platform
-  default (foot, kitty and alacritty all keep the two apart) and it has a real cost here —
+  default (foot and alacritty both keep the two apart) and it has a real cost here —
   the machine's `cliphist` records every mouse selection. Becomes a `copy_on_select` config
   option in phase 6.
 - **Paste safety**: bracketed paste when the application enabled it. When it did not, C0
@@ -534,7 +534,7 @@ xkbcommon's documented handling. A missing Compose table is not fatal.
 Fixed alongside: a key producing nothing left a running repeat armed, so holding `a` and
 then tapping `^` kept streaming `a`.
 
-**Kitty keyboard protocol — flag 1 only (2026-07-30).** Negotiation is complete: push
+**The CSI u keyboard protocol — flag 1 only (2026-07-30).** Negotiation is complete: push
 (`CSI > flags u`), pop (`CSI < n u`), set (`CSI = flags ; mode u`) and query (`CSI ? u`).
 Unsupported bits are masked off and the query reports what actually took effect — that is
 the protocol working, not a shortcut. Claiming a flag we do not implement is what breaks
@@ -558,7 +558,7 @@ anything with `Ctrl+Shift` (legacy collapses those onto the same C0 byte), modif
 asking xkb rather than enumerating a table, since which keys those are is entirely
 layout-dependent. This is a documented subset of flag 1, not the whole of it.
 
-**The flags stack lives per screen buffer**, swapped with the grids on 1049, as kitty does.
+**The flags stack lives per screen buffer**, swapped with the grids on 1049.
 That is a safety property: a full-screen application that enables the protocol and dies
 without popping cannot leave the shell with an encoding it never asked for.
 
@@ -586,7 +586,7 @@ given up is a default that eventually fights an application.
 A later line replaces an earlier one, so `include` and user overrides behave as anyone
 would expect, and a malformed line is reported and skipped like every other setting.
 
-**Still outstanding in this phase:** legacy modifyOtherKeys; kitty flags 2/4/8/16; focus
+**Still outstanding in this phase:** legacy modifyOtherKeys; CSI u flags 2/4/8/16; focus
 reporting (1004 is tracked but `CSI I`/`CSI O` are never sent); a keyboard-driven visual
 select mode; and a confirmation prompt for multi-line pastes, which needs UI that does not
 exist yet.
@@ -595,7 +595,7 @@ Original phase 3 scope, for reference:
 
 - **Keyboard**: xkbcommon keymap from the compositor fd, layout/group changes, dead keys,
   `xkbcommon-compose`, repeat from `repeat_info`.
-- **Kitty keyboard protocol** (progressive enhancement, CSI u) plus legacy
+- **The CSI u keyboard protocol** (progressive enhancement) plus legacy
   `modifyOtherKeys`. Your nvim is 0.12.4 and supports it; this is what lets nvim tell
   `Ctrl+I` from `Tab` and see key releases. Central to "keyboard friendly".
 - **Keybinding table** parsed from config → actions: tab new/close/next/prev/move,
@@ -639,7 +639,7 @@ Original phase 3 scope, for reference:
 - **The modifier is `Ctrl`**, which makes the pointer local exactly as `Shift` does, so a
   link stays clickable while nvim holds the mouse. **This takes `Ctrl` away from the
   planned `Ctrl`+drag block selection** — that moves to `Alt`+drag, which is also what
-  kitty and iTerm use. `Ctrl`+wheel is likewise ours, and phase 7 wants it for font size.
+  iTerm and others use. `Ctrl`+wheel is likewise ours, and phase 7 wants it for font size.
 - **`launch.zig` spawns with `posix_spawnp` and an argv array**, plus: the allowlist
   re-checked (OSC 8 will carry URIs chosen freely by the writing process), no control
   characters, a length cap, and **signals reset in the child** — dispositions survive
@@ -792,7 +792,7 @@ behaviour, and the shell here is zsh.
 *Prerequisite:* the bindings hook receives only the keysym today, so it needs the keycode
 too. Three lines, landing with the feature rather than as dead code.
 
-**`Ctrl+Tab` collides with the Kitty keyboard protocol**, and it is worth writing down:
+**`Ctrl+Tab` collides with the CSI u keyboard protocol**, and it is worth writing down:
 `Ctrl+Tab` has no legacy encoding, so flag 1 gives it one (`CSI 9;5u`) — meaning we have
 just made it available to applications and are now taking it back. Our binding has first
 refusal, so nvim will never see it. Accepted deliberately; configurable bindings (still
@@ -811,8 +811,8 @@ so tabs must live at stable addresses — heap-allocated, held as `[]*Tab`, neve
 2. Then the feature: creation inheriting the directory, switching, closing, the bar.
 
 *The bar row is reserved always*, even with one tab, so opening a second one does not
-resize the grid and reflow what you were reading. It also matches the existing kitty
-config, which shows the bar from the first tab.
+resize the grid and reflow what you were reading. Showing the bar from the first tab is
+also the convention elsewhere.
 
 *Layout lives with the application, not the renderer.* `App.buildBar` produces one
 `BarCell` per column — codepoint, foreground, background — and the renderer draws that row
@@ -820,8 +820,8 @@ like any other. The colours are explicit rather than a flag the renderer maps, b
 powerline needs a separator whose foreground is the tab it *leaves* and whose background is
 the one it *enters*: two tabs' colours in one cell, which no flag can express. That is also
 the whole trick — the glyph reads as the edge of the previous tab instead of as a character.
-`tab_bar_style` and `tab_powerline_style` follow kitty's names and glyphs, defaulting to
-`powerline`/`slanted` to match the config already on this machine. Truncation, separators and numbering are layout decisions; the
+`tab_bar_style` and `tab_powerline_style` follow the established names and glyphs,
+defaulting to `powerline`/`slanted`. Truncation, separators and numbering are layout decisions; the
 renderer's job is putting cells on screen. Titles are decoded as UTF-8 so an accented
 title occupies the columns it looks like it occupies.
 
@@ -858,9 +858,9 @@ per-terminal state.
 
 **Config format** (`config.zig`): flat `key value`, `#` comments, `include` with a depth
 cap against cycles. The separator may be a space *or* a colon, because the two
-conventions in play disagree — kitty theme files write `background #192330`, and
+conventions in play disagree — terminal theme files write `background #192330`, and
 `theme: nord.yaml` is what reads naturally when pointing at a file. One optional colon
-costs a line of parsing and the existing `~/.config/kitty/themes/*.conf` load unchanged.
+costs a line of parsing and existing third-party `*.conf` themes load unchanged.
 Not YAML, and deliberately: nesting, lists, anchors and quoting are a few thousand lines
 and a supply of surprises for no gain here.
 
@@ -924,7 +924,7 @@ a bogus `font_family` leaving the old font in place with `keeping the old font �
 
 The largest single feature; sequence it last deliberately.
 
-- **Kitty graphics protocol** over APC: transmission `a=T`/`a=t`, formats `f=32/24/100`,
+- **The APC graphics protocol** (`ESC _ G`): transmission `a=T`/`a=t`, formats `f=32/24/100`,
   chunked `m=1`, placement `a=p` with `z`/crop/cell-span, unicode placeholders, deletion
   `a=d`, and shared-memory transfer.
 - **PNG decode via `libspng`** (hardened, fast, packaged). Enforce hard dimension, pixel,
@@ -935,7 +935,7 @@ The largest single feature; sequence it last deliberately.
 - **Sixel**: DCS parser, palette handling, raster attributes, convert to RGBA, then reuse
   the same placement machinery.
 
-**Acceptance:** `kitten icat` renders and scrolls correctly; image memory returns to
+**Acceptance:** an icat-style image writer renders and scrolls correctly; image memory returns to
 baseline after `clear`; a truncated or malicious PNG is rejected without crashing.
 
 ### Phase 9 — hardening (ongoing)
@@ -946,13 +946,13 @@ leak checks on pane churn, and a crash handler that does **not** dump grid conte
 ## 6. Performance budgets
 
 Targets, and how each is measured. Numbers to beat are `foot` (fastest software renderer)
-and `kitty` (fastest GPU renderer) — both already installed, so A/B is easy.
+and the fastest available GPU renderer — both already installed, so A/B is easy.
 
 | Metric | Target | Measurement |
 |---|---|---|
 | Cold start → first frame | < 40 ms | `hyperfine 'maai -e true'` |
 | Keypress → pixels | < 1 frame (13 ms @75 Hz) | internal timestamps: `wl_keyboard` event → `eglSwapBuffers`, plus `wp_presentation_feedback` for actual scan-out |
-| `cat` 100 MB ASCII | ≥ kitty | `vtebench`, `hyperfine` |
+| `cat` 100 MB ASCII | ≥ the GPU baseline | `vtebench`, `hyperfine` |
 | Frame time, full 1440p redraw | < 1 ms GPU | `GL_EXT_disjoint_timer_query` |
 | Idle CPU | ~0.0% | `top` with cursor blink off |
 | RSS, 10k scrollback filled, 4 panes | < 150 MB | `/proc/self/status` |
@@ -1001,7 +1001,7 @@ not hypotheticals — each has a CVE history in real terminals.
 - **Golden images**: render to an offscreen FBO, hash the PNG, diff on change. Catches
   shaper, atlas, and blending regressions that unit tests never see.
 - **Fuzzing** (high value, cheap): AFL++ or `zig build fuzz` on the VT parser, the Sixel
-  parser, and the Kitty-graphics APC parser. All three consume untrusted bytes.
+  parser, and the APC graphics parser. All three consume untrusted bytes.
 - **Integration**: a pexpect-style harness driving real `nvim`, `htop`, `lazygit`, `k9s`
   through a headless compositor (`sway --headless` or `cage`) and asserting on the grid.
 - **Sanitizers**: ASan/UBSan builds in CI; valgrind on the pane-churn leak test.
@@ -1055,7 +1055,7 @@ vttest 2.7, hyperfine 1.19.0.
 | **Zig 0.16 churn.** `build.zig` and stdlib APIs move between releases. | Pin `zig@0.16.0` in `.mise.toml`; upgrade deliberately, never mid-phase. |
 | **Reflow correctness.** Every terminal has bugs here. | Property tests from phase 2, before splits multiply the geometry cases. |
 | **Mixed-DPI glyph handling.** Two different-density monitors is the case most terminals get wrong. | Key the glyph cache on `(font, glyph, scale)` from day one. Retrofitting scale into the cache key is painful. |
-| **Kitty graphics protocol is under-specified in corners.** | Test against `kitten icat` and real `yazi`/`ranger` output; accept partial support and document exactly what's implemented. |
+| **The APC graphics protocol is under-specified in corners.** | Test against an icat-style writer and real `yazi`/`ranger` output; accept partial support and document exactly what's implemented. |
 | **Terminfo over SSH.** | `--print-terminfo` plus documented `xterm-256color` fallback, from phase 2. |
 | **Losing to `foot` on latency.** A software renderer genuinely can beat GPU at small damage. | Measure against foot from phase 1. The phase-7 presentation-feedback work is the answer; if it isn't, that's real data worth having. |
 
