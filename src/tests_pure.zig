@@ -17,5 +17,6 @@ test {
     _ = @import("term/theme.zig");
     _ = @import("term/url.zig");
     _ = @import("term/width.zig");
+    _ = @import("ui/bar.zig");
     _ = @import("vt/parser.zig");
 }

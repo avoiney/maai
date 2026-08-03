@@ -23,6 +23,7 @@ const urlmod = @import("term/url.zig");
 const hintsmod = @import("term/hints.zig");
 const launch = @import("launch.zig");
 const cfgmod = @import("config.zig");
+const barmod = @import("ui/bar.zig");
 const watchmod = @import("watch.zig");
 const ptr = @import("wl/pointer.zig");
 const clip = @import("wl/clipboard.zig");
@@ -169,59 +170,24 @@ const App = struct {
     ///
     /// Built here rather than in the renderer because it is *layout* — truncation,
     /// separators, numbering, which tab is active — and the renderer's job is to put
-    /// cells on screen. It also owns the colours, since powerline needs a cell holding
-    /// two tabs' colours at once.
+    /// cells on screen. The rules themselves live in `ui/bar.zig`, which knows nothing
+    /// of tabs, PTYs or Wayland and can therefore be tested without a compositor.
     fn buildBar(self: *App) []const rendermod.BarCell {
-        const cols = self.screen.grid.cols;
-        const theme = &self.screen.theme;
-        const powerline = self.cfg.tab_bar_style == .powerline;
-        const sep = self.cfg.tab_powerline_style.separator();
-        var n: usize = 0;
-
-        const room = @min(cols, self.bar.len);
-
+        var tabs: [max_tabs]barmod.Tab = undefined;
         for (self.tabs[0..self.tab_count], 0..) |t, i| {
-            const active = i == self.active;
-            const fg = if (active) theme.bar_active_fg else theme.bar_inactive_fg;
-            const bg = if (active) theme.bar_active_bg else theme.bar_inactive_bg;
-
-            var label: [64]u8 = undefined;
-            const title = t.screen.title();
-            const text = if (title.len > 0)
-                std.fmt.bufPrint(&label, " {d}: {s} ", .{ i + 1, title }) catch continue
-            else
-                std.fmt.bufPrint(&label, " {d} ", .{i + 1}) catch continue;
-
-            // Decoded as UTF-8 so a title with accents occupies the columns it looks
-            // like it occupies, rather than one per byte.
-            var it = (std.unicode.Utf8View.init(text) catch continue).iterator();
-            while (it.nextCodepoint()) |cp| {
-                if (n == room) break;
-                self.bar[n] = .{ .cp = cp, .fg = fg, .bg = bg };
-                n += 1;
-            }
-            if (n == room) break;
-
-            if (powerline) {
-                // The separator wears the colour of the tab it leaves, on the background
-                // of whatever comes next. That is the whole trick: the glyph reads as
-                // the edge of the previous tab rather than as a character of its own.
-                const next_bg = if (i + 1 < self.tab_count)
-                    (if (i + 1 == self.active) theme.bar_active_bg else theme.bar_inactive_bg)
-                else
-                    theme.bar_bg;
-                self.bar[n] = .{ .cp = sep, .fg = bg, .bg = next_bg };
-                n += 1;
-                if (n == room) break;
-            }
+            tabs[i] = .{ .title = t.screen.title() };
         }
-
-        // The strip runs the full width, so the bar reads as a bar and not as a label
-        // floating on the terminal background.
-        while (n < room) : (n += 1) {
-            self.bar[n] = .{ .cp = ' ', .fg = theme.bar_inactive_fg, .bg = theme.bar_bg };
-        }
-        return self.bar[0..n];
+        return barmod.layout(
+            &self.bar,
+            self.screen.grid.cols,
+            tabs[0..self.tab_count],
+            self.active,
+            &self.screen.theme,
+            .{
+                .powerline = self.cfg.tab_bar_style == .powerline,
+                .separator = self.cfg.tab_powerline_style.separator(),
+            },
+        );
     }
 
     /// Open a tab, starting where the current one is.
@@ -1341,13 +1307,13 @@ const Dims = struct { cols: u32, rows: u32 };
 /// Rows the tab bar takes out of the grid.
 ///
 /// Always reserved, even with one tab, so opening a second one does not resize the grid
-/// and reflow everything you were looking at. It also matches the existing kitty config,
-/// which shows the bar from the first tab.
+/// and reflow everything you were looking at. Showing the bar from the first tab is
+/// also the convention elsewhere.
 const tab_bar_rows: u32 = 1;
 
 fn gridSize(width: u32, height: u32, font: *const Font, pad: Padding) Dims {
-    // Padding is left/top only, matching the user's existing kitty and wezterm
-    // configs (`window_padding_width 0 0 0 4`).
+    // Padding is left/top only (the equivalent of `window_padding_width 0 0 0 4`),
+    // so the gutter does not cost a row.
     const usable_w = if (width > pad.x) width - pad.x else font.cell_w;
     const usable_h = if (height > pad.y) height - pad.y else font.cell_h;
     const rows = usable_h / font.cell_h;

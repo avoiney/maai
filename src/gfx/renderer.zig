@@ -27,14 +27,9 @@ const Hint = @import("../term/hints.zig").Hint;
 /// A flat list of columns rather than a list of tabs: the bar is drawn like any other
 /// row of cells, and deciding what goes in each column — truncation, separators, which
 /// tab is active — is layout, which belongs with the application, not the renderer.
-pub const BarCell = struct {
-    cp: u21 = ' ',
-    /// Explicit rather than a flag the renderer maps to colours. Powerline needs a
-    /// separator whose foreground is the tab it leaves and whose background is the one
-    /// it enters — two different tabs' colours in one cell, which no flag can express.
-    fg: Rgb,
-    bg: Rgb,
-};
+/// That layout lives in `ui/bar.zig`; the type is re-exported here because the
+/// renderer's callers speak of it as part of `draw`'s signature.
+pub const BarCell = @import("../ui/bar.zig").Cell;
 
 const Rgb = cellmod.Rgb;
 

@@ -203,6 +203,39 @@ depuis notre propre tampon quand on possède la sélection ; on ne peut pas dép
 pendant l'attente, `paste` étant appelé depuis un listener, donc à l'intérieur de
 `wl_display_dispatch_pending`, et libwayland interdit le dispatch réentrant.
 
+## La barre d'onglets se vide quand un titre est long — **corrigé**
+
+**Sévérité : moyenne — chrome invisible, signalé à l'usage.**
+**Fichier :** `src/main.zig` (`buildBar`), déplacé vers `src/ui/bar.zig`.
+
+Signalé ainsi : « dans un worktree, par exemple
+`/work/.claude-worktrees/revault-adr-backoffice-mcp-server`, la barre des onglets ne
+s'affiche plus ». Elle s'affichait toujours — c'est la bande vide qui ne se distingue
+pas du fond. Ce qui disparaissait, ce sont les **étiquettes** :
+
+```zig
+var label: [64]u8 = undefined;
+const text = std.fmt.bufPrint(&label, " {d}: {s} ", .{ i + 1, title }) catch continue;
+```
+
+`bufPrint` renvoie `NoSpaceLeft` dès que le titre dépasse 59 octets, et le `continue`
+sautait **l'onglet entier**. Un chemin de worktree, ou n'importe quel titre annoncé par
+un agent, passe cette borne sans effort. Deuxième porte de sortie sur le même chemin :
+`Utf8View.init(text) catch continue`, alors que `Screen` tronque les titres à 256 octets
+sans regarder les frontières de séquence — un octet coupé coûtait aussi l'onglet.
+
+**Correctif :** un titre se **tronque**, il ne se jette pas. Le numéro s'écrit d'abord et
+sans condition, donc `alt+<n>` garde toujours sa cible visible ; le titre reçoit une part
+de la largeur (`room / tab_count`, bornée à 6–24 colonnes) ; le décodage UTF-8 est
+indulgent et rend U+FFFD sur une séquence coupée. Un titre qui commence par `/` ou `~`
+est coupé **par la tête** — `/work/.claude-worktrees/…` coupé par la queue ne distingue
+aucun worktree d'un autre.
+
+**Le vrai enseignement est structurel :** cette mise en page vivait dans `main.zig`, donc
+la seule façon de l'exercer était de lancer un compositeur et de regarder la fenêtre.
+Elle est maintenant dans `src/ui/bar.zig`, sans C ni Wayland, couverte par
+`zig build test-pure`, dont les cas de troncature qui échouaient avant le correctif.
+
 ---
 
 ## 1. Le premier cluster de graphèmes de la session disparaît au resize
