@@ -153,7 +153,8 @@
 #     selection_foreground  #cdcecf
 #     hint_background       #dbc074      (maai-specific: hint-mode labels)
 #     hint_foreground       #192330
-#     tab_bar_background      #192330    (the strip behind the tabs)
+#     tab_bar_background      #192330    (the strip behind the tabs; omit it, or
+#                                         write `none`, to follow `background`)
 #     inactive_tab_background #2b3b51
 #     inactive_tab_foreground #738091
 #     active_tab_background   #719cd6

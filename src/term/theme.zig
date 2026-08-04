@@ -35,7 +35,13 @@ pub const Theme = struct {
     /// Tab bar. Four colours plus the strip behind them, which is the model the
     /// established `*_tab_*` theme keys already describe — reusing that vocabulary
     /// means existing theme files colour the bar without being edited.
-    bar_bg: Rgb = default_bar_bg,
+    ///
+    /// The strip is optional because `tab_bar_background` defaults to `none`
+    /// upstream, meaning "the terminal background" — and most theme files leave it
+    /// out on that understanding. Holding a literal colour here instead put a stale
+    /// default behind the tabs of every such theme: oasis coloured its tabs pink and
+    /// got nightfox's blue strip. Read it through `barBg()`.
+    bar_bg: ?Rgb = null,
     bar_inactive_bg: Rgb = default_bar_inactive_bg,
     bar_inactive_fg: Rgb = default_bar_inactive_fg,
     bar_active_bg: Rgb = default_bar_active_bg,
@@ -46,6 +52,14 @@ pub const Theme = struct {
     palette: [256]Rgb = default_palette,
 
     pub const default: Theme = .{};
+
+    /// The strip behind the tabs: whatever the theme said, else the terminal
+    /// background. Resolved here rather than at parse time for the same reason cells
+    /// are — an unthemed strip follows a later OSC 11 instead of stranding the old
+    /// background in one row.
+    pub fn barBg(self: *const Theme) Rgb {
+        return self.bar_bg orelse self.bg;
+    }
 
     pub fn resolve(self: *const Theme, color: Color, role: Role) Rgb {
         return switch (color.kind) {
@@ -94,8 +108,8 @@ pub const default_cursor = Rgb.rgb(0xcd, 0xce, 0xcf);
 pub const default_selection_bg = Rgb.rgb(0x2b, 0x3b, 0x51);
 pub const default_selection_fg = Rgb.rgb(0xcd, 0xce, 0xcf);
 pub const default_hint_bg = Rgb.rgb(0xdb, 0xc0, 0x74);
-// Straight from the upstream nightfox.conf, key for key.
-pub const default_bar_bg = Rgb.rgb(0x19, 0x23, 0x30);
+// Straight from the upstream nightfox.conf, key for key. No `default_bar_bg`: the
+// strip follows `background` unless a theme names a colour for it.
 pub const default_bar_inactive_bg = Rgb.rgb(0x2b, 0x3b, 0x51);
 pub const default_bar_inactive_fg = Rgb.rgb(0x73, 0x80, 0x91);
 pub const default_bar_active_bg = Rgb.rgb(0x71, 0x9c, 0xd6);

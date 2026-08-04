@@ -462,8 +462,22 @@ pub fn parseTheme(
             continue;
         }
 
+        // Separate from the slots below because this one may be absent: `none` is the
+        // upstream default and means "follow the terminal background", which is a
+        // null here rather than a colour.
+        if (std.mem.eql(u8, key, "tab_bar_background")) {
+            if (std.mem.eql(u8, value, "none")) {
+                theme.bar_bg = null;
+            } else if (thememod.parseColor(value)) |col| {
+                theme.bar_bg = col;
+            } else {
+                diags.add(path, entry.line, "unparseable colour");
+            }
+            continue;
+        }
+
         const slot: ?*Rgb =
-            if (std.mem.eql(u8, key, "background")) &theme.bg else if (std.mem.eql(u8, key, "foreground")) &theme.fg else if (std.mem.eql(u8, key, "cursor")) &theme.cursor else if (std.mem.eql(u8, key, "cursor_text_color")) &theme.cursor_text else if (std.mem.eql(u8, key, "selection_background")) &theme.selection_bg else if (std.mem.eql(u8, key, "selection_foreground")) &theme.selection_fg else if (std.mem.eql(u8, key, "hint_background")) &theme.hint_bg else if (std.mem.eql(u8, key, "hint_foreground")) &theme.hint_fg else if (std.mem.eql(u8, key, "tab_bar_background")) &theme.bar_bg else if (std.mem.eql(u8, key, "inactive_tab_background")) &theme.bar_inactive_bg else if (std.mem.eql(u8, key, "inactive_tab_foreground")) &theme.bar_inactive_fg else if (std.mem.eql(u8, key, "active_tab_background")) &theme.bar_active_bg else if (std.mem.eql(u8, key, "active_tab_foreground")) &theme.bar_active_fg else null;
+            if (std.mem.eql(u8, key, "background")) &theme.bg else if (std.mem.eql(u8, key, "foreground")) &theme.fg else if (std.mem.eql(u8, key, "cursor")) &theme.cursor else if (std.mem.eql(u8, key, "cursor_text_color")) &theme.cursor_text else if (std.mem.eql(u8, key, "selection_background")) &theme.selection_bg else if (std.mem.eql(u8, key, "selection_foreground")) &theme.selection_fg else if (std.mem.eql(u8, key, "hint_background")) &theme.hint_bg else if (std.mem.eql(u8, key, "hint_foreground")) &theme.hint_fg else if (std.mem.eql(u8, key, "inactive_tab_background")) &theme.bar_inactive_bg else if (std.mem.eql(u8, key, "inactive_tab_foreground")) &theme.bar_inactive_fg else if (std.mem.eql(u8, key, "active_tab_background")) &theme.bar_active_bg else if (std.mem.eql(u8, key, "active_tab_foreground")) &theme.bar_active_fg else null;
 
         if (slot) |s| {
             s.* = thememod.parseColor(value) orelse {
@@ -902,6 +916,32 @@ test "third-party theme files parse, including the keys we have no chrome for" {
     try testing.expect(theme.palette[15].eq(Rgb.rgb(0xe4, 0xe4, 0xe5)));
     // Chrome we do not have is ignored quietly, or an unmodified theme file would
     // print a dozen complaints.
+    try testing.expectEqual(@as(usize, 0), diags.len);
+}
+
+test "a theme that colours its tabs but not the strip gets its own background behind them" {
+    var theme = Theme.default;
+    var diags = Diagnostics{};
+    // The regression, from oasis.conf: every `*_tab_*` key set, `tab_bar_background`
+    // absent — which upstream reads as `none`. The strip used to keep the built-in
+    // nightfox blue, so pink tabs sat on a blue bar.
+    parseTheme(
+        \\background #2C1724
+        \\active_tab_background #E6A4BE
+        \\inactive_tab_background #3C2534
+    , "oasis.conf", &theme, &diags);
+
+    try testing.expect(theme.barBg().eq(Rgb.rgb(0x2C, 0x17, 0x24)));
+    try testing.expectEqual(@as(usize, 0), diags.len);
+
+    // Named explicitly, it wins over the background.
+    parseTheme("tab_bar_background #101010", "oasis.conf", &theme, &diags);
+    try testing.expect(theme.barBg().eq(Rgb.rgb(0x10, 0x10, 0x10)));
+
+    // And `none` — the upstream default, which some theme files write out — hands it
+    // back to the background rather than being rejected as an unparseable colour.
+    parseTheme("tab_bar_background none", "oasis.conf", &theme, &diags);
+    try testing.expect(theme.barBg().eq(Rgb.rgb(0x2C, 0x17, 0x24)));
     try testing.expectEqual(@as(usize, 0), diags.len);
 }
 

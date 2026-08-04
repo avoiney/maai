@@ -145,7 +145,7 @@ pub fn layout(
             const next_bg = if (i + 1 < tabs.len)
                 (if (i + 1 == active) theme.bar_active_bg else theme.bar_inactive_bg)
             else
-                theme.bar_bg;
+                theme.barBg();
             out[n] = .{ .cp = style.separator, .fg = bg, .bg = next_bg };
             n += 1;
             if (n == room) break;
@@ -153,7 +153,7 @@ pub fn layout(
     }
 
     while (n < room) : (n += 1) {
-        out[n] = .{ .cp = ' ', .fg = theme.bar_inactive_fg, .bg = theme.bar_bg };
+        out[n] = .{ .cp = ' ', .fg = theme.bar_inactive_fg, .bg = theme.barBg() };
     }
     return out[0..n];
 }
