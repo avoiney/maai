@@ -122,6 +122,9 @@ const App = struct {
 
     /// Pointer state for selection dragging and click counting.
     dragging: bool = false,
+    /// Where a single-click drag would start, held until the pointer leaves that
+    /// cell. A click that never moves must not select anything.
+    drag_anchor: ?sel.Point = null,
     last_click_ms: i64 = 0,
     last_click_line: usize = 0,
     last_click_x: u32 = 0,
@@ -547,6 +550,14 @@ const App = struct {
             return;
         }
         const p = self.pointAt(px, py);
+        if (self.drag_anchor) |a| {
+            // The press is still sitting in its own cell, so there is nothing to
+            // select yet. The selection only comes into being once the pointer
+            // actually moves off it.
+            if (p.line == a.line and p.x == a.x) return;
+            self.screen.selection.begin(&self.screen.grid, a, .char);
+            self.drag_anchor = null;
+        }
         self.screen.selection.extend(&self.screen.grid, p);
         if (self.debug) {
             const b = self.screen.selection.bounds();
@@ -596,7 +607,20 @@ const App = struct {
                         2 => .word,
                         else => .line,
                     };
-                    self.screen.selection.begin(&self.screen.grid, p, mode);
+                    if (mode == .char) {
+                        // A plain click clears the selection and no more: the drag
+                        // only becomes a selection once the pointer leaves this
+                        // cell. Highlighting the cell under a click would make
+                        // every click to focus or to place the pointer overwrite
+                        // PRIMARY with a stray character.
+                        self.screen.selection.clear();
+                        self.drag_anchor = p;
+                    } else {
+                        // Double and triple clicks select a word or a line outright;
+                        // there is nothing to wait for.
+                        self.screen.selection.begin(&self.screen.grid, p, mode);
+                        self.drag_anchor = null;
+                    }
                     self.dragging = true;
                     if (self.debug) {
                         std.debug.print(
@@ -606,6 +630,7 @@ const App = struct {
                     }
                 } else if (self.dragging) {
                     self.dragging = false;
+                    self.drag_anchor = null;
                     // Finishing a selection publishes it to PRIMARY, so middle-click
                     // paste works, *and* to CLIPBOARD so Ctrl+Shift+V picks it up.
                     // Feeding CLIPBOARD on select is not the platform default — it
