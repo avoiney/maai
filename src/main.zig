@@ -915,6 +915,7 @@ test {
 /// globals, so we take the `Init.Minimal` form.
 pub fn main(init: std.process.Init.Minimal) !void {
     ignoreSigpipe();
+    catchFatalSignals();
 
     // We link libc anyway, so use its allocator rather than paying for Zig's
     // debug allocator bookkeeping in the render path.
@@ -1058,6 +1059,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // pipe fills, so a build running in another tab would silently stall.
     var fds: [2 + max_tabs]std.posix.pollfd = undefined;
     var sync_started_ms: i64 = 0;
+    // Why we stopped. The initial value covers the loop condition itself: falling out
+    // of it rather than breaking means the compositor asked the toplevel to close.
+    var exit_reason: Exit = .toplevel_closed;
 
     while (!win.closed) {
         // Synchronized output (DECSET 2026): while an application is mid-update we
@@ -1127,13 +1131,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
         _ = std.posix.poll(fds[0..n_fds], timeout) catch |err| {
             c.wl_display_cancel_read(win.display);
-            std.debug.print("maai: poll failed: {s}\n", .{@errorName(err)});
+            exit_reason = .{ .poll_failed = err };
             break;
         };
 
         if (fds[0].revents & std.posix.POLL.IN != 0) {
             if (c.wl_display_read_events(win.display) < 0) {
-                reportWaylandError(&win);
+                exit_reason = .wayland_error;
                 break;
             }
         } else {
@@ -1143,12 +1147,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // the same revents, forever.
             const dead = std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL;
             if (fds[0].revents & dead != 0) {
-                std.debug.print("maai: compositor connection closed\n", .{});
+                exit_reason = .compositor_gone;
                 break;
             }
         }
         if (c.wl_display_dispatch_pending(win.display) < 0) {
-            reportWaylandError(&win);
+            exit_reason = .wayland_error;
             break;
         }
 
@@ -1220,8 +1224,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 break;
             }
         }
-        if (all_closed) break;
+        if (all_closed) {
+            exit_reason = .last_tab_exited;
+            break;
+        }
     }
+
+    exit_reason.report(&win);
 }
 
 fn render(
@@ -1272,6 +1281,53 @@ fn handleFrame(
     app.frame_pending = false;
 }
 
+/// Why the event loop stopped.
+///
+/// Every way out names itself on the way out, because a terminal that vanishes is
+/// exactly the situation where you have nothing left to inspect: there is no window
+/// to read, and the shell that would have shown an exit status died with it. Three of
+/// these paths used to print nothing at all, which made "it disappeared and I do not
+/// know why" unanswerable after the fact — the journal held the startup banner and
+/// then silence.
+///
+/// A signal is not among these: it never reaches the loop at all, so
+/// `reportFatalSignal` reports that case instead.
+const Exit = union(enum) {
+    /// The compositor asked the toplevel to close — a window-manager close binding,
+    /// a taskbar, `swaymsg kill`. Ordinary, but worth distinguishing from a crash.
+    toplevel_closed,
+    /// The last tab's child exited and the window went with it. The usual way to quit.
+    last_tab_exited,
+    /// `poll` itself failed, which should not happen: the fds are ours.
+    poll_failed: anyerror,
+    /// POLLHUP/POLLERR on the Wayland fd with nothing to read: the compositor is gone.
+    compositor_gone,
+    /// A protocol error, or a read that failed for another reason.
+    wayland_error,
+
+    fn report(self: Exit, win: *Window) void {
+        switch (self) {
+            .toplevel_closed => std.debug.print(
+                "maai: exit: the compositor closed the window\n",
+                .{},
+            ),
+            .last_tab_exited => std.debug.print(
+                "maai: exit: the last tab's child exited\n",
+                .{},
+            ),
+            .poll_failed => |err| std.debug.print(
+                "maai: exit: poll failed: {s}\n",
+                .{@errorName(err)},
+            ),
+            .compositor_gone => std.debug.print(
+                "maai: exit: the compositor connection closed\n",
+                .{},
+            ),
+            .wayland_error => reportWaylandError(win),
+        }
+    }
+};
+
 /// Ignore SIGPIPE, whose default action is to terminate the process *silently* —
 /// no panic, no message, no exit code to inspect.
 ///
@@ -1293,6 +1349,81 @@ fn ignoreSigpipe() void {
     std.posix.sigaction(.PIPE, &act, null);
 }
 
+/// Signals that kill us outright and, by default, say nothing while doing it.
+///
+/// SIGSEGV and friends are already covered — Zig installs a handler that prints an
+/// address and a stack trace — but these are not, so a `kill`, a session teardown or a
+/// stray Ctrl-C on our own process group leaves the window gone and the log empty. That
+/// is indistinguishable from a clean exit, and it is the case where knowing *who* did
+/// it matters most.
+const fatal_signals = [_]std.posix.SIG{ .TERM, .HUP, .INT, .QUIT };
+
+/// Say who killed us before honouring the signal.
+///
+/// `SA.RESETHAND` puts the default action back before the handler runs and `SA.NODEFER`
+/// leaves the signal unblocked, so the `raise` at the end kills us immediately with the
+/// right status — a wrapper still sees "terminated by SIGTERM", not a plain exit. Our
+/// `defer`s do not run, which is what already happened before this existed.
+fn catchFatalSignals() void {
+    const act = std.posix.Sigaction{
+        .handler = .{ .sigaction = reportFatalSignal },
+        .mask = std.mem.zeroes(std.posix.sigset_t),
+        .flags = std.posix.SA.SIGINFO | std.posix.SA.RESETHAND | std.posix.SA.NODEFER,
+    };
+    for (fatal_signals) |sig| std.posix.sigaction(sig, &act, null);
+}
+
+/// The handler itself, which has to be async-signal-safe: a stack buffer, hand-rolled
+/// integer formatting and one `write`. `std.debug.print` takes a lock around stderr,
+/// and a signal arriving while the loop already holds that lock would deadlock instead
+/// of reporting anything.
+fn reportFatalSignal(
+    sig: std.posix.SIG,
+    info: *const std.posix.siginfo_t,
+    _: ?*anyopaque,
+) callconv(.c) void {
+    var buf: [96]u8 = undefined;
+    var n: usize = 0;
+    n += append(&buf, n, "maai: exit: killed by ");
+    n += append(&buf, n, @tagName(sig));
+    // si_pid is 0 when the kernel raised it rather than a process — a terminal
+    // hangup, for instance. Naming a pid we do not have would be a lie.
+    const sender = info.fields.common.first.piduid.pid;
+    if (sender != 0) {
+        n += append(&buf, n, " (sent by pid ");
+        n += appendDec(&buf, n, sender);
+        n += append(&buf, n, ")");
+    }
+    n += append(&buf, n, "\n");
+    _ = std.c.write(2, &buf, n);
+
+    _ = std.c.raise(sig);
+}
+
+/// Copy into `buf` at `off`, truncating rather than overflowing, and report how much
+/// landed. Signal-handler helper: no allocation, no formatting machinery.
+fn append(buf: []u8, off: usize, text: []const u8) usize {
+    const room = buf.len - off;
+    const len = @min(room, text.len);
+    @memcpy(buf[off..][0..len], text[0..len]);
+    return len;
+}
+
+/// The same, for a positive integer. Digits are produced backwards into a scratch
+/// buffer, which is why this cannot just be `append`.
+fn appendDec(buf: []u8, off: usize, value: i32) usize {
+    var digits: [11]u8 = undefined;
+    var i: usize = digits.len;
+    var v: u32 = @intCast(@max(value, 0));
+    while (true) {
+        i -= 1;
+        digits[i] = '0' + @as(u8, @intCast(v % 10));
+        v /= 10;
+        if (v == 0) break;
+    }
+    return append(buf, off, digits[i..]);
+}
+
 /// Explain why the Wayland connection died.
 ///
 /// Without this a protocol error is indistinguishable from a clean exit: the loop
@@ -1300,7 +1431,6 @@ fn ignoreSigpipe() void {
 /// print these itself, it only records them for the client to ask about.
 fn reportWaylandError(win: *Window) void {
     const err = c.wl_display_get_error(win.display);
-    if (err == 0) return;
 
     var iface: ?*const c.struct_wl_interface = null;
     var id: u32 = 0;
@@ -1308,11 +1438,15 @@ fn reportWaylandError(win: *Window) void {
 
     if (iface) |i| {
         std.debug.print(
-            "maai: wayland protocol error: {s} raised code {d} on object {d}\n",
+            "maai: exit: wayland protocol error: {s} raised code {d} on object {d}\n",
             .{ std.mem.span(i.*.name), code, id },
         );
+    } else if (err != 0) {
+        std.debug.print("maai: exit: wayland connection lost (errno {d})\n", .{err});
     } else {
-        std.debug.print("maai: wayland connection lost (errno {d})\n", .{err});
+        // libwayland reported failure but recorded no error. Nothing to name, so say
+        // that much rather than exiting silently, which is the whole point here.
+        std.debug.print("maai: exit: wayland dispatch failed, no error recorded\n", .{});
     }
 }
 
