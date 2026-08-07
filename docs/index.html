@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>maai — Wayland terminal emulator</title>
+<style>
+/* ── tokens ──────────────────────────────────────────────────────────────── */
+:root {
+  --bg:       #0C0F14;
+  --surface:  #131820;
+  --border:   #1E2530;
+  --fg:       #C5CDD9;
+  --muted:    #5A6478;
+  --accent:   #2EC4B6;
+  --accent-d: #239E94;
+  --good:     #3FB68A;
+  --warn:     #E6A04C;
+
+  --mono: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', ui-monospace, monospace;
+  --sans: system-ui, -apple-system, sans-serif;
+
+  --r: 4px;
+  color-scheme: dark;
+}
+
+/* light theme — maai can do it, so can we */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg:       #F0F2F5;
+    --surface:  #FFFFFF;
+    --border:   #D0D5DC;
+    --fg:       #1A1F2A;
+    --muted:    #6E7A8A;
+    --accent:   #0D9488;
+    --accent-d: #0A7A70;
+    --good:     #2C8B64;
+    --warn:     #B5731A;
+    color-scheme: light;
+  }
+}
+:root[data-theme="dark"] {
+  --bg:       #0C0F14;
+  --surface:  #131820;
+  --border:   #1E2530;
+  --fg:       #C5CDD9;
+  --muted:    #5A6478;
+  --accent:   #2EC4B6;
+  --accent-d: #239E94;
+  --good:     #3FB68A;
+  --warn:     #E6A04C;
+  color-scheme: dark;
+}
+
+/* ── reset + base ─────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { font-size: 16px; }
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--mono);
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* ── layout ───────────────────────────────────────────────────────────────── */
+.page {
+  max-width: 780px;
+  margin: 0 auto;
+  padding: 3.5rem 2rem 5rem;
+}
+
+/* ── header ───────────────────────────────────────────────────────────────── */
+.hero {
+  padding-bottom: 2.5rem;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 3rem;
+}
+
+.hero-name {
+  font-size: clamp(3rem, 10vw, 5.5rem);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1;
+  color: var(--fg);
+  display: inline;
+}
+
+.cursor {
+  display: inline-block;
+  width: 0.55em;
+  height: 1em;
+  background: var(--accent);
+  vertical-align: text-bottom;
+  margin-left: 0.04em;
+  border-radius: 1px;
+  animation: blink 1.1s step-start infinite;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cursor { animation: none; opacity: 1; }
+}
+
+.hero-tagline {
+  margin-top: 1.1rem;
+  font-size: 1.0rem;
+  color: var(--muted);
+  letter-spacing: 0.01em;
+  max-width: 55ch;
+}
+
+.hero-tagline em {
+  font-style: normal;
+  color: var(--accent);
+}
+
+.hero-meta {
+  margin-top: 1.5rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.5rem;
+  font-size: 0.75rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.hero-meta span::before {
+  content: '▸ ';
+  color: var(--accent);
+  letter-spacing: 0;
+}
+
+/* ── section ──────────────────────────────────────────────────────────────── */
+.section {
+  margin-bottom: 3rem;
+}
+
+.section-label {
+  font-size: 0.68rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 0.9rem;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+.section-label::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
+/* ── prose ────────────────────────────────────────────────────────────────── */
+.prose {
+  font-family: var(--sans);
+  font-size: 0.95rem;
+  color: var(--fg);
+  line-height: 1.75;
+  max-width: 62ch;
+}
+.prose code {
+  font-family: var(--mono);
+  font-size: 0.85em;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  padding: 0.1em 0.35em;
+  border-radius: var(--r);
+  color: var(--accent);
+}
+
+/* ── feature grid ─────────────────────────────────────────────────────────── */
+.features {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 1px;
+  background: var(--border);
+  border: 1px solid var(--border);
+  border-radius: calc(var(--r) + 1px);
+  overflow: hidden;
+  margin-top: 0.5rem;
+}
+
+.feature {
+  background: var(--surface);
+  padding: 1.1rem 1.2rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.feature-name {
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: var(--fg);
+}
+
+.feature-desc {
+  font-family: var(--sans);
+  font-size: 0.8rem;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+/* ── terminal panel ───────────────────────────────────────────────────────── */
+.term-wrap {
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  overflow: hidden;
+}
+
+.term-bar {
+  background: var(--border);
+  padding: 0.45rem 0.9rem;
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.term-dots {
+  display: flex;
+  gap: 0.38rem;
+}
+
+.term-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--muted);
+  opacity: 0.4;
+}
+
+.term-title {
+  font-size: 0.72rem;
+  color: var(--muted);
+  letter-spacing: 0.04em;
+  flex: 1;
+  text-align: center;
+}
+
+.term-body {
+  background: var(--bg);
+  padding: 1.2rem 1.4rem 1.4rem;
+  overflow-x: auto;
+}
+
+.term-body pre {
+  font-size: 0.82rem;
+  line-height: 1.75;
+  white-space: pre;
+  color: var(--fg);
+}
+
+/* syntax colours */
+.c-comment { color: var(--muted); }
+.c-key     { color: var(--fg); }
+.c-val     { color: var(--accent); }
+.c-section { color: var(--warn); }
+
+/* ── key table ────────────────────────────────────────────────────────────── */
+.keytable {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+  margin-top: 0.5rem;
+}
+
+.keytable th {
+  text-align: left;
+  font-size: 0.68rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding: 0 0.5rem 0.6rem;
+  border-bottom: 1px solid var(--border);
+}
+.keytable th:first-child { padding-left: 0; }
+
+.keytable td {
+  padding: 0.45rem 0.5rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+.keytable td:first-child { padding-left: 0; }
+.keytable tr:last-child td { border-bottom: none; }
+
+.keytable .kbd {
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.keytable .kdesc {
+  font-family: var(--sans);
+  color: var(--fg);
+  font-size: 0.82rem;
+}
+
+/* ── build block ──────────────────────────────────────────────────────────── */
+.build-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  margin-top: 0.5rem;
+}
+
+.build-step {
+  display: flex;
+  align-items: baseline;
+  gap: 0.8rem;
+}
+
+.build-step-num {
+  font-size: 0.65rem;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  min-width: 1.4rem;
+  text-align: right;
+  padding-top: 0.15rem;
+}
+
+.build-step code {
+  font-family: var(--mono);
+  font-size: 0.83rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  padding: 0.3rem 0.8rem;
+  border-radius: var(--r);
+  color: var(--fg);
+  flex: 1;
+  display: block;
+}
+
+.build-step code .cmd-prompt {
+  color: var(--accent);
+  user-select: none;
+}
+
+.build-step code .cmd-arg {
+  color: var(--good);
+}
+
+/* ── footer ───────────────────────────────────────────────────────────────── */
+.footer {
+  margin-top: 4rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--border);
+  font-size: 0.72rem;
+  color: var(--muted);
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.footer a { color: var(--muted); }
+.footer a:hover { color: var(--accent); text-decoration: none; }
+</style>
+</head>
+<body>
+
+<div class="page">
+
+  <!-- ── hero ── -->
+  <header class="hero">
+    <div>
+      <span class="hero-name">maai</span><span class="cursor"></span>
+    </div>
+    <p class="hero-tagline">
+      A Wayland terminal emulator built in <em>Zig</em> —
+      PTY, VT parser, GPU-rendered text, and nothing you did not ask for.
+    </p>
+    <div class="hero-meta">
+      <span>Zig</span>
+      <span>Wayland / EGL</span>
+      <span>OpenGL</span>
+      <span>Linux</span>
+      <span>MIT License</span>
+    </div>
+  </header>
+
+  <!-- ── about ── -->
+  <section class="section">
+    <div class="section-label">About</div>
+    <p class="prose">
+      maai opens a window, spawns a shell, and stays out of the way.
+      Under the hood: a PTY read loop, a VT sequence parser, a glyph atlas on the GPU, and a
+      Wayland surface driven by <code>poll(2)</code> — no threads, no framework, one tight event loop.
+      Config is a flat <code>key value</code> file; themes are compatible with the corpus already out there.
+      Edit either one and the change lands while you watch.
+    </p>
+  </section>
+
+  <!-- ── features ── -->
+  <section class="section">
+    <div class="section-label">Features</div>
+    <div class="features">
+      <div class="feature">
+        <div class="feature-name">Tabs</div>
+        <div class="feature-desc">Up to 32 tabs per window. New tab inherits the current directory.</div>
+      </div>
+      <div class="feature">
+        <div class="feature-name">Powerline bar</div>
+        <div class="feature-desc">Shaped separators between tabs. Angled, slanted, or round — needs a Nerd Font.</div>
+      </div>
+      <div class="feature">
+        <div class="feature-name">Hint mode</div>
+        <div class="feature-desc">Every visible link labelled. Type two letters to open or copy — no mouse required.</div>
+      </div>
+      <div class="feature">
+        <div class="feature-name">URL handling</div>
+        <div class="feature-desc">OSC 8 hyperlinks and plain-text URL detection. Ctrl+click opens; shift-click copies.</div>
+      </div>
+      <div class="feature">
+        <div class="feature-name">Live reload</div>
+        <div class="feature-desc">Config, theme file, and flavour file are watched via inotify. Save to apply.</div>
+      </div>
+      <div class="feature">
+        <div class="feature-name">Mouse protocols</div>
+        <div class="feature-desc">All xterm mouse modes. Shift overrides back to selection in any mode.</div>
+      </div>
+      <div class="feature">
+        <div class="feature-name">GPU rendering</div>
+        <div class="feature-desc">Glyph atlas rasterised once, drawn each frame via OpenGL/EGL. No compositing path.</div>
+      </div>
+      <div class="feature">
+        <div class="feature-name">Scrollback</div>
+        <div class="feature-desc">10 000 lines by default (configurable). Ring buffer; no allocation on scroll.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── keyboard ── -->
+  <section class="section">
+    <div class="section-label">Default bindings</div>
+    <div style="overflow-x:auto">
+      <table class="keytable">
+        <thead>
+          <tr>
+            <th>Combination</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td class="kbd">Ctrl+Shift+C</td><td class="kdesc">Copy selection to clipboard</td></tr>
+          <tr><td class="kbd">Ctrl+Shift+V</td><td class="kdesc">Paste from clipboard</td></tr>
+          <tr><td class="kbd">Ctrl+Shift+U</td><td class="kdesc">Enter hint mode</td></tr>
+          <tr><td class="kbd">Ctrl+Shift+T</td><td class="kdesc">New tab</td></tr>
+          <tr><td class="kbd">Ctrl+Tab</td><td class="kdesc">Next tab</td></tr>
+          <tr><td class="kbd">Ctrl+Shift+Tab</td><td class="kdesc">Previous tab</td></tr>
+          <tr><td class="kbd">Alt+1…0</td><td class="kdesc">Jump to tab by number row position</td></tr>
+          <tr><td class="kbd">Alt+%</td><td class="kdesc">New window in current directory</td></tr>
+          <tr><td class="kbd">Shift+Page Up/Down</td><td class="kdesc">Scroll half a page</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p style="margin-top:0.8rem;font-family:var(--sans);font-size:0.78rem;color:var(--muted)">
+      Every binding is remappable. Use <code style="font-family:var(--mono);color:var(--accent);background:var(--surface);border:1px solid var(--border);padding:.05em .3em;border-radius:3px">key &lt;combo&gt; none</code> to hand a combination back to applications.
+    </p>
+  </section>
+
+  <!-- ── config ── -->
+  <section class="section">
+    <div class="section-label">Configuration</div>
+    <div class="term-wrap">
+      <div class="term-bar">
+        <div class="term-dots">
+          <div class="term-dot"></div>
+          <div class="term-dot"></div>
+          <div class="term-dot"></div>
+        </div>
+        <div class="term-title">~/.config/maai/maai.conf</div>
+      </div>
+      <div class="term-body">
+        <pre><span class="c-comment"># font and layout</span>
+<span class="c-key">font_family</span>  <span class="c-val">FiraCode Nerd Font Ret</span>
+<span class="c-key">font_size</span>    <span class="c-val">12</span>
+<span class="c-key">padding_x</span>    <span class="c-val">4</span>
+
+<span class="c-comment"># behaviour</span>
+<span class="c-key">copy_on_select</span>    <span class="c-val">yes</span>
+<span class="c-key">scrollback_lines</span>  <span class="c-val">10000</span>
+<span class="c-key">url_launcher</span>      <span class="c-val">xdg-open</span>
+
+<span class="c-comment"># tab bar</span>
+<span class="c-key">tab_bar_style</span>      <span class="c-val">powerline</span>
+<span class="c-key">tab_powerline_style</span> <span class="c-val">slanted</span>
+
+<span class="c-comment"># theme — name looked up in theme_dir, or a path</span>
+<span class="c-key">theme</span>  <span class="c-val">nightfox</span>
+<span class="c-comment"># or let an external switcher drive it:</span>
+<span class="c-key">theme_flavour_file</span>  <span class="c-val">~/.config/.app-theme-flavour</span>
+
+<span class="c-comment"># rebind or free a key</span>
+<span class="c-key">key</span>  <span class="c-val">ctrl+shift+c  copy</span>
+<span class="c-key">key</span>  <span class="c-val">ctrl+tab      none</span>  <span class="c-comment"># hand back to applications</span></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── build ── -->
+  <section class="section">
+    <div class="section-label">Build &amp; install</div>
+    <div class="build-steps">
+      <div class="build-step">
+        <div class="build-step-num">01</div>
+        <code><span class="cmd-prompt">$ </span>git clone &lt;repo&gt; &amp;&amp; cd maai</code>
+      </div>
+      <div class="build-step">
+        <div class="build-step-num">02</div>
+        <code><span class="cmd-prompt">$ </span>zig build <span class="cmd-arg">-Doptimize=ReleaseFast</span></code>
+      </div>
+      <div class="build-step">
+        <div class="build-step-num">03</div>
+        <code><span class="cmd-prompt">$ </span>./zig-out/bin/maai</code>
+      </div>
+      <div class="build-step">
+        <div class="build-step-num">or</div>
+        <code><span class="cmd-prompt">$ </span>bash install.sh</code>
+      </div>
+    </div>
+    <p style="margin-top:1rem;font-family:var(--sans);font-size:0.78rem;color:var(--muted)">
+      Requires Zig 0.16+, libwayland-client, libEGL, libxkbcommon, and fcft.
+    </p>
+  </section>
+
+  <!-- ── footer ── -->
+  <footer class="footer">
+    <span>maai &mdash; MIT License</span>
+    <span>Zig · Wayland · OpenGL</span>
+  </footer>
+
+</div>
+
+</body>
+</html>
