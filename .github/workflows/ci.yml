@@ -19,7 +19,7 @@ jobs:
           version: 0.16.0
 
       - name: Install deps
-        run: sudo apt-get install -q -y libutf8proc-dev
+        run: sudo apt-get install -q -y wayland-protocols libutf8proc-dev
 
       - run: zig build test-pure
 
