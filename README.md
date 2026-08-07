@@ -1,5 +1,7 @@
 # maai
 
+[![CI](https://github.com/avoiney/maai/actions/workflows/ci.yml/badge.svg)](https://github.com/avoiney/maai/actions/workflows/ci.yml)
+
 A Wayland terminal emulator written in Zig.
 
 PTY + VT parser + GPU-rendered text, driven by a single `poll(2)` loop. No threads,
