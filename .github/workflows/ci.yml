@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # Fast terminal-logic tests — no Wayland/EGL/fcft required.
+  test-pure:
+    name: Tests (pure)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install deps
+        run: sudo apt-get install -q -y libutf8proc-dev
+
+      - run: zig build test-pure
+
+  # Full test suite — compiles and links against every system library.
+  # Tests themselves are pure logic; no compositor or display required.
+  test-full:
+    name: Tests (full)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install deps
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -q -y \
+            libwayland-bin wayland-protocols libwayland-dev \
+            libegl1-mesa-dev libgles2-mesa-dev            \
+            libfcft-dev libpixman-1-dev                   \
+            libxkbcommon-dev libutf8proc-dev
+
+      - run: zig build test
