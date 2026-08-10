@@ -1248,6 +1248,12 @@ pub const Screen = struct {
         std.mem.swap(usize, &self.csi_u_depth, &self.other_csi_u_depth);
         self.in_alt = enable;
 
+        // Selection and hover coordinates belong to the grid that was visible. After
+        // swapping buffers they could point at unrelated cells and leave a stale
+        // highlight on a full-screen app's redraw.
+        self.selection.clear();
+        self.hover = null;
+
         // Margins belong to the buffer being left behind.
         self.margin_top = 0;
         self.margin_bottom = self.grid.rows - 1;
@@ -1284,6 +1290,8 @@ pub const Screen = struct {
         self.margin_bottom = self.grid.rows - 1;
         self.modes = .{};
         self.mouse = .{};
+        self.selection.clear();
+        self.hover = null;
         self.csi_u_depth = 0;
         self.other_csi_u_flags = 0;
         self.other_csi_u_depth = 0;

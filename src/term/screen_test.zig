@@ -279,6 +279,25 @@ test "alt screen restores the cursor position on exit" {
     try std.testing.expectEqual(@as(u32, 4), s.cursor_x);
 }
 
+test "alt screen switches clear stale selection overlays" {
+    var s = try Screen.init(std.testing.allocator, 10, 4);
+    defer s.deinit();
+
+    s.selection.begin(&s.grid, .{ .line = s.grid.screenTop(), .x = 1 }, .char);
+    s.selection.extend(&s.grid, .{ .line = s.grid.screenTop(), .x = 3 });
+    try std.testing.expect(s.selection.active);
+
+    feed(&s, "\x1b[?1049h");
+    try std.testing.expect(!s.selection.active);
+
+    s.selection.begin(&s.grid, .{ .line = s.grid.screenTop(), .x = 2 }, .char);
+    s.selection.extend(&s.grid, .{ .line = s.grid.screenTop(), .x = 4 });
+    try std.testing.expect(s.selection.active);
+
+    feed(&s, "\x1b[?1049l");
+    try std.testing.expect(!s.selection.active);
+}
+
 test "scroll region confines scrolling to its rows" {
     var s = try Screen.init(std.testing.allocator, 6, 5);
     defer s.deinit();

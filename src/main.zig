@@ -234,6 +234,12 @@ const App = struct {
 
     fn writeToPty(ctx: *anyopaque, bytes: []const u8) void {
         const self: *App = @ptrCast(@alignCast(ctx));
+        // Typing replaces the visual context: a mouse selection left highlighted
+        // over the next command (for example a full-screen app) reads as stale UI.
+        if (self.screen.selection.active) {
+            self.screen.selection.clear();
+            self.needs_render = true;
+        }
         // Typing snaps the view back to the live screen; otherwise the reply to
         // whatever you just typed scrolls past unseen.
         if (self.screen.grid.view != 0) {
@@ -730,6 +736,11 @@ const App = struct {
         const text = self.win.clipboard.paste(kind, self.win.display) orelse return;
         defer self.gpa.free(text);
         if (text.len == 0) return;
+
+        if (self.screen.selection.active) {
+            self.screen.selection.clear();
+            self.needs_render = true;
+        }
 
         // Bracketed paste lets the application tell pasted text from typing, which
         // is what stops a pasted newline from executing a command outright. When the
