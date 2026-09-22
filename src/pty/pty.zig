@@ -11,6 +11,15 @@ pub const Error = error{
 pub const Pty = struct {
     master: std.posix.fd_t = -1,
     child: std.posix.pid_t = -1,
+    /// Index of the slave side, the N in `/dev/pts/N`; -1 when unknown.
+    ///
+    /// This is the only name a session has that anything *outside* maai can also
+    /// see: a process's controlling terminal shows up as `/dev/pts/N` everywhere
+    /// from `ps` to `/proc`, so it is what the control socket addresses a tab by.
+    /// forkpty can hand back the slave's path, but only into a caller-supplied
+    /// buffer that would have to be sized against PATH_MAX and then re-parsed —
+    /// the number is what we want, and TIOCGPTN is where ptsname() gets it.
+    pts: i32 = -1,
     /// Set once the child has exited or the master has hung up.
     hung_up: bool = false,
 
@@ -91,7 +100,25 @@ pub const Pty = struct {
         _ = c.fcntl(master, c.F_SETFL, flags | c.O_NONBLOCK);
         _ = c.fcntl(master, c.F_SETFD, c.FD_CLOEXEC);
 
-        return .{ .master = @intCast(master), .child = @intCast(pid) };
+        return .{
+            .master = @intCast(master),
+            .child = @intCast(pid),
+            .pts = ptsIndex(master),
+        };
+    }
+
+    /// The N in `/dev/pts/N` for a master fd, or -1 if the kernel will not say.
+    ///
+    /// `ptsname()` would be the portable spelling, but glibc hides it behind
+    /// `__USE_XOPEN_EXTENDED`, so it is not among the symbols our single
+    /// `@cImport` translates — and c.zig is not a file to add a header to for one
+    /// call. TIOCGPTN is what ptsname() itself does on Linux, arrives free with
+    /// `sys/ioctl.h`, which is already included, and yields the number directly
+    /// instead of a path to parse back into one.
+    fn ptsIndex(master: c_int) i32 {
+        var n: c_uint = 0;
+        if (c.ioctl(master, c.TIOCGPTN, &n) != 0) return -1;
+        return std.math.cast(i32, n) orelse -1;
     }
 
     pub fn resize(self: *Pty, cols: u32, rows: u32) void {
@@ -215,4 +242,41 @@ test "a dead child has no directory" {
     var pty = Pty{ .master = -1, .child = -1 };
     var buf: [64]u8 = undefined;
     try testing.expect(pty.cwd(&buf) == null);
+}
+
+test "the pts index is the one the child's own terminal reports" {
+    // Asked of the *child*, because that is the number an outside process reads
+    // back out of /proc when it maps a session to a tab. Checking our own ioctl
+    // against our own master fd would only prove the ioctl agrees with itself.
+    var argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", "tty" };
+    var pty = Pty.spawn(20, 5, &argv, "") catch return error.SkipZigTest;
+    defer pty.deinit();
+
+    try testing.expect(pty.pts >= 0);
+
+    // Poll rather than read once: forkpty returns in the parent before the child
+    // has been scheduled, so nothing about the child is observable yet. (Reading
+    // /proc/<child>/fd/0 instead walks straight into that race and sees *our* fd
+    // table, which is how this test found the window in the first place.)
+    var buf: [128]u8 = undefined;
+    var n: usize = 0;
+    const nap = std.c.timespec{ .sec = 0, .nsec = 1_000_000 };
+    var tries: usize = 0;
+    while (tries < 2000) : (tries += 1) {
+        if (std.mem.indexOfScalar(u8, buf[0..n], '\n') != null) break;
+        if (n == buf.len) break;
+        n += pty.read(buf[n..]);
+        _ = std.c.nanosleep(&nap, null);
+    }
+
+    var expect_buf: [64]u8 = undefined;
+    const expect = try std.fmt.bufPrint(&expect_buf, "/dev/pts/{d}", .{pty.pts});
+    // The line arrives CRLF-terminated: the slave is in cooked mode.
+    const line = std.mem.sliceTo(buf[0..n], '\n');
+    try testing.expectEqualStrings(expect, std.mem.trimEnd(u8, line, "\r"));
+}
+
+test "a pty that was never spawned reports an unknown pts" {
+    const pty = Pty{};
+    try testing.expectEqual(@as(i32, -1), pty.pts);
 }

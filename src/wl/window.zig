@@ -45,18 +45,23 @@ pub const Window = struct {
     pending_width: u32 = 0,
     pending_height: u32 = 0,
 
+    /// Wayland app_id. sway matches window rules on it, so the default is
+    /// effectively API and must stay "maai"; `--app-id` gives one window its own
+    /// identity, which is how the agent dashboard gets its own scratchpad rule.
+    app_id: [*:0]const u8 = "maai",
+
     configured: bool = false,
     /// Size changed since the last render; renderer must resync its viewport.
     resized: bool = true,
     /// Compositor or user asked us to go away.
     closed: bool = false,
 
-    pub fn init(w: *Window, gpa: std.mem.Allocator) Error!void {
+    pub fn init(w: *Window, gpa: std.mem.Allocator, app_id: [*:0]const u8) Error!void {
         const display = c.wl_display_connect(null) orelse return Error.ConnectFailed;
         const registry = c.wl_display_get_registry(display) orelse
             return Error.ConnectFailed;
 
-        w.* = .{ .display = display, .registry = registry };
+        w.* = .{ .display = display, .registry = registry, .app_id = app_id };
         w.keyboard.init();
         w.clipboard.init(gpa);
 
@@ -88,9 +93,10 @@ pub const Window = struct {
             return Error.RoleFailed;
         _ = c.xdg_toplevel_add_listener(w.toplevel, &toplevel_listener, w);
 
+        // A name until the child sets one of its own; App pushes the active tab's
+        // OSC title from there on.
         c.xdg_toplevel_set_title(w.toplevel, "maai");
-        // sway matches rules on app_id; keep this stable, it is effectively API.
-        c.xdg_toplevel_set_app_id(w.toplevel, "maai");
+        c.xdg_toplevel_set_app_id(w.toplevel, w.app_id);
 
         // Ask for server-side decorations so sway draws its own 1px border rather
         // than us reimplementing titlebars. If the compositor lacks the protocol we
@@ -121,6 +127,20 @@ pub const Window = struct {
     /// The Wayland connection's fd, for the poll loop in main.
     pub fn fd(w: *Window) std.posix.fd_t {
         return c.wl_display_get_fd(w.display);
+    }
+
+    /// Hand the compositor a new toplevel title.
+    ///
+    /// Copied into a local because the screen keeps its title as a slice while
+    /// libwayland wants a C string; the request marshals the bytes immediately, so
+    /// the buffer does not have to outlive the call.
+    pub fn setTitle(w: *Window, text: []const u8) void {
+        const toplevel = w.toplevel orelse return;
+        var buf: [257]u8 = undefined;
+        const n = @min(text.len, buf.len - 1);
+        @memcpy(buf[0..n], text[0..n]);
+        buf[n] = 0;
+        c.xdg_toplevel_set_title(toplevel, @ptrCast(&buf));
     }
 
     pub fn deinit(w: *Window) void {

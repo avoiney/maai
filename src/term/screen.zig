@@ -659,6 +659,8 @@ pub const Screen = struct {
             const n = @min(text.len, self.title_buf.len);
             @memcpy(self.title_buf[0..n], text[0..n]);
             self.title_len = n;
+            // The tab bar draws this, so a title on its own still owes us a frame.
+            self.dirty = true;
         } else if (std.mem.eql(u8, code, "8")) {
             self.setHyperlink(text);
         } else if (std.mem.eql(u8, code, "7")) {

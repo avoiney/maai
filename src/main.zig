@@ -25,6 +25,7 @@ const launch = @import("launch.zig");
 const cfgmod = @import("config.zig");
 const barmod = @import("ui/bar.zig");
 const watchmod = @import("watch.zig");
+const ctlmod = @import("ctl.zig");
 const ptr = @import("wl/pointer.zig");
 const clip = @import("wl/clipboard.zig");
 
@@ -108,6 +109,11 @@ const App = struct {
     child_argv: [*:null]const ?[*:0]const u8,
     /// Scratch for the tab bar, rebuilt each frame it is drawn.
     bar: [1024]rendermod.BarCell = undefined,
+    /// Scratch for the control socket's tab listing, same reason as `bar`.
+    ctl_pts: [max_tabs]i32 = undefined,
+    /// Last title handed to the compositor, so an unchanged one costs no request.
+    title_pushed: [256]u8 = undefined,
+    title_pushed_len: usize = 0,
     font: *const Font,
     pad: Padding,
     cfg: *const cfgmod.Config,
@@ -167,6 +173,41 @@ const App = struct {
         t.screen.reply = .{ .ctx = self, .write = App.writeToPty };
         self.hintsExit();
         self.needs_render = true;
+    }
+
+    /// Give the window the active tab's title, so the outside world can tell one
+    /// maai from another — in sway's tree, in a window switcher, in waybar.
+    ///
+    /// Compared before pushing rather than pushed every frame: a shell that
+    /// rewrites its title on every prompt would otherwise put a Wayland request on
+    /// the wire for every command. An empty title falls back to the program name
+    /// rather than leaving the window nameless.
+    fn syncTitle(self: *App) void {
+        const set = self.screen.title();
+        const text = if (set.len > 0) set else "maai";
+        if (std.mem.eql(u8, text, self.title_pushed[0..self.title_pushed_len])) return;
+        const n = @min(text.len, self.title_pushed.len);
+        @memcpy(self.title_pushed[0..n], text[0..n]);
+        self.title_pushed_len = n;
+        self.win.setTitle(text[0..n]);
+    }
+
+    /// The pts index of every tab, for the control socket's `list`.
+    fn ctlTabs(ctx: *anyopaque) ctlmod.Tabs {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        for (self.tabs[0..self.tab_count], 0..) |t, i| self.ctl_pts[i] = t.pty.pts;
+        return .{ .pts = self.ctl_pts[0..self.tab_count], .active = self.active };
+    }
+
+    /// Bring the tab running on `/dev/pts/<pts>` to the front. False when no tab is.
+    fn ctlFocusPts(ctx: *anyopaque, pts: i32) bool {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        for (self.tabs[0..self.tab_count], 0..) |t, i| {
+            if (t.pty.pts != pts) continue;
+            self.focus(i);
+            return true;
+        }
+        return false;
     }
 
     /// Lay the tab bar out, one column per cell.
@@ -966,7 +1007,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer font.deinit();
 
     var win: Window = undefined;
-    try win.init(gpa);
+    try win.init(gpa, args.app_id);
     defer win.deinit();
 
     var gl: Gl = undefined;
@@ -1026,6 +1067,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
     if (watcher) |*w| armWatches(w, args.config_path, &cfg);
     defer if (watcher) |*w| w.deinit();
 
+    // The outside world's only handle on an individual tab. Optional for the same
+    // reason the watcher is: a session with no XDG_RUNTIME_DIR simply cannot be
+    // driven from outside, which is how things were before it existed.
+    var ctl = ctlmod.Control.init(.{
+        .ctx = &app,
+        .tabs = App.ctlTabs,
+        .focus = App.ctlFocusPts,
+    });
+    defer if (ctl) |*x| x.deinit();
+
     const gi = gl.info();
     const caps = Font.capabilities();
     std.debug.print(
@@ -1065,10 +1116,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // panes (phase 5), and foot demonstrates a single-threaded loop is entirely
     // competitive. Revisit with measurements rather than on principle.
     var read_buf: [read_chunk]u8 = undefined;
-    // Wayland, inotify, then one per tab. Every tab is polled, not just the visible
-    // one: a hidden tab that stops draining its PTY blocks its child the moment the
-    // pipe fills, so a build running in another tab would silently stall.
-    var fds: [2 + max_tabs]std.posix.pollfd = undefined;
+    // Wayland, inotify, the control socket, then one per tab. Every tab is polled,
+    // not just the visible one: a hidden tab that stops draining its PTY blocks its
+    // child the moment the pipe fills, so a build running in another tab would
+    // silently stall.
+    var fds: [3 + max_tabs]std.posix.pollfd = undefined;
     var sync_started_ms: i64 = 0;
     // Why we stopped. The initial value covers the loop condition itself: falling out
     // of it rather than breaking means the compositor asked the toplevel to close.
@@ -1095,6 +1147,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             win.keyboard.fireRepeat(now_ms);
         }
 
+        app.syncTitle();
+
         if (app.needs_render and !app.frame_pending and !sync_holding) {
             render(&app, &renderer, &cache, &font, pad);
         }
@@ -1114,14 +1168,20 @@ pub fn main(init: std.process.Init.Minimal) !void {
             .events = std.posix.POLL.IN,
             .revents = 0,
         };
+        // And again for the control socket.
+        fds[2] = .{
+            .fd = if (ctl) |*x| x.fd else -1,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        };
         for (app.tabs[0..app.tab_count], 0..) |t, i| {
-            fds[2 + i] = .{
+            fds[3 + i] = .{
                 .fd = t.pty.master,
                 .events = std.posix.POLL.IN,
                 .revents = 0,
             };
         }
-        const n_fds = 2 + app.tab_count;
+        const n_fds = 3 + app.tab_count;
 
         // Block indefinitely unless a deadline needs us back sooner. Two can be
         // outstanding — the synchronized-output safety valve and the next key
@@ -1170,7 +1230,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // Drain every tab, with the budget applied per tab so one flooding session
         // cannot starve the others — or the input handling.
         for (app.tabs[0..app.tab_count], 0..) |t, i| {
-            if (fds[2 + i].revents & (std.posix.POLL.IN | std.posix.POLL.HUP) == 0) continue;
+            if (fds[3 + i].revents & (std.posix.POLL.IN | std.posix.POLL.HUP) == 0) continue;
             var drained: usize = 0;
             while (drained < drain_budget) {
                 const n = t.pty.read(&read_buf);
@@ -1178,6 +1238,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 t.parser.feed(read_buf[0..n]);
                 drained += n;
             }
+        }
+
+        if (ctl) |*x| {
+            if (fds[2].revents & std.posix.POLL.IN != 0) x.drain();
         }
 
         if (watcher) |*w| {
@@ -1498,6 +1562,8 @@ const Args = struct {
     config_path: []const u8 = "",
     /// Directory to start the child in; empty means inherit ours.
     cwd: []const u8 = "",
+    /// Wayland app_id for this window, so one window can carry its own sway rules.
+    app_id: [*:0]const u8 = "maai",
     /// Everything from `-e` onwards, or the whole argv when absent.
     child: []const [*:0]const u8,
 };
@@ -1515,6 +1581,9 @@ fn parseArgs(argv: []const [*:0]const u8) Args {
             i += 1;
         } else if (std.mem.eql(u8, arg, "--cwd") and i + 1 < argv.len) {
             out.cwd = std.mem.span(argv[i + 1]);
+            i += 1;
+        } else if (std.mem.eql(u8, arg, "--app-id") and i + 1 < argv.len) {
+            out.app_id = argv[i + 1];
             i += 1;
         }
     }
@@ -1704,4 +1773,23 @@ fn buildArgv(
     const argv = try gpa.allocSentinel(?[*:0]const u8, 1, null);
     argv[0] = shell;
     return argv;
+}
+
+// ── tests ───────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "the app_id defaults to the one sway rules already match" {
+    const argv = [_][*:0]const u8{"maai"};
+    try testing.expectEqualStrings("maai", std.mem.span(parseArgs(&argv).app_id));
+}
+
+test "--app-id gives one window an identity of its own" {
+    const argv = [_][*:0]const u8{ "maai", "--app-id", "agentstat", "-e", "sh" };
+    try testing.expectEqualStrings("agentstat", std.mem.span(parseArgs(&argv).app_id));
+}
+
+test "a command after -e is not mistaken for our own flags" {
+    const argv = [_][*:0]const u8{ "maai", "-e", "sh", "--app-id", "nope" };
+    try testing.expectEqualStrings("maai", std.mem.span(parseArgs(&argv).app_id));
 }
