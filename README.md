@@ -51,6 +51,7 @@ maai                    # run $SHELL
 maai -e cmd args        # run a specific command
 maai -c path/to.conf    # use a specific config file
 maai --cwd /some/dir    # start in that directory
+maai --app-id NAME      # set the Wayland app_id (default: maai)
 MAAI_DEBUG=1 maai       # trace input, selection, and mouse handling
 ```
 
@@ -180,6 +181,51 @@ the link; hold Shift while typing to copy it instead. Any other key exits the mo
 
 OSC 8 hyperlinks (where the link text is not itself a URL) are handled correctly: the
 label text is opened, not whatever characters happen to be on screen.
+
+## Window identity
+
+A compositor matches its window rules on the Wayland `app_id`, which is `maai`
+unless you say otherwise. `--app-id NAME` gives one window an identity of its
+own, so a dropdown or a dashboard can carry rules that no other terminal
+inherits:
+
+```sh
+maai --app-id scratchterm
+```
+
+The toplevel title follows the active tab — whatever the program running in it
+sets through OSC 0 or OSC 2 — and falls back to `maai` when nothing has set one.
+That is the name a window switcher, a bar, or `swaymsg -t get_tree` shows.
+
+## Control socket
+
+Each window listens on `$XDG_RUNTIME_DIR/maai/<pid>.sock`, so something outside
+can bring a particular tab to the front. Tabs are addressed by the index of
+their pseudo-terminal: `/dev/pts/N` is the one name a session and an outside
+observer can both pronounce — it shows up in `ps` and in `/proc`, and a process
+can read its own.
+
+One command per line, one line of reply:
+
+| Request | Reply |
+|---|---|
+| `ping` | `ok` |
+| `list` | `ok 7,*12,3` — each tab's pts in order, the active one starred, `?` when unknown |
+| `focus-pts N` | `ok`, or `err no-such-pts` |
+
+Anything else answers `err bad-command`.
+
+```sh
+printf 'focus-pts 7\n' | nc -U "$XDG_RUNTIME_DIR/maai/$(pgrep -x maai | head -1).sock"
+```
+
+Two things this deliberately is not. The access control is the filesystem's:
+`$XDG_RUNTIME_DIR` is already private to one user, and a token of our own would
+be one more thing to get wrong without being one more thing to get past. And no
+command writes to a child — the socket moves the focus, it never injects input.
+
+Without `XDG_RUNTIME_DIR` no socket is created and everything else works as
+before, the same way the config watcher degrades.
 
 ## Tests
 
