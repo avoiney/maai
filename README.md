@@ -101,12 +101,24 @@ url_launcher    xdg-open # one program, no arguments
 ### Tab bar
 
 ```
-tab_bar_style       powerline   # or: plain
+tab_bar_style       powerline   # or: plain, hidden
 tab_powerline_style slanted     # or: angled, round
 ```
 
 `powerline` draws a shaped separator between tabs using glyphs from the Nerd Font
 private-use range. Use `plain` if the font does not have them.
+
+`hidden` draws no bar at all and hands its row back to the grid, for a window used as
+a single scratchpad. Tabs still work and stay addressable over the control socket —
+they are only invisible — so unbind their keys too if you want none:
+
+```
+tab_bar_style hidden
+key ctrl+shift+t none
+key ctrl+tab      none
+key ctrl+shift+tab none
+key alt+numrow    none
+```
 
 ### Key bindings
 

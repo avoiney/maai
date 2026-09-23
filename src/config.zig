@@ -37,6 +37,12 @@ pub const BarStyle = enum {
     /// shape rather than a character. Needs a Nerd Font for the glyphs; the machine's
     /// FiraCode Nerd Font has them.
     powerline,
+    /// No bar at all, and the row it would take goes back to the grid. For a window
+    /// used as a single scratchpad, where the strip is a permanent one-line tax for a
+    /// second tab that never opens. Tabs still work and are still addressable over the
+    /// control socket; they are simply not shown. Unbind their keys too
+    /// (`key ctrl+shift+t none`) to be sure one cannot be opened unseen.
+    hidden,
 };
 
 /// Which separator glyph. Names and codepoints follow the established
@@ -588,7 +594,7 @@ fn applyKey(
         cfg.url_launcher.set(value);
     } else if (std.mem.eql(u8, key, "tab_bar_style")) {
         cfg.tab_bar_style = std.meta.stringToEnum(BarStyle, value) orelse {
-            diags.add(path, entry.line, "expected plain or powerline");
+            diags.add(path, entry.line, "expected plain, powerline or hidden");
             return;
         };
     } else if (std.mem.eql(u8, key, "tab_powerline_style")) {
@@ -1172,4 +1178,17 @@ test "writing shift into a punctuation binding is harmless, not a second entry" 
     // Both spellings name the same combination, so the second replaced the first rather
     // than sitting behind it forever.
     try testing.expectEqual(Action.hints, cfg.bindings.lookup('%', 0, false, true, true).?);
+}
+
+test "tab_bar_style hidden parses, and a bad value leaves the old style alone" {
+    var cfg = Config{};
+    var diags = Diagnostics{};
+    parseInto("tab_bar_style hidden", &cfg, &diags);
+    try testing.expectEqual(BarStyle.hidden, cfg.tab_bar_style);
+    try testing.expectEqual(@as(usize, 0), diags.len);
+
+    // A typo must not silently hide the bar, nor silently bring it back.
+    parseInto("tab_bar_style invisible", &cfg, &diags);
+    try testing.expectEqual(BarStyle.hidden, cfg.tab_bar_style);
+    try testing.expectEqual(@as(usize, 1), diags.len);
 }

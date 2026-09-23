@@ -217,6 +217,10 @@ const App = struct {
     /// cells on screen. The rules themselves live in `ui/bar.zig`, which knows nothing
     /// of tabs, PTYs or Wayland and can therefore be tested without a compositor.
     fn buildBar(self: *App) []const rendermod.BarCell {
+        // One compare per frame, before any per-tab or per-column work: a hidden bar
+        // costs the draw path an empty slice, which the renderer already skips.
+        if (self.cfg.tab_bar_style == .hidden) return self.bar[0..0];
+
         var tabs: [max_tabs]barmod.Tab = undefined;
         for (self.tabs[0..self.tab_count], 0..) |t, i| {
             tabs[i] = .{ .title = t.screen.title() };
@@ -1021,7 +1025,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer cache.deinit();
 
     var pad = Padding{ .x = cfg.padding_x, .y = cfg.padding_y };
-    var dims = gridSize(win.width, win.height, &font, pad);
+    var dims = gridSize(win.width, win.height, &font, pad, tabBarRows(&cfg));
 
     const first = Tab.create(gpa, dims.cols, dims.rows, &cfg, argv.ptr, "") catch |err| {
         std.debug.print("maai: could not start {s}: {s}\n", .{
@@ -1266,7 +1270,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // text. The same reason `Screen.resize` drops the hover span.
             app.hintsExit();
             gl.resize(win.width, win.height);
-            dims = gridSize(win.width, win.height, &font, pad);
+            dims = gridSize(win.width, win.height, &font, pad, tabBarRows(&cfg));
             for (app.tabs[0..app.tab_count]) |t| {
                 // Every tab, not only the visible one: a background tab left at the old
                 // width writes at the wrong size and reflows wrongly when shown.
@@ -1540,12 +1544,16 @@ const Dims = struct { cols: u32, rows: u32 };
 
 /// Rows the tab bar takes out of the grid.
 ///
-/// Always reserved, even with one tab, so opening a second one does not resize the grid
+/// Reserved whatever the tab count, so opening a second tab does not resize the grid
 /// and reflow everything you were looking at. Showing the bar from the first tab is
-/// also the convention elsewhere.
-const tab_bar_rows: u32 = 1;
+/// also the convention elsewhere. It is the *config* that can give the row back, not
+/// the tab count: a window either has a bar or it does not, for its whole life, and
+/// the grid never changes size underneath you.
+fn tabBarRows(cfg: *const cfgmod.Config) u32 {
+    return if (cfg.tab_bar_style == .hidden) 0 else 1;
+}
 
-fn gridSize(width: u32, height: u32, font: *const Font, pad: Padding) Dims {
+fn gridSize(width: u32, height: u32, font: *const Font, pad: Padding, bar_rows: u32) Dims {
     // Padding is left/top only (the equivalent of `window_padding_width 0 0 0 4`),
     // so the gutter does not cost a row.
     const usable_w = if (width > pad.x) width - pad.x else font.cell_w;
@@ -1553,7 +1561,7 @@ fn gridSize(width: u32, height: u32, font: *const Font, pad: Padding) Dims {
     const rows = usable_h / font.cell_h;
     return .{
         .cols = @max(usable_w / font.cell_w, 1),
-        .rows = @max(rows -| tab_bar_rows, 1),
+        .rows = @max(rows -| bar_rows, 1),
     };
 }
 
@@ -1663,7 +1671,11 @@ fn reloadConfig(l: Live) void {
     const font_changed = !l.cfg.font_family.eql(fresh.font_family.slice()) or
         l.cfg.font_size != fresh.font_size;
     const geom_changed = l.cfg.padding_x != fresh.padding_x or
-        l.cfg.padding_y != fresh.padding_y;
+        l.cfg.padding_y != fresh.padding_y or
+        // Hiding or showing the bar hands a row to the grid or takes it away, so it is
+        // geometry, not just a style — the screens and their ptys have to be resized
+        // like a window resize, or the last row draws under the strip.
+        (l.cfg.tab_bar_style == .hidden) != (fresh.tab_bar_style == .hidden);
     // scrollback_lines is missing on purpose: changing it means reallocating the ring
     // and deciding what to do with the history that no longer fits. It applies at the
     // next start, which is what every other terminal does too.
@@ -1703,7 +1715,7 @@ fn reloadConfig(l: Live) void {
     if (font_changed or geom_changed) {
         l.pad.* = .{ .x = l.cfg.padding_x, .y = l.cfg.padding_y };
         l.app.pad = l.pad.*;
-        const dims = gridSize(l.win.width, l.win.height, l.font, l.pad.*);
+        const dims = gridSize(l.win.width, l.win.height, l.font, l.pad.*, tabBarRows(l.cfg));
         for (l.app.tabs[0..l.app.tab_count]) |t| {
             t.screen.resize(dims.cols, dims.rows) catch |err| {
                 std.debug.print("maai: resize after reload failed: {s}\n", .{
