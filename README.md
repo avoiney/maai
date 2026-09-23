@@ -52,6 +52,7 @@ maai -e cmd args        # run a specific command
 maai -c path/to.conf    # use a specific config file
 maai --cwd /some/dir    # start in that directory
 maai --app-id NAME      # set the Wayland app_id (default: maai)
+maai --no-tabs          # one tab, no bar, tab keys left to the child
 MAAI_DEBUG=1 maai       # trace input, selection, and mouse handling
 ```
 
@@ -108,17 +109,20 @@ tab_powerline_style slanted     # or: angled, round
 `powerline` draws a shaped separator between tabs using glyphs from the Nerd Font
 private-use range. Use `plain` if the font does not have them.
 
-`hidden` draws no bar at all and hands its row back to the grid, for a window used as
-a single scratchpad. Tabs still work and stay addressable over the control socket —
-they are only invisible — so unbind their keys too if you want none:
+`hidden` draws no bar at all and hands its row back to the grid. Tabs still work and
+stay addressable over the control socket — they are only invisible.
 
+For a window used as a scratchpad, prefer `--no-tabs` on the command line:
+
+```sh
+maai --no-tabs --app-id scratchpad
 ```
-tab_bar_style hidden
-key ctrl+shift+t none
-key ctrl+tab      none
-key ctrl+shift+tab none
-key alt+numrow    none
-```
+
+It hides the bar *and* hands `Ctrl+Shift+T`, `Ctrl+Tab`, `Ctrl+Shift+Tab` and
+`Alt+1…0` back to whatever is running in the window, so no tab can open unseen. Being
+a flag rather than a config key is the point: one config file serves both the
+scratchpad and the windows that do want tabs. It wins over the config file, and keeps
+winning across a live reload.
 
 ### Key bindings
 

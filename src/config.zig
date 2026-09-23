@@ -169,6 +169,22 @@ pub const Bindings = struct {
         self.len += 1;
     }
 
+    /// Turn every binding that drives tabs into `none`, handing those combinations
+    /// back to applications. Rewritten rather than removed: `none` is already how a
+    /// config frees a default, and `lookup` reports it as unbound, so the key reaches
+    /// the child instead of being swallowed.
+    ///
+    /// Walks the table rather than naming the four default combinations, so a config
+    /// that moved `tab_new` somewhere else is disarmed too.
+    pub fn dropTabs(self: *Bindings) void {
+        for (self.items[0..self.len]) |*b| {
+            switch (b.action) {
+                .tab_new, .tab_next, .tab_prev, .tab_goto => b.action = .none,
+                else => {},
+            }
+        }
+    }
+
     /// `keycode` is the raw evdev code, needed only by positional bindings.
     pub fn lookup(
         self: *const Bindings,
@@ -294,6 +310,18 @@ pub const Config = struct {
             return std.mem.eql(u8, self.slice(), s);
         }
     };
+
+    /// Turn this window into a single-tab one: no bar, and the tab keys handed back to
+    /// applications. What `--no-tabs` means, applied *over* a loaded config so a
+    /// scratchpad needs no config file of its own — and re-applied after a live reload,
+    /// since the flag is the launch's decision and a file edit cannot revoke it.
+    ///
+    /// Not a key of the file format. Per-window is the whole point: the same config
+    /// serves the scratchpad and the windows that do want tabs.
+    pub fn disableTabs(self: *Config) void {
+        self.tab_bar_style = .hidden;
+        self.bindings.dropTabs();
+    }
 };
 
 /// A problem with a config file. Collected rather than thrown: one bad line must not
@@ -1191,4 +1219,31 @@ test "tab_bar_style hidden parses, and a bad value leaves the old style alone" {
     parseInto("tab_bar_style invisible", &cfg, &diags);
     try testing.expectEqual(BarStyle.hidden, cfg.tab_bar_style);
     try testing.expectEqual(@as(usize, 1), diags.len);
+}
+
+test "disableTabs hides the bar and hands the tab keys back" {
+    var cfg = Config{};
+    cfg.disableTabs();
+
+    try testing.expectEqual(BarStyle.hidden, cfg.tab_bar_style);
+    // Unbound, which is what sends the key on to the child: `lookup` reports a `none`
+    // binding as no binding at all.
+    try testing.expect(cfg.bindings.lookup('t', 0, true, true, false) == null);
+    try testing.expect(cfg.bindings.lookup(c.XKB_KEY_Tab, 0, true, false, false) == null);
+    try testing.expect(cfg.bindings.lookup(c.XKB_KEY_Tab, 0, true, true, false) == null);
+    try testing.expect(cfg.bindings.lookup(0, num_row[2], false, false, true) == null);
+
+    // Everything else is untouched — this disables tabs, not the terminal's bindings.
+    try testing.expectEqual(Action.copy, cfg.bindings.lookup('c', 0, true, true, false).?);
+    try testing.expectEqual(Action.new_window, cfg.bindings.lookup('%', 0, false, false, true).?);
+}
+
+test "disableTabs disarms a tab binding the config moved elsewhere" {
+    var cfg = Config{};
+    var diags = Diagnostics{};
+    parseInto("key ctrl+shift+n tab_new", &cfg, &diags);
+    try testing.expectEqual(Action.tab_new, cfg.bindings.lookup('n', 0, true, true, false).?);
+
+    cfg.disableTabs();
+    try testing.expect(cfg.bindings.lookup('n', 0, true, true, false) == null);
 }

@@ -62,12 +62,9 @@
 # Powerline needs the separator glyphs, which live in the Nerd Font private-use range.
 # With a font that lacks them the separators come out blank; `plain` is the way out.
 #
-# `hidden` draws no bar and gives its row back to the grid — for a window used as a
-# single scratchpad, where the strip costs a line for a second tab that never opens.
-# Tabs keep working unseen; unbind their keys as well if you want them gone:
-#
-#     key ctrl+shift+t none
-#     key ctrl+tab      none
+# `hidden` draws no bar and gives its row back to the grid. Tabs keep working unseen.
+# For a scratchpad window, `maai --no-tabs` is the better tool: it hides the bar and
+# hands the tab keys back to the child, for that window only, whatever this file says.
 #
 # tab_bar_style powerline
 

@@ -999,6 +999,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var diags = cfgmod.Diagnostics{};
     var cfg = loadConfig(gpa, args.config_path, &diags);
     diags.report();
+    // Over the file, never under it: the flag is this launch's decision, so no config
+    // — or edit of one, see `reloadConfig` — can hand the window tabs it asked not to
+    // have. Everything downstream reads the config alone and needs to know nothing
+    // about the flag, including the per-frame path.
+    if (args.no_tabs) cfg.disableTabs();
 
     // ── font: cell geometry determines the initial window size ──────────────
     var font = loadFont(&cfg) catch |err| {
@@ -1254,6 +1259,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 reloadConfig(.{
                     .gpa = gpa,
                     .cfg = &cfg,
+                    .no_tabs = args.no_tabs,
                     .config_path = args.config_path,
                     .font = &font,
                     .cache = &cache,
@@ -1572,6 +1578,12 @@ const Args = struct {
     cwd: []const u8 = "",
     /// Wayland app_id for this window, so one window can carry its own sway rules.
     app_id: [*:0]const u8 = "maai",
+    /// One tab, no bar, and the tab keys left to the child. For a window used as a
+    /// scratchpad, where tabs are chrome for something it will never do.
+    ///
+    /// A flag rather than a config key because it is a property of *this launch*: the
+    /// scratchpad and the windows that do want tabs share one config file.
+    no_tabs: bool = false,
     /// Everything from `-e` onwards, or the whole argv when absent.
     child: []const [*:0]const u8,
 };
@@ -1593,6 +1605,8 @@ fn parseArgs(argv: []const [*:0]const u8) Args {
         } else if (std.mem.eql(u8, arg, "--app-id") and i + 1 < argv.len) {
             out.app_id = argv[i + 1];
             i += 1;
+        } else if (std.mem.eql(u8, arg, "--no-tabs")) {
+            out.no_tabs = true;
         }
     }
     return out;
@@ -1653,6 +1667,8 @@ fn applyConfig(screen: *Screen, cfg: *const cfgmod.Config) void {
 const Live = struct {
     gpa: std.mem.Allocator,
     cfg: *cfgmod.Config,
+    /// `--no-tabs`, re-applied over every reload.
+    no_tabs: bool,
     config_path: []const u8,
     font: *Font,
     cache: *GlyphCache,
@@ -1665,8 +1681,11 @@ const Live = struct {
 /// Re-read the config and apply what can be applied without restarting.
 fn reloadConfig(l: Live) void {
     var diags = cfgmod.Diagnostics{};
-    const fresh = loadConfig(l.gpa, l.config_path, &diags);
+    var fresh = loadConfig(l.gpa, l.config_path, &diags);
     diags.report();
+    // Before the comparisons below, so a file that flips `tab_bar_style` under
+    // `--no-tabs` is correctly seen as no change at all rather than as a resize.
+    if (l.no_tabs) fresh.disableTabs();
 
     const font_changed = !l.cfg.font_family.eql(fresh.font_family.slice()) or
         l.cfg.font_size != fresh.font_size;
@@ -1804,4 +1823,17 @@ test "--app-id gives one window an identity of its own" {
 test "a command after -e is not mistaken for our own flags" {
     const argv = [_][*:0]const u8{ "maai", "-e", "sh", "--app-id", "nope" };
     try testing.expectEqualStrings("maai", std.mem.span(parseArgs(&argv).app_id));
+    // Including the valueless ones, which have no argument to swallow and so would
+    // otherwise match anywhere on the line.
+    try testing.expect(!parseArgs(&[_][*:0]const u8{ "maai", "-e", "sh", "--no-tabs" }).no_tabs);
+}
+
+test "--no-tabs is off unless asked for" {
+    try testing.expect(!parseArgs(&[_][*:0]const u8{"maai"}).no_tabs);
+    try testing.expect(parseArgs(&[_][*:0]const u8{ "maai", "--no-tabs" }).no_tabs);
+    // Alongside the flags that take a value, in either order.
+    const argv = [_][*:0]const u8{ "maai", "--no-tabs", "--app-id", "scratch", "-e", "sh" };
+    const a = parseArgs(&argv);
+    try testing.expect(a.no_tabs);
+    try testing.expectEqualStrings("scratch", std.mem.span(a.app_id));
 }
