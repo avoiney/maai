@@ -107,6 +107,16 @@ const App = struct {
     active: usize = 0,
     /// The child command, so a new tab runs the same thing as the first.
     child_argv: [*:null]const ?[*:0]const u8,
+    /// The shell, for the tab the control socket asks for. Deliberately not
+    /// `child_argv`: a window launched with `-e` runs one particular program, and
+    /// an outside tool asking for a terminal in a directory never means "start that
+    /// program again" — under agentstat it would mean a second copy of the very
+    /// session you were looking at.
+    shell_argv: [*:null]const ?[*:0]const u8,
+    /// Whether this window may hold more than one tab. `--no-tabs` is a promise to
+    /// the window, so the socket has to keep it too: a tab arriving from outside
+    /// into a scratchpad is the accident the flag exists to prevent.
+    tabs_enabled: bool = true,
     /// Scratch for the tab bar, rebuilt each frame it is drawn.
     bar: [1024]rendermod.BarCell = undefined,
     /// Scratch for the control socket's tab listing, same reason as `bar`.
@@ -210,6 +220,24 @@ const App = struct {
         return false;
     }
 
+    /// Open a shell in this window for the tab running on `/dev/pts/<pts>`,
+    /// starting in that tab's own directory — which is what makes this worth having
+    /// over launching another terminal: the shell lands in the window, and the
+    /// folder, the session is already working in.
+    ///
+    /// It lands at the end of the strip, where a new tab always lands, rather than
+    /// next to the tab that named it: tab order is the order they were opened, and
+    /// that is worth more than putting one pair together.
+    fn ctlNewTabPts(ctx: *anyopaque, pts: i32) ctlmod.NewTab {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        if (!self.tabs_enabled) return .refused;
+        for (self.tabs[0..self.tab_count]) |t| {
+            if (t.pty.pts != pts) continue;
+            return if (self.tabOpen(t, self.shell_argv)) .ok else .failed;
+        }
+        return .no_such_pts;
+    }
+
     /// Lay the tab bar out, one column per cell.
     ///
     /// Built here rather than in the renderer because it is *layout* — truncation,
@@ -240,29 +268,46 @@ const App = struct {
 
     /// Open a tab, starting where the current one is.
     fn tabNew(self: *App) void {
+        _ = self.tabOpen(self.tab(), self.child_argv);
+    }
+
+    /// Open a tab running `argv`, starting in `from`'s directory, and bring it to
+    /// the front. False when the window could not take one.
+    ///
+    /// `from` rather than the active tab, because the control socket names the tab
+    /// whose directory it means, and that need not be the one in front. The directory
+    /// is asked of it the way the tab bar's own new-tab asks: what the shell
+    /// announced through OSC 7, and failing that what its pty says — a `cd` the
+    /// shell never announced is the one case where the two disagree.
+    fn tabOpen(
+        self: *App,
+        from: *Tab,
+        argv: [*:null]const ?[*:0]const u8,
+    ) bool {
         if (self.tab_count == max_tabs) {
             std.debug.print("maai: {d} tabs is the limit\n", .{max_tabs});
-            return;
+            return false;
         }
 
         var buf: [launch.max_path_len]u8 = undefined;
-        const announced = self.screen.cwd();
-        const dir = if (announced.len > 0) announced else self.pty.cwd(&buf) orelse "";
+        const announced = from.screen.cwd();
+        const dir = if (announced.len > 0) announced else from.pty.cwd(&buf) orelse "";
 
         const t = Tab.create(
             self.gpa,
             self.screen.grid.cols,
             self.screen.grid.rows,
             self.cfg,
-            self.child_argv,
+            argv,
             dir,
         ) catch |err| {
             std.debug.print("maai: could not open a tab: {s}\n", .{@errorName(err)});
-            return;
+            return false;
         };
         self.tabs[self.tab_count] = t;
         self.tab_count += 1;
         self.focus(self.tab_count - 1);
+        return true;
     }
 
     /// Drop tab `i`, whose child has gone. Returns false when that was the last one.
@@ -981,6 +1026,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const args = parseArgs(init.args.vector);
     const argv = try buildArgv(gpa, args.child, init.environ);
     defer gpa.free(argv);
+    // The same call with no `-e` in sight, which is how the socket's `new-tab-pts`
+    // gets a shell even in a window that was launched to run one program. Built
+    // here, once, because the environment it reads belongs to `main`.
+    const shell_argv = try buildArgv(gpa, &.{}, init.environ);
+    defer gpa.free(shell_argv);
 
     // Start where we were asked to. Before the fork, so the child inherits it — and
     // failure is not fatal: a window that opens in the wrong directory beats one that
@@ -1051,6 +1101,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .pad = pad,
         .cfg = &cfg,
         .child_argv = argv.ptr,
+        .shell_argv = shell_argv.ptr,
+        .tabs_enabled = !args.no_tabs,
         .debug = std.c.getenv("MAAI_DEBUG") != null,
     };
     app.tabs[0] = first;
@@ -1084,6 +1136,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .ctx = &app,
         .tabs = App.ctlTabs,
         .focus = App.ctlFocusPts,
+        .newTab = App.ctlNewTabPts,
     });
     defer if (ctl) |*x| x.deinit();
 

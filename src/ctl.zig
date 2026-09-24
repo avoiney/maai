@@ -1,4 +1,4 @@
-//! A control socket, so something outside can focus a tab.
+//! A control socket, so something outside can focus a tab, or ask for one.
 //!
 //! maai is one process per *window*, and each window holds several tabs. Focusing
 //! the right window from outside is already a solved problem — sway's tree carries
@@ -9,8 +9,8 @@
 //! What a tab does have is its pseudo-terminal, and `/dev/pts/N` is visible from
 //! the outside. It shows up in `ps`, in `/proc/<pid>/fdinfo`, and a process can
 //! read its own. That makes the pts index the one name a session and an outside
-//! observer can both pronounce, which is why the whole protocol reduces to *focus
-//! the tab whose pty is pts N*.
+//! observer can both pronounce, which is why every command here names a tab the
+//! same way: *the tab whose pty is pts N*.
 //!
 //! Two deliberate choices about what this is not:
 //!
@@ -18,10 +18,13 @@
 //!     `$XDG_RUNTIME_DIR`, which the session manager already creates 0700 and owned
 //!     by one user. Inventing a token or a handshake here would add a thing to get
 //!     wrong without adding a thing an attacker has to get past.
-//!   * **Three fixed commands, and none of them writes to a child.** A control
-//!     surface that could inject input into a shell would be a far larger promise
-//!     than "jump to that tab", and a far larger hole if the directory rule above
-//!     ever failed.
+//!   * **A fixed verb set, and none of them writes to a child.** `new-tab-pts` is
+//!     the one that creates anything, and what it creates is a shell: it takes a
+//!     tab index and nothing else — no program, no arguments, no path — and picks
+//!     its directory the way the new-tab key already picks one. A control
+//!     surface that could *type into* a child, or name the program one runs, would
+//!     be a far larger promise than "that tab, please", and a far larger hole if
+//!     the directory rule above ever failed.
 //!
 //! Like the config watcher, this is an *optional* fd in the main poll loop. If any
 //! part of the setup fails — no `XDG_RUNTIME_DIR`, a read-only runtime directory,
@@ -33,7 +36,12 @@ const std = @import("std");
 const Addr = std.posix.sockaddr.un;
 
 /// Pending connections the kernel will hold for us. A handful, because clients
-/// arrive one per user gesture and each is served in microseconds.
+/// arrive one per user gesture, and all but one are served in microseconds.
+///
+/// The exception is `new-tab-pts`, which forks a child and allocates a scrollback
+/// ring before it can answer — single digit milliseconds, on the render loop, so
+/// one frame is late. That is the price of answering *after* the tab exists
+/// rather than before, which is what lets a client tell a tab from a refusal.
 const backlog = 8;
 
 /// Longest request read from a client. Every command is under twenty bytes; the cap
@@ -46,10 +54,13 @@ const max_request = 256;
 /// which covers far more tabs than a window will ever hold.
 const max_reply = 1024;
 
-/// How long one client may hold the render loop. The peer is a process on this
-/// machine sending a dozen bytes, so anything slower than this is a client that has
-/// wandered off rather than a slow link — and a frame must not wait for it either
-/// way.
+/// How long one client may hold the render loop *waiting for it to speak*. The
+/// peer is a process on this machine sending a dozen bytes, so anything slower
+/// than this is a client that has wandered off rather than a slow link — and a
+/// frame must not wait for it either way.
+///
+/// Not a bound on the work a command asks for: `new-tab-pts` takes as long as a
+/// fork takes, and cutting that short would leave a half-made tab.
 const client_timeout_ms = 50;
 
 // ── the protocol ────────────────────────────────────────────────────────────
@@ -63,12 +74,28 @@ pub const Tabs = struct {
     active: usize,
 };
 
-/// The two things the socket can ask of whoever owns the tabs.
+/// How a `new-tab-pts` turned out. Four outcomes rather than a bool because a
+/// client has something different to do with each: retry elsewhere, give up on
+/// the session, stop asking this window, or report a window that is simply full.
+pub const NewTab = enum {
+    ok,
+    /// No tab has that pts — the session it named is gone.
+    no_such_pts,
+    /// A window launched with `--no-tabs`, which will never hold a second tab.
+    refused,
+    /// The tab limit, or a child that would not start.
+    failed,
+};
+
+/// The three things the socket can ask of whoever owns the tabs.
 pub const Handler = struct {
     ctx: *anyopaque,
     tabs: *const fn (ctx: *anyopaque) Tabs,
     /// Focus the tab whose pty is `pts`. False when no tab has that index.
     focus: *const fn (ctx: *anyopaque, pts: i32) bool,
+    /// Open a shell in the window holding the tab whose pty is `pts`, starting in
+    /// that tab's directory.
+    newTab: *const fn (ctx: *anyopaque, pts: i32) NewTab,
 };
 
 /// Answer one command line, writing into `out` when the reply is not a constant.
@@ -79,8 +106,16 @@ pub const Handler = struct {
 pub fn respond(line: []const u8, h: Handler, out: []u8) []const u8 {
     if (std.mem.eql(u8, line, "ping")) return "ok\n";
     if (std.mem.eql(u8, line, "list")) return formatList(h.tabs(h.ctx), out);
-    if (parseFocus(line)) |pts| {
+    if (parseIndex(line, "focus-pts ")) |pts| {
         return if (h.focus(h.ctx, pts)) "ok\n" else "err no-such-pts\n";
+    }
+    if (parseIndex(line, "new-tab-pts ")) |pts| {
+        return switch (h.newTab(h.ctx, pts)) {
+            .ok => "ok\n",
+            .no_such_pts => "err no-such-pts\n",
+            .refused => "err no-tabs\n",
+            .failed => "err tab-failed\n",
+        };
     }
     return "err bad-command\n";
 }
@@ -95,14 +130,13 @@ fn firstLine(buf: []const u8) []const u8 {
     return std.mem.trim(u8, buf[0..end], " \t\r");
 }
 
-/// The index in a `focus-pts N` line, or null for anything else.
+/// The index in a `<verb> N` line, or null when the line is not that verb.
 ///
-/// A `focus-pts` whose argument is not a plain non-negative number returns null too,
-/// so it is answered as a bad command rather than as a tab that does not exist. The
+/// A verb whose argument is not a plain non-negative number returns null too, so it
+/// is answered as a bad command rather than as a tab that does not exist. The
 /// distinction matters to a client deciding whether to retry: `no-such-pts` means
 /// the session is gone, `bad-command` means the client is broken.
-fn parseFocus(line: []const u8) ?i32 {
-    const verb = "focus-pts ";
+fn parseIndex(line: []const u8, verb: []const u8) ?i32 {
     if (!std.mem.startsWith(u8, line, verb)) return null;
     const arg = std.mem.trim(u8, line[verb.len..], " \t");
     // u31 rather than i32: a pts index is never negative, and -1 is our own marker
@@ -249,14 +283,19 @@ fn serve(fd: i32, h: Handler) void {
 
 const testing = std.testing;
 
-/// A stand-in for the App: a fixed set of tabs and a record of what was focused.
+/// A stand-in for the App: a fixed set of tabs and a record of what was asked of
+/// them.
 const FakeTabs = struct {
     pts: []const i32,
     active: usize = 0,
     focused: i32 = -1,
+    /// The tab a `new-tab-pts` started from, and what the window answers.
+    opened_from: i32 = -1,
+    tabs_enabled: bool = true,
+    can_open: bool = true,
 
     fn handler(self: *FakeTabs) Handler {
-        return .{ .ctx = self, .tabs = snapshot, .focus = focus };
+        return .{ .ctx = self, .tabs = snapshot, .focus = focus, .newTab = newTab };
     }
 
     fn snapshot(ctx: *anyopaque) Tabs {
@@ -272,6 +311,18 @@ const FakeTabs = struct {
             return true;
         }
         return false;
+    }
+
+    fn newTab(ctx: *anyopaque, pts: i32) NewTab {
+        const self: *FakeTabs = @ptrCast(@alignCast(ctx));
+        if (!self.tabs_enabled) return .refused;
+        for (self.pts) |p| {
+            if (p != pts) continue;
+            if (!self.can_open) return .failed;
+            self.opened_from = pts;
+            return .ok;
+        }
+        return .no_such_pts;
     }
 };
 
@@ -318,6 +369,35 @@ test "focus-pts on an unknown pts is refused" {
     try testing.expectEqual(@as(i32, -1), f.focused);
 }
 
+test "new-tab-pts opens beside the tab with that pts" {
+    var f = FakeTabs{ .pts = &.{ 7, 12, 3 } };
+    var out: [max_reply]u8 = undefined;
+    try testing.expectEqualStrings("ok\n", ask(&f, "new-tab-pts 12\n", &out));
+    try testing.expectEqual(@as(i32, 12), f.opened_from);
+    // Asking for a tab is not asking to leave the one you were on: whether the new
+    // tab comes to the front is the window's business, not the protocol's.
+    try testing.expectEqual(@as(i32, -1), f.focused);
+}
+
+test "new-tab-pts tells its three refusals apart" {
+    // Each one sends a client somewhere different: retry elsewhere, forget the
+    // session, or stop asking this window — so none of them may collapse into
+    // another.
+    var out: [max_reply]u8 = undefined;
+
+    var gone = FakeTabs{ .pts = &.{7} };
+    try testing.expectEqualStrings("err no-such-pts\n", ask(&gone, "new-tab-pts 99\n", &out));
+    try testing.expectEqual(@as(i32, -1), gone.opened_from);
+
+    var tabless = FakeTabs{ .pts = &.{7}, .tabs_enabled = false };
+    try testing.expectEqualStrings("err no-tabs\n", ask(&tabless, "new-tab-pts 7\n", &out));
+    try testing.expectEqual(@as(i32, -1), tabless.opened_from);
+
+    var full = FakeTabs{ .pts = &.{7}, .can_open = false };
+    try testing.expectEqualStrings("err tab-failed\n", ask(&full, "new-tab-pts 7\n", &out));
+    try testing.expectEqual(@as(i32, -1), full.opened_from);
+}
+
 test "a tab whose pts is unknown cannot be addressed" {
     // -1 is our marker for "the kernel would not tell us", not an index. Letting
     // `focus-pts -1` match it would make an unaddressable tab addressable by
@@ -325,7 +405,9 @@ test "a tab whose pts is unknown cannot be addressed" {
     var f = FakeTabs{ .pts = &.{ -1, 12 } };
     var out: [max_reply]u8 = undefined;
     try testing.expectEqualStrings("err bad-command\n", ask(&f, "focus-pts -1\n", &out));
+    try testing.expectEqualStrings("err bad-command\n", ask(&f, "new-tab-pts -1\n", &out));
     try testing.expectEqual(@as(i32, -1), f.focused);
+    try testing.expectEqual(@as(i32, -1), f.opened_from);
 }
 
 test "anything else is a bad command" {
@@ -341,13 +423,21 @@ test "anything else is a bad command" {
         "focus-pts abc\n",
         "focus-pts 0x7\n",
         "focus-pts 7 8\n",
+        "new-tab-pts\n",
+        "new-tab-pts abc\n",
+        "new-tab\n",
         // A client that sends a shell-ish line gets the same flat refusal: there is
         // no command here that takes anything but a number.
         "focus-pts $(id)\n",
+        // And there is no command that takes a *path*, which is the one an outside
+        // caller would most expect to be able to hand a new tab.
+        "new-tab-pts /tmp\n",
+        "new-tab /tmp\n",
     }) |bad| {
         try testing.expectEqualStrings("err bad-command\n", ask(&f, bad, &out));
     }
     try testing.expectEqual(@as(i32, -1), f.focused);
+    try testing.expectEqual(@as(i32, -1), f.opened_from);
 }
 
 test "a command is read up to the first newline, CRLF and all" {

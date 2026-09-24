@@ -216,10 +216,10 @@ That is the name a window switcher, a bar, or `swaymsg -t get_tree` shows.
 ## Control socket
 
 Each window listens on `$XDG_RUNTIME_DIR/maai/<pid>.sock`, so something outside
-can bring a particular tab to the front. Tabs are addressed by the index of
-their pseudo-terminal: `/dev/pts/N` is the one name a session and an outside
-observer can both pronounce — it shows up in `ps` and in `/proc`, and a process
-can read its own.
+can bring a particular tab to the front, or ask for one. Tabs are addressed by
+the index of their pseudo-terminal: `/dev/pts/N` is the one name a session and an
+outside observer can both pronounce — it shows up in `ps` and in `/proc`, and a
+process can read its own.
 
 One command per line, one line of reply:
 
@@ -228,6 +228,7 @@ One command per line, one line of reply:
 | `ping` | `ok` |
 | `list` | `ok 7,*12,3` — each tab's pts in order, the active one starred, `?` when unknown |
 | `focus-pts N` | `ok`, or `err no-such-pts` |
+| `new-tab-pts N` | `ok`, or `err no-such-pts`, `err no-tabs`, `err tab-failed` |
 
 Anything else answers `err bad-command`.
 
@@ -235,10 +236,21 @@ Anything else answers `err bad-command`.
 printf 'focus-pts 7\n' | nc -U "$XDG_RUNTIME_DIR/maai/$(pgrep -x maai | head -1).sock"
 ```
 
+`new-tab-pts` opens a shell in the window holding the tab on `/dev/pts/N` and
+brings it to the front, starting in that tab's own directory — what it announced
+through OSC 7, or failing that what its pty says. It lands at the end of the
+strip, where a new tab always lands. A window launched with `--no-tabs` answers
+`err no-tabs`: the flag is a promise the socket keeps too.
+
+The shell, specifically, and never the window's own `-e` command: a caller asking
+for a terminal in a directory does not mean "run that program again".
+
 Two things this deliberately is not. The access control is the filesystem's:
 `$XDG_RUNTIME_DIR` is already private to one user, and a token of our own would
 be one more thing to get wrong without being one more thing to get past. And no
-command writes to a child — the socket moves the focus, it never injects input.
+command writes to a child: `new-tab-pts` takes a tab index and nothing else — no
+program, no arguments, no path — so the socket moves the focus and asks for a
+shell, and never injects input into either.
 
 Without `XDG_RUNTIME_DIR` no socket is created and everything else works as
 before, the same way the config watcher degrades.
