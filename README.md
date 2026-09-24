@@ -118,11 +118,11 @@ For a window used as a scratchpad, prefer `--no-tabs` on the command line:
 maai --no-tabs --app-id scratchpad
 ```
 
-It hides the bar *and* hands `Ctrl+Shift+T`, `Ctrl+Tab`, `Ctrl+Shift+Tab` and
-`Alt+1…0` back to whatever is running in the window, so no tab can open unseen. Being
-a flag rather than a config key is the point: one config file serves both the
-scratchpad and the windows that do want tabs. It wins over the config file, and keeps
-winning across a live reload.
+It hides the bar *and* hands `Ctrl+Shift+T`, `Ctrl+Tab`, `Ctrl+Shift+Tab`,
+`Ctrl+Shift+Page Up/Down` and `Alt+1…0` back to whatever is running in the window, so
+no tab can open unseen. Being a flag rather than a config key is the point: one config
+file serves both the scratchpad and the windows that do want tabs. It wins over the
+config file, and keeps winning across a live reload.
 
 ### Key bindings
 
@@ -153,7 +153,20 @@ Default bindings:
 | `Ctrl+Shift+T` | New tab |
 | `Ctrl+Tab` | Next tab |
 | `Ctrl+Shift+Tab` | Previous tab |
+| `Ctrl+Shift+Page Up/Down` | Move the current tab left / right along the strip |
 | `Alt+1…0` | Jump to tab by number-row position |
+
+Moving a tab carries the focus with it, and stops at the ends rather than wrapping: a
+tab already last stays last. `Ctrl+Shift+Page Up/Down` is the one default that takes a
+sequence applications can otherwise see (`CSI 5;6~` and `CSI 6;6~`); little binds it,
+but if something you run does, hand it back with:
+
+```
+key ctrl+shift+Page_Up none
+key ctrl+shift+Page_Down none
+key alt+Page_Up tab_move_left       # and put the action somewhere else
+key alt+Page_Down tab_move_right
+```
 
 ### Themes
 

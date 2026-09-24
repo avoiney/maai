@@ -102,7 +102,7 @@
 #
 # Actions: copy, paste, paste_primary, hints, new_window, scroll_page_up,
 #          scroll_page_down, scroll_top, scroll_bottom, tab_new, tab_next, tab_prev,
-#          tab_goto, none
+#          tab_goto, tab_move_left, tab_move_right, none
 #
 # The defaults:
 # key ctrl+shift+c copy
@@ -117,6 +117,14 @@
 # key ctrl+tab tab_next
 # key ctrl+shift+tab tab_prev
 # key alt+numrow tab_goto
+# key ctrl+shift+Page_Up tab_move_left
+# key ctrl+shift+Page_Down tab_move_right
+#
+# tab_move_left/right slide the current tab along the strip, taking the focus with
+# them, and stop at the ends rather than wrapping round. They are the only defaults
+# that take a sequence applications can otherwise read (CSI 5;6~ and CSI 6;6~), so if
+# something you run wants those keys, free them with `none` and bind the actions
+# elsewhere.
 
 # ── theme ────────────────────────────────────────────────────────────────────
 

@@ -226,8 +226,9 @@ const App = struct {
     /// folder, the session is already working in.
     ///
     /// It lands at the end of the strip, where a new tab always lands, rather than
-    /// next to the tab that named it: tab order is the order they were opened, and
-    /// that is worth more than putting one pair together.
+    /// next to the tab that named it: a tab arrives at the end and is moved from there
+    /// by hand if you want it elsewhere, and that predictability is worth more than
+    /// putting one pair together.
     fn ctlNewTabPts(ctx: *anyopaque, pts: i32) ctlmod.NewTab {
         const self: *App = @ptrCast(@alignCast(ctx));
         if (!self.tabs_enabled) return .refused;
@@ -320,6 +321,36 @@ const App = struct {
         // Focus the neighbour, which is what closing a tab means everywhere else.
         self.focus(@min(i, self.tab_count - 1));
         return true;
+    }
+
+    /// Which way along the strip a tab is being moved.
+    const Dir = enum { left, right };
+
+    /// Move the active tab one place along the strip, carrying the focus with it.
+    ///
+    /// Stops at the ends rather than wrapping. `tab_next` can afford to wrap because
+    /// it moves nothing — the opposite key puts you back. Wrapping a *move* shifts
+    /// every other tab one place to make room, which is a great deal of rearrangement
+    /// for the one keypress you did not mean to make; `tab_goto` past the last tab
+    /// already does nothing, for the same reason. The key stays ours either way, so
+    /// nothing reaches the child when the tab is already at the end.
+    ///
+    /// Only two array slots change hands. A `Tab` is heap-allocated and never moved —
+    /// its parser points at its own screen — so swapping the pointers leaves every one
+    /// of them valid, and the bar, rebuilt from this array each frame it is drawn,
+    /// shows the new order with no work of its own.
+    fn tabMove(self: *App, dir: Dir) void {
+        const from = self.active;
+        // Saturating, so index 0 moving left lands back on itself and is refused
+        // below along with the right-hand end.
+        const to = if (dir == .right) from + 1 else from -| 1;
+        if (to == from or to >= self.tab_count) return;
+
+        std.mem.swap(*Tab, &self.tabs[from], &self.tabs[to]);
+        // Not `focus`: the tab in front is the same one it was, at a new index, so the
+        // screen, the pty and the key encoder all still point where they should.
+        self.active = to;
+        self.needs_render = true;
     }
 
     fn writeToPty(ctx: *anyopaque, bytes: []const u8) void {
@@ -920,6 +951,8 @@ const App = struct {
             .tab_prev => self.focus(
                 (self.active + self.tab_count - 1) % self.tab_count,
             ),
+            .tab_move_left => self.tabMove(.left),
+            .tab_move_right => self.tabMove(.right),
             .tab_goto => {
                 // The key's position *is* the argument, which is what lets one binding
                 // cover all ten keys.

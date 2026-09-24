@@ -84,6 +84,12 @@ pub const Action = enum {
     tab_prev,
     /// Jump to the tab at the pressed key's position in the number row.
     tab_goto,
+    /// Move the active tab one place along the strip, carrying the focus with it:
+    /// you are moving the tab you are looking at, not stepping away from it. Named
+    /// for the direction on screen rather than for `tab_next`/`tab_prev`, because
+    /// the strip is what you are rearranging and the strip is what you can see.
+    tab_move_left,
+    tab_move_right,
 };
 
 /// evdev codes of the number row, in order. Positional bindings match these rather
@@ -147,6 +153,14 @@ pub const Bindings = struct {
         b.add(.{ .sym = c.XKB_KEY_Tab, .ctrl = true, .action = .tab_next });
         b.add(.{ .sym = c.XKB_KEY_Tab, .ctrl = true, .shift = true, .action = .tab_prev });
         b.add(.{ .sym = 0, .alt = true, .numrow = true, .action = .tab_goto });
+        // Reordering, on the chord browsers and GNOME Terminal already use for it.
+        // Not Ctrl+Shift plus an arrow: for arrows that claim is a real loss, since
+        // the legacy encoder hands applications `CSI 1;6D` there and editors bind it
+        // for word-wise selection. Page Up and Page Down cost the child `CSI 5;6~`
+        // and `CSI 6;6~`, which almost nothing binds, and they sit next to the
+        // Shift'ed pair above that scrolls — one key, two related jobs.
+        b.add(.{ .sym = c.XKB_KEY_Page_Up, .ctrl = true, .shift = true, .action = .tab_move_left });
+        b.add(.{ .sym = c.XKB_KEY_Page_Down, .ctrl = true, .shift = true, .action = .tab_move_right });
         return b;
     }
 
@@ -179,7 +193,13 @@ pub const Bindings = struct {
     pub fn dropTabs(self: *Bindings) void {
         for (self.items[0..self.len]) |*b| {
             switch (b.action) {
-                .tab_new, .tab_next, .tab_prev, .tab_goto => b.action = .none,
+                .tab_new,
+                .tab_next,
+                .tab_prev,
+                .tab_goto,
+                .tab_move_left,
+                .tab_move_right,
+                => b.action = .none,
                 else => {},
             }
         }
@@ -1152,8 +1172,33 @@ test "the tab defaults are what was agreed" {
     try testing.expectEqual(Action.tab_new, b.lookup('t', 0, true, true, false).?);
     try testing.expectEqual(Action.tab_next, b.lookup(c.XKB_KEY_Tab, 0, true, false, false).?);
     try testing.expectEqual(Action.tab_prev, b.lookup(c.XKB_KEY_Tab, 0, true, true, false).?);
+    try testing.expectEqual(
+        Action.tab_move_left,
+        b.lookup(c.XKB_KEY_Page_Up, 0, true, true, false).?,
+    );
+    try testing.expectEqual(
+        Action.tab_move_right,
+        b.lookup(c.XKB_KEY_Page_Down, 0, true, true, false).?,
+    );
     // Plain Tab is untouched, which is the whole point of putting ours behind Ctrl.
     try testing.expect(b.lookup(c.XKB_KEY_Tab, 0, false, false, false) == null);
+}
+
+test "Ctrl tells moving a tab apart from scrolling it" {
+    // The two live on the same keys, one modifier apart, so a lookup that ignored Ctrl
+    // would make Shift+Page_Up rearrange the strip instead of scrolling back.
+    const b = Bindings.defaults();
+    try testing.expectEqual(
+        Action.scroll_page_up,
+        b.lookup(c.XKB_KEY_Page_Up, 0, false, true, false).?,
+    );
+    try testing.expectEqual(
+        Action.tab_move_left,
+        b.lookup(c.XKB_KEY_Page_Up, 0, true, true, false).?,
+    );
+    // Unshifted, both are the application's — full-screen programs page with them.
+    try testing.expect(b.lookup(c.XKB_KEY_Page_Up, 0, false, false, false) == null);
+    try testing.expect(b.lookup(c.XKB_KEY_Page_Down, 0, true, false, false) == null);
 }
 
 test "Shift+Tab is reported as ISO_Left_Tab and must still match `tab`" {
@@ -1232,10 +1277,18 @@ test "disableTabs hides the bar and hands the tab keys back" {
     try testing.expect(cfg.bindings.lookup(c.XKB_KEY_Tab, 0, true, false, false) == null);
     try testing.expect(cfg.bindings.lookup(c.XKB_KEY_Tab, 0, true, true, false) == null);
     try testing.expect(cfg.bindings.lookup(0, num_row[2], false, false, true) == null);
+    try testing.expect(cfg.bindings.lookup(c.XKB_KEY_Page_Up, 0, true, true, false) == null);
+    try testing.expect(cfg.bindings.lookup(c.XKB_KEY_Page_Down, 0, true, true, false) == null);
 
     // Everything else is untouched — this disables tabs, not the terminal's bindings.
     try testing.expectEqual(Action.copy, cfg.bindings.lookup('c', 0, true, true, false).?);
     try testing.expectEqual(Action.new_window, cfg.bindings.lookup('%', 0, false, false, true).?);
+    // Scrolling in particular: it shares the tab-move keys, and disabling tabs must
+    // not take Shift+Page_Up with it.
+    try testing.expectEqual(
+        Action.scroll_page_up,
+        cfg.bindings.lookup(c.XKB_KEY_Page_Up, 0, false, true, false).?,
+    );
 }
 
 test "disableTabs disarms a tab binding the config moved elsewhere" {
