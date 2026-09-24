@@ -941,6 +941,7 @@ test {
     // almost nothing. Found by breaking an assertion in launch.zig on purpose and
     // watching the suite stay green.
     _ = @import("config.zig");
+    _ = @import("ctl.zig");
     _ = @import("watch.zig");
     _ = @import("launch.zig");
     _ = @import("font/font.zig");
